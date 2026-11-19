@@ -2,6 +2,7 @@
 
 #include "core/Math.h"
 #include "core/Types.h"
+#include "nfs/ChunkReader.h"
 
 #include <string>
 #include <vector>
@@ -31,6 +32,13 @@ struct WorldAnimationPart {
     std::vector<Vec3> scale;
     int   frames = 0;
     float fps = 30.0f;
+
+    // NFS World: one absolute matrix per frame (chunk 0x37240), shown as is
+    // at round(seconds * fps) -- no blending, no parent product -- going
+    // forward and wrapping, or back and forth when pingPong (nfsw.exe
+    // 0x74FCE0 / 0x74F520).
+    std::vector<Mat4> baked;
+    bool pingPong = false;
 };
 
 struct WorldAnimationTree {
@@ -52,6 +60,11 @@ public:
     // Reads every animated tree of a region's layout file.
     void Parse(ByteSpan layout);
     void Clear() { trees_.clear(); placements_.clear(); shipped_ = 0; }
+
+    // NFS World keeps its moving scenery in the section files instead: the
+    // section's top-level chunks, in file order. Adds its trees and one
+    // placement each, before any extra placements. `section` = its number.
+    void AddWorldSection(const std::vector<Chunk>& chunks, int section);
 
     // Placements of the editor's own after the region's -- shown, never
     // written: a preview of what an extension is about to put in the game.

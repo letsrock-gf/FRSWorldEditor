@@ -35,11 +35,16 @@ add_executable(FRSWorldEditor WIN32
     src/io/MarkerEffects.cpp
     src/nfs/Markers.cpp
     src/ui/MarkersExtension.cpp
+    src/io/WorldMesh.cpp
+    src/io/WorldPlace.cpp
+    src/io/WorldTexture.cpp
+    src/io/WorldWrite.cpp
     src/io/SelectionExport.cpp
     src/io/SelectionImport.cpp
     src/nfs/ChunkReader.cpp
     src/nfs/Jdlz.cpp
     src/nfs/Collision.cpp
+    src/nfs/WorldCollision.cpp
     src/nfs/Preculler.cpp
     src/nfs/Scenery.cpp
     src/nfs/CityZones.cpp
@@ -64,9 +69,11 @@ add_executable(FRSWorldEditor WIN32
     src/render/CollisionMesh.cpp
     src/render/WorldRenderer.cpp
     src/render/GameLook.cpp
+    src/render/GameLookAttributes.cpp
     src/render/Gizmo.cpp
     src/render/ModelThumbnails.cpp
 
+    src/ui/DarkTheme.cpp
     src/ui/EditsPanel.cpp
     src/ui/EmbeddedGame.cpp
     src/ui/CrashReport.cpp

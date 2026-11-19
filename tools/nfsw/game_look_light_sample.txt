@@ -1,0 +1,9 @@
+# Source of gamelook::NfswLight (src/render/GameLook.h): world_A constants as the game's own world draws
+# received them, logged by the mesh-deform addon (Data2015/mesh-deform.log, read 2026-11-15, file dated 2026-11-15 03:09).
+# Chosen: the most frequent line with tod1 = (1, 0) (full day, no baked night lights). Counts below: occurrences.
+# total lines: 4698
+     99 Pedestrian world light: lightVec=0.063101,-0.775425,0.628443,-0.775425 diffuse=1.985050,1.855151,1.651232,2.000000 ambient=1.059071,1.093091,1.147111,0.000000 tod1=1.000000,0.000000,0.000000,0.000000 fogEnable=1.000000 BrPlusBm=0.000189,0.000206,0.000226,0.000000 fogMW=1.786778 extFloor=0.000000 const3=1.000000,1.000000,-0.000000,3.006382
+     31 Pedestrian world light: lightVec=0.027973,-0.770419,0.636856,-0.770419 diffuse=1.978233,1.834698,1.619870,2.000000 ambient=1.049526,1.080819,1.132112,0.000000 tod1=1.000000,0.000000,0.000000,0.000000 fogEnable=1.000000 BrPlusBm=0.000190,0.000208,0.000228,4680.124023 fogMW=1.827444 extFloor=0.000000 const3=1.000000,1.000000,-0.000000,2.922677
+     31 Pedestrian world light: lightVec=-0.027719,-0.760627,0.648634,-0.760627 diffuse=1.967582,1.802747,1.570878,2.000000 ambient=1.034615,1.061648,1.108681,0.000000 tod1=1.000000,0.000000,0.000000,0.000000 fogEnable=1.000000 BrPlusBm=0.000191,0.000209,0.000230,0.000000 fogMW=1.890667 extFloor=0.000000 const3=1.000000,1.000000,-0.000000,2.792544
+# first line number of the chosen sample:
+192176

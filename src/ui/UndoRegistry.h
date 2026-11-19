@@ -1,8 +1,10 @@
 #pragma once
 
+#include "core/Log.h"
 #include "core/Types.h"
 
 #include <algorithm>
+#include <typeinfo>
 #include <vector>
 
 // One Ctrl+Z for the whole editor.
@@ -61,6 +63,9 @@ inline UndoParticipant* Latest() {
 // Ctrl+Z: the most recent step, of whichever part made it.
 inline bool UndoLatest() {
     UndoParticipant* p = Latest();
+    // Which part took the step back, for tests driven by posted commands.
+    LOG_INFO("undo: %s, stamp %llu", p ? typeid(*p).name() : "nothing to undo",
+             (unsigned long long)(p ? p->LatestUndoStamp() : 0));
     return p && p->UndoLatest();
 }
 

@@ -24,6 +24,13 @@ public:
     bool Open(const std::wstring& path);
     void Close();
 
+    // NFS World ships each streaming section as its own file. The editor works
+    // on one stream addressed by offset, so those files are laid end to end in
+    // a reserved address range and read into it as each section is opened:
+    // Reserve claims the range, Load fills one file's part of it.
+    bool Reserve(u64 size);
+    bool Load(u64 offset, const std::wstring& path, u64 size);
+
     bool IsOpen() const { return base_ != nullptr; }
 
     ByteSpan Span() const { return { base_, size_ }; }
@@ -37,4 +44,5 @@ private:
     void*        mapping_ = nullptr;  // HANDLE
     const u8*    base_    = nullptr;
     u64          size_    = 0;
+    bool         reserved_ = false;   // base_ is a VirtualAlloc range, not a view
 };

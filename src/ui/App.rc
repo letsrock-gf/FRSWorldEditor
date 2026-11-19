@@ -52,6 +52,7 @@ BEGIN
         BEGIN
             MENUITEM "&Frustum Culling",          ID_VIEW_FRUSTUM_CULL
             MENUITEM "&Stream Around Camera",     ID_VIEW_STREAMING
+            MENUITEM "&Viewport Settings (clip, detail, sensitivity)...", ID_VIEW_CLIP
             MENUITEM "&Backface Culling\tF6",     ID_VIEW_BACKFACE_CULL
         END
         // MINIMAP PREVIEW (temporary)
@@ -71,10 +72,37 @@ BEGIN
         MENUITEM "&Go to Saved Camera",           IDC_GO_CAMERA
         MENUITEM SEPARATOR
         MENUITEM "&Frame World\tHome",            ID_WORLD_FRAME
+        MENUITEM "Frame S&elected\tNumpad . / F",  ID_CAMERA_FRAME_SEL
+        MENUITEM SEPARATOR
+        POPUP "&Viewpoint"
+        BEGIN
+            MENUITEM "&Front\tNumpad 1 / Alt+1",        ID_VIEW_FRONT
+            MENUITEM "&Back\tCtrl+Numpad 1",            ID_VIEW_BACK
+            MENUITEM "&Right\tNumpad 3 / Alt+3",        ID_VIEW_RIGHT
+            MENUITEM "&Left\tCtrl+Numpad 3",            ID_VIEW_LEFT
+            MENUITEM "&Top\tNumpad 7 / Alt+7",          ID_VIEW_TOP
+            MENUITEM "B&ottom\tCtrl+Numpad 7",          ID_VIEW_BOTTOM
+            MENUITEM "O&pposite Side\tNumpad 9",        ID_VIEW_OPPOSITE
+        END
+        POPUP "&Orbit"
+        BEGIN
+            MENUITEM "&Left\tNumpad 4",                 ID_VIEW_ORBIT_LEFT
+            MENUITEM "&Right\tNumpad 6",                ID_VIEW_ORBIT_RIGHT
+            MENUITEM "&Up\tNumpad 8",                   ID_VIEW_ORBIT_UP
+            MENUITEM "&Down\tNumpad 2",                 ID_VIEW_ORBIT_DOWN
+        END
+        MENUITEM SEPARATOR
+        MENUITEM "Orbit: middle or right button drag",          0, GRAYED
+        MENUITEM "Pan: Shift + drag, Ctrl+wheel, Shift+wheel",  0, GRAYED
+        MENUITEM "Zoom: wheel, or Ctrl + middle button drag",   0, GRAYED
+        MENUITEM "Free look: Ctrl + right button drag",         0, GRAYED
     END
 
     POPUP "&Objects"
     BEGIN
+        MENUITEM "&Undo\tCtrl+Z",                 ID_EDIT_UNDO
+        MENUITEM "R&edo\tCtrl+Y",                 ID_EDIT_REDO
+        MENUITEM SEPARATOR
         MENUITEM "&Place Object...\tCtrl+N",      ID_OBJECT_PLACE
         MENUITEM SEPARATOR
         POPUP "&Selection"
@@ -83,6 +111,7 @@ BEGIN
             MENUITEM "&Rotate\tR",                ID_OBJECT_ROTATE
             MENUITEM "Snap to &Ground\tCtrl+G",   ID_OBJECT_SNAP
             MENUITEM "P&roperties...\tF2",        ID_OBJECT_PROPERTIES
+            MENUITEM "Select &All with the Same Name\tShift+G", ID_OBJECT_SELECT_SAME
             MENUITEM SEPARATOR
             MENUITEM "&Copy\tCtrl+C",             ID_OBJECT_COPY
             MENUITEM "&Paste at View Centre\tCtrl+V", ID_OBJECT_PASTE
@@ -137,14 +166,17 @@ STYLE DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME
 CAPTION "Texture browser"
 FONT 9, "Segoe UI", 400, 0, 1
 BEGIN
+    EDITTEXT        IDC_TEX_SEARCH, 6, 6, 190, 12, ES_AUTOHSCROLL
     CONTROL         "", IDC_TEX_LIST, "SysListView32",
                     LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER |
-                    WS_TABSTOP, 6, 6, 190, 288
+                    WS_TABSTOP, 6, 22, 190, 272
     CONTROL         "", IDC_TEX_PREVIEW, "STATIC", SS_OWNERDRAW | WS_BORDER,
                     202, 6, 232, 232
     LTEXT           "", IDC_TEX_INFO, 202, 244, 232, 32
     AUTOCHECKBOX    "&Actual size", IDC_TEX_ZOOM, 202, 282, 60, 12
-    PUSHBUTTON      "&Save as BMP...", IDC_TEX_SAVE, 370, 280, 64, 14
+    PUSHBUTTON      "&Save as PNG...", IDC_TEX_SAVE, 370, 280, 64, 14
+    PUSHBUTTON      "&Replace with image...", IDC_TEX_REPLACE, 202, 262, 90, 14
+    PUSHBUTTON      "Restore &original", IDC_TEX_RESTORE, 296, 262, 70, 14
 END
 
 // The edits that are in force, and the way to take one back out.
@@ -158,6 +190,27 @@ BEGIN
                     WS_TABSTOP, 6, 6, 328, 186
     PUSHBUTTON      "&Remove edit", IDC_OVERLAY_REMOVE, 6, 198, 55, 14
     DEFPUSHBUTTON   "&Close", IDC_OVERLAY_CLOSE, 294, 198, 40, 14
+END
+
+// The camera's clip planes and the smallest thing worth drawing.
+IDD_CLIP DIALOGEX 0, 0, 230, 148
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Viewport settings"
+FONT 9, "Segoe UI", 400, 0, 1
+BEGIN
+    LTEXT           "Clip &start:", -1, 6, 8, 150, 10
+    EDITTEXT        IDC_CLIP_START, 164, 6, 60, 13, ES_AUTOHSCROLL
+    LTEXT           "Clip &end:", -1, 6, 26, 150, 10
+    EDITTEXT        IDC_CLIP_END, 164, 24, 60, 13, ES_AUTOHSCROLL
+    LTEXT           "&Hide scenery smaller than (pixels, 0 = draw all):", -1, 6, 44, 156, 10
+    EDITTEXT        IDC_CLIP_DETAIL, 164, 42, 60, 13, ES_AUTOHSCROLL
+    LTEXT           "&Mouse sensitivity (1 = normal):", -1, 6, 62, 156, 10
+    EDITTEXT        IDC_CLIP_SENSITIVITY, 164, 60, 60, 13, ES_AUTOHSCROLL
+    LTEXT           "&Zoom per wheel notch (percent of the way):", -1, 6, 80, 156, 10
+    EDITTEXT        IDC_CLIP_ZOOM, 164, 78, 60, 13, ES_AUTOHSCROLL
+    LTEXT           "Nothing nearer than the start or farther than the end is drawn. A shorter end and a larger pixel size draw less and run smoother.", -1, 6, 98, 218, 26
+    DEFPUSHBUTTON   "OK", IDOK, 120, 128, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 174, 128, 50, 14
 END
 
 // A name for a new, empty world.
@@ -257,8 +310,27 @@ BEGIN
     "K",        ID_VIEW_COLLISION,   VIRTKEY, CONTROL
     "N",        ID_OBJECT_PLACE,     VIRTKEY, CONTROL
     "C",        ID_OBJECT_COPY,      VIRTKEY, CONTROL
+    "Z",        ID_EDIT_UNDO,        VIRTKEY, CONTROL
+    "Y",        ID_EDIT_REDO,        VIRTKEY, CONTROL
+    "Z",        ID_EDIT_REDO,        VIRTKEY, CONTROL, SHIFT
+    VK_NUMPAD1, ID_VIEW_FRONT,       VIRTKEY
+    VK_NUMPAD1, ID_VIEW_BACK,        VIRTKEY, CONTROL
+    VK_NUMPAD3, ID_VIEW_RIGHT,       VIRTKEY
+    VK_NUMPAD3, ID_VIEW_LEFT,        VIRTKEY, CONTROL
+    VK_NUMPAD7, ID_VIEW_TOP,         VIRTKEY
+    VK_NUMPAD7, ID_VIEW_BOTTOM,      VIRTKEY, CONTROL
+    VK_NUMPAD9, ID_VIEW_OPPOSITE,    VIRTKEY
+    VK_NUMPAD4, ID_VIEW_ORBIT_LEFT,  VIRTKEY
+    VK_NUMPAD6, ID_VIEW_ORBIT_RIGHT, VIRTKEY
+    VK_NUMPAD8, ID_VIEW_ORBIT_UP,    VIRTKEY
+    VK_NUMPAD2, ID_VIEW_ORBIT_DOWN,  VIRTKEY
+    VK_DECIMAL, ID_CAMERA_FRAME_SEL, VIRTKEY
+    "1",        ID_VIEW_FRONT,       VIRTKEY, ALT
+    "3",        ID_VIEW_RIGHT,       VIRTKEY, ALT
+    "7",        ID_VIEW_TOP,         VIRTKEY, ALT
     "V",        ID_OBJECT_PASTE,     VIRTKEY, CONTROL
     "G",        ID_OBJECT_SNAP,      VIRTKEY, CONTROL
+    "G",        ID_OBJECT_SELECT_SAME, VIRTKEY, SHIFT
     "S",        ID_OBJECT_SAVE,      VIRTKEY, CONTROL, SHIFT
     "E",        ID_OBJECT_BLENDER,   VIRTKEY, CONTROL, SHIFT
     "N",        ID_OBJECT_NEW_BLENDER, VIRTKEY, CONTROL, SHIFT
@@ -288,7 +360,7 @@ IDD_SETUP_FOLDER DIALOGEX 0, 0, 300, 150
 STYLE DS_SETFONT | WS_CHILD | WS_DISABLED | WS_CAPTION
 FONT 9, "Segoe UI", 400, 0, 1
 BEGIN
-    LTEXT           "The editor reads the city straight from the game's own files. Point it at the folder that holds SPEED2.EXE -- nothing in the game is changed by this.",
+    LTEXT           "The editor reads the city straight from the game's own files. Point it at the game's folder: the one that holds SPEED2.EXE (Underground 2), speed.exe (Underground) or nfsw.exe (NFS World). Choosing it changes nothing in the game.",
                     -1, 0, 0, 300, 28
     LTEXT           "&Game folder:", -1, 0, 36, 300, 10
     EDITTEXT        IDC_SETUP_PATH, 0, 48, 236, 14, ES_AUTOHSCROLL

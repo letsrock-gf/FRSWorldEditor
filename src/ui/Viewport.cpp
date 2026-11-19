@@ -1,10 +1,13 @@
 #include "ui/Viewport.h"
 
 #include "core/Log.h"
+#include "nfs/GameFormat.h"
 #include "render/RenderExtension.h"
+#include "ui/Resource.h"
 
 #include <windowsx.h>
 
+#include <algorithm>
 #include <cstring>
 
 namespace {
@@ -148,16 +151,22 @@ LRESULT Viewport::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         case WM_RBUTTONDOWN:
             if (GizmoDragging()) { EndGizmoDrag(false); return 0; }
             if (Transforming()) { EndTransform(false); return 0; }
-            BeginLook();
+            BeginNavigate(wParam, GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
             return 0;
 
         case WM_RBUTTONUP:
+        case WM_MBUTTONUP:
             EndLook();
+            return 0;
+
+        case WM_MBUTTONDOWN:
+            if (GizmoDragging() || Transforming()) return 0;
+            BeginNavigate(wParam, GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
             return 0;
 
         case WM_MOUSEMOVE:
             if (GizmoDragging()) {
-                UpdateGizmoDrag(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+                UpdateGizmoDrag(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam), (wParam & MK_SHIFT) != 0);
                 return 0;
             }
             if (Transforming()) {
@@ -184,7 +193,19 @@ LRESULT Viewport::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
                 const int dy = cursor.y - lookAnchor_.y;
                 if (dx || dy) {
                     flying_ = false;
-                    camera_.Rotate((float)dx, (float)dy);
+                    if (lookMode_ == LookMode::Orbit) {
+                        camera_.Orbit(lookPivot_, (float)dx, (float)dy);
+                    } else if (lookMode_ == LookMode::Pan) {
+                        Pan((float)dx, (float)dy);
+                    } else if (lookMode_ == LookMode::Zoom) {
+                        // Up or right goes in, half a percent of the way a pixel.
+                        const Vec3 toPivot = lookPivot_ - camera_.Position();
+                        const float amount = 1.0f - std::pow(0.995f, (float)(dx - dy));
+                        if (amount < 0.0f || Length(toPivot) > 1.0f)
+                            camera_.SetPosition(camera_.Position() + toPivot * amount);
+                    } else {
+                        camera_.Rotate((float)dx, (float)dy);
+                    }
                     // Pin the cursor so the look is never limited by screen edges.
                     ::SetCursorPos(lookAnchor_.x, lookAnchor_.y);
                 }
@@ -206,8 +227,29 @@ LRESULT Viewport::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
                 UpdateTransform(cursor.x, cursor.y);
                 return 0;
             }
-            const float factor = std::pow(1.25f, (float)notches);
-            camera_.SetSpeed(Clamp(camera_.Speed() * factor, 0.5f, 20000.0f));
+            // A smooth-scrolling mouse sends less than a whole notch at a time,
+            // so the amount is kept as a fraction: rounding it lost every step.
+            const float turned = (float)GET_WHEEL_DELTA_WPARAM(wParam) / (float)WHEEL_DELTA;
+
+            // Held in a drag, the wheel sets the flying speed as it always did.
+            if (looking_) {
+                camera_.SetSpeed(Clamp(camera_.Speed() * std::pow(1.25f, turned), 0.5f, 20000.0f));
+                return 0;
+            }
+            flying_ = false;
+
+            // Blender: Ctrl+wheel slides sideways, Shift+wheel up and down.
+            POINT cursor{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            ::ScreenToClient(window_, &cursor);
+            lookPivot_ = PivotAt(cursor.x, cursor.y);
+            if (GET_KEYSTATE_WPARAM(wParam) & MK_CONTROL) { Pan(turned * 60.0f, 0.0f); return 0; }
+            if (GET_KEYSTATE_WPARAM(wParam) & MK_SHIFT)   { Pan(0.0f, turned * 60.0f); return 0; }
+
+            // Plain wheel: zoom on what is under the cursor.
+            const Vec3 toPivot = lookPivot_ - camera_.Position();
+            if (turned > 0.0f && Length(toPivot) < 1.0f) return 0;
+            camera_.SetPosition(camera_.Position() +
+                                toPivot * (1.0f - std::pow(1.0f - zoomStep_, turned)));
             return 0;
         }
 
@@ -258,6 +300,12 @@ LRESULT Viewport::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             if (!looking_ && !Transforming() && (lParam & (1 << 30)) == 0) {
                 if (wParam == 'G') { BeginTransform(TransformMode::Move);   return 0; }
                 if (wParam == 'R') { BeginTransform(TransformMode::Rotate); return 0; }
+
+                if (wParam == 'F') { FrameSelection(); return 0; }
+                if (wParam == 'X') {
+                    ::PostMessageW(::GetParent(window_), WM_COMMAND, ID_OBJECT_DELETE, 0);
+                    return 0;
+                }
             }
             if (wParam < 256) keys_[wParam] = true;
             if (wParam == VK_ESCAPE) renderer_.ClearSelection();
@@ -286,7 +334,87 @@ LRESULT Viewport::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
     return ::DefWindowProcW(window_, message, wParam, lParam);
 }
 
-void Viewport::BeginLook() {
+bool Viewport::SelectionCentre(Vec3& centre) const {
+    Aabb bounds;
+    for (const PickResult& picked : renderer_.Selection()) bounds.Add(picked.worldBounds);
+    if (!bounds.Valid()) return false;
+    centre = bounds.Center();
+    return true;
+}
+
+// The mesh under the cursor is the pivot: what the eye is on stays put while
+// the view turns or closes in. Over the sky it is the selection, and with
+// nothing selected a point as far away as the last pivot was.
+Vec3 Viewport::PivotAt(int x, int y) {
+    const Ray ray = RayAt(x, y);
+    PickResult hit;
+    if (renderer_.Pick(ray, hit)) {
+        pivotDistance_ = std::max(hit.distance, 1.0f);
+        return ray.origin + ray.direction * hit.distance;
+    }
+    Vec3 pivot;
+    if (SelectionCentre(pivot)) return pivot;
+    return ray.origin + ray.direction * pivotDistance_;
+}
+
+// Blender's buttons, on the middle button and on the right one alike:
+//   drag            orbit around the mesh under the cursor
+//   Shift + drag    pan
+//   Ctrl + drag     zoom (middle button) -- on the right button, the old free
+//                   look, for steering while flying with W A S D
+void Viewport::BeginNavigate(WPARAM buttons, int x, int y) {
+    const bool right = (buttons & MK_RBUTTON) != 0 && !(buttons & MK_MBUTTON);
+    if ((buttons & MK_CONTROL) && right) { BeginLook(LookMode::Free); return; }
+
+    lookPivot_ = PivotAt(x, y);
+    if (buttons & MK_SHIFT)        BeginLook(LookMode::Pan);
+    else if (buttons & MK_CONTROL) BeginLook(LookMode::Zoom);
+    else                           BeginLook(LookMode::Orbit);
+}
+
+// Slides the view so the pivot's plane follows the drag pixel for pixel.
+void Viewport::Pan(float pixelsX, float pixelsY) {
+    const float distance = std::max(Length(lookPivot_ - camera_.Position()), 1.0f);
+    const float perPixel = distance * 2.0f * std::tan(camera_.FieldOfView() * 0.5f) /
+                           (float)std::max<u32>(context_.Height(), 1);
+    camera_.SetPosition(camera_.Position() - camera_.Right() * (pixelsX * perPixel) +
+                        camera_.Up() * (pixelsY * perPixel));
+}
+
+void Viewport::View(int command) {
+    Vec3 about;
+    if (!SelectionCentre(about)) about = camera_.Position() + camera_.Forward() * pivotDistance_;
+    const float step = Radians(15.0f) / camera_.Sensitivity();
+    flying_ = false;
+    switch (command) {
+        case ID_VIEW_FRONT:       camera_.OrbitTo(about,  kPi * 0.5f, 0.0f); break;
+        case ID_VIEW_BACK:        camera_.OrbitTo(about, -kPi * 0.5f, 0.0f); break;
+        case ID_VIEW_RIGHT:       camera_.OrbitTo(about, kPi, 0.0f); break;
+        case ID_VIEW_LEFT:        camera_.OrbitTo(about, 0.0f, 0.0f); break;
+        case ID_VIEW_TOP:         camera_.OrbitTo(about, camera_.Yaw(), -kPi); break;
+        case ID_VIEW_BOTTOM:      camera_.OrbitTo(about, camera_.Yaw(), kPi); break;
+        case ID_VIEW_OPPOSITE:    camera_.OrbitTo(about, camera_.Yaw() + kPi, -camera_.Pitch()); break;
+        case ID_VIEW_ORBIT_LEFT:  camera_.Orbit(about, -step, 0.0f); break;
+        case ID_VIEW_ORBIT_RIGHT: camera_.Orbit(about,  step, 0.0f); break;
+        case ID_VIEW_ORBIT_UP:    camera_.Orbit(about, 0.0f, -step); break;
+        case ID_VIEW_ORBIT_DOWN:  camera_.Orbit(about, 0.0f,  step); break;
+        default: break;
+    }
+}
+
+void Viewport::FrameSelection() {
+    Aabb bounds;
+    for (const PickResult& picked : renderer_.Selection()) bounds.Add(picked.worldBounds);
+    if (!bounds.Valid()) { FrameWorld(); return; }
+
+    // Far enough back to see all of it, looking the way the camera already does.
+    const float distance = std::max(bounds.Radius(), 1.0f) / std::tan(camera_.FieldOfView() * 0.5f);
+    flying_ = false;
+    camera_.SetPosition(bounds.Center() - camera_.Forward() * distance);
+}
+
+void Viewport::BeginLook(LookMode mode) {
+    lookMode_ = mode;
     if (looking_) return;
 
     looking_ = true;
@@ -552,15 +680,15 @@ void Viewport::PickCollisionAt(const Ray& ray, bool add, bool wholePack) {
              polygon.attributes[3], renderer_.CollisionSelection().size());
 }
 
-Ray Viewport::RayAt(int x, int y) const {
+Ray Viewport::RayThrough(float x, float y) const {
     const float width  = (float)std::max(1u, context_.Width());
     const float height = (float)std::max(1u, context_.Height());
 
     // Built straight from the camera basis rather than by inverting the
     // view-projection: the same field of view that made the frame defines it.
     const float tanHalfFov = std::tan(camera_.FieldOfView() * 0.5f);
-    const float ndcX = 2.0f * ((float)x + 0.5f) / width - 1.0f;
-    const float ndcY = 1.0f - 2.0f * ((float)y + 0.5f) / height;
+    const float ndcX = 2.0f * (x + 0.5f) / width - 1.0f;
+    const float ndcY = 1.0f - 2.0f * (y + 0.5f) / height;
 
     Ray ray;
     ray.origin    = camera_.Position();
@@ -571,6 +699,11 @@ Ray Viewport::RayAt(int x, int y) const {
 }
 
 size_t Viewport::DetachNatives(bool remember) {
+    // NFS World: one of the map's own objects is moved where it stands, by its
+    // handle (SelectedMovables), and written as a moved record. Detaching it --
+    // removing it and placing a copy -- would lose its flags and its levels of
+    // detail, and is how Underground 2 does it, where nothing else can be written.
+    if (nfs::IsWorld()) return 0;
     if (!world_) return 0;
     std::vector<std::pair<u32, int>> select;
     size_t converted = 0;
@@ -638,9 +771,56 @@ bool Viewport::SelectedPlacement(u32& loadedSection, int& placement) const {
     return true;
 }
 
+std::vector<std::pair<u32, int>> Viewport::SelectedMovables() const {
+    std::vector<std::pair<u32, int>> out;
+    for (const PickResult& picked : renderer_.Selection()) {
+        if (picked.IsPlacement())   out.push_back({ picked.loadedSection, picked.placement });
+        else if (picked.IsNative()) out.push_back({ picked.loadedSection, NativeHandle(picked.native) });
+    }
+    return out;
+}
+
+bool Viewport::MovableTransform(u32 loadedSection, int handle, Mat4& transform) const {
+    if (!world_ || loadedSection >= world_->Loaded().size()) return false;
+    const nfs::LoadedSection& loaded = *world_->Loaded()[loadedSection];
+    if (handle >= 0) {
+        if ((size_t)handle >= loaded.placements.size()) return false;
+        transform = loaded.placements[(size_t)handle].instance.transform;
+        return true;
+    }
+    if (!IsNativeHandle(handle)) return false;
+    const size_t native = (size_t)NativeOfHandle(handle);
+    if (native >= loaded.scenery.instances.size()) return false;
+    transform = loaded.scenery.instances[native].transform;
+    return true;
+}
+
 void Viewport::SetPlacementTransform(u32 loadedSection, int placement, const Mat4& transform) {
     if (!world_) return;
     nfs::LoadedSection* section = world_->MutableLoaded(loadedSection);
+
+    // One of the map's own: the instance takes the transform, and where it
+    // stood is kept the first time, for undoing and for writing to the game.
+    if (section && IsNativeHandle(placement)) {
+        const size_t native = (size_t)NativeOfHandle(placement);
+        if (native >= section->scenery.instances.size()) return;
+        nfs::SceneryInstance& instance = section->scenery.instances[native];
+        auto moved = std::find_if(section->movedNatives.begin(), section->movedNatives.end(),
+                                  [&](const nfs::LoadedSection::MovedNative& m) {
+                                      return m.sceneryNumber == instance.sceneryNumber &&
+                                             m.record == instance.record;
+                                  });
+        if (moved == section->movedNatives.end())
+            section->movedNatives.push_back({ instance.sceneryNumber, instance.record,
+                                              instance.transform, transform });
+        else
+            moved->moved = transform;
+        instance.transform = transform;
+        section->placementsChanged = true;
+        renderer_.UpdateNative(loadedSection, (int)native, transform);
+        return;
+    }
+
     if (!section || placement < 0 || (size_t)placement >= section->placements.size()) return;
     section->placements[(size_t)placement].instance.transform = transform;
     section->placementsChanged = true;
@@ -683,10 +863,9 @@ bool Viewport::BeginTransform(TransformMode mode) {
         pointHeadingStart_ = pointHeadingNow_ = heading;
     }
     for (const auto& [section, placement] : movingPoint_ ? std::vector<std::pair<u32, int>>{}
-                                                         : SelectedPlacements()) {
-        const nfs::LoadedSection* loaded = world_->MutableLoaded(section);
-        if (!loaded || (size_t)placement >= loaded->placements.size()) continue;
-        const Mat4& start = loaded->placements[(size_t)placement].instance.transform;
+                                                         : SelectedMovables()) {
+        Mat4 start;
+        if (!MovableTransform(section, placement, start)) continue;
         moving_.push_back({ section, placement, start });
         sum += Vec3{ start.m[3][0], start.m[3][1], start.m[3][2] };
     }
@@ -811,6 +990,11 @@ void Viewport::EndTransform(bool keep) {
 }
 
 void Viewport::RehomePlacements(std::vector<std::pair<u32, int>> placements) {
+    // The map's own scenery stays in the section that ships it.
+    placements.erase(std::remove_if(placements.begin(), placements.end(),
+                                    [](const std::pair<u32, int>& p) { return p.second < 0; }),
+                     placements.end());
+    if (placements.empty()) return;
     if (!world_) return;
 
     // Work out where each one belongs before anything moves: taking one out
@@ -895,6 +1079,18 @@ bool Viewport::GizmoTarget(u32& section, int& placement, Mat4& transform) const 
         placement = kGizmoPoint;
         return true;
     }
+    // NFS World: one of the map's own objects moves where it stands, and is
+    // written to the game as a moved record (io/WorldWrite.cpp). Nothing is
+    // detached, so its flags, its levels of detail and its place in the
+    // section's tree stay what they were.
+    if (nfs::IsWorld()) {
+        if (renderer_.Selection().size() != 1) return false;
+        const auto movables = SelectedMovables();
+        if (movables.size() != 1) return false;
+        section   = movables.front().first;
+        placement = movables.front().second;
+        return MovableTransform(section, placement, transform);
+    }
     if (!SelectedPlacement(section, placement)) {
         // One of the map's own objects: the gizmo stands on it, and the
         // first drag makes it a placement.
@@ -977,26 +1173,55 @@ bool Viewport::BeginGizmoDrag(int x, int y) {
     gizmoStart_ = transform;
     gizmoNow_ = transform;
     gizmoMouseStart_ = { (float)x, (float)y };
+    gizmoMouseLast_ = gizmoPointer_ = gizmoMouseStart_;
+    {
+        // In the log like a pick is: what was grabbed, and where the gizmo
+        // stands on screen, which is what a scripted drag has to aim at.
+        Vec2 centre{};
+        GizmoProject(CurrentGizmoView(), origin, centre);
+        LOG_INFO("gizmo: handle %d grabbed at (%d, %d); origin (%.1f, %.1f, %.1f) on screen at (%.0f, %.0f)",
+                 handle, x, y, origin.x, origin.y, origin.z, centre.x, centre.y);
+    }
     ::SetCapture(window_);
     return true;
 }
 
-void Viewport::UpdateGizmoDrag(int x, int y) {
+void Viewport::UpdateGizmoDrag(int x, int y, bool fine) {
     if (gizmoActive_ == kGizmoNone || !world_) return;
     const Vec3 origin{ gizmoStart_.m[3][0], gizmoStart_.m[3][1], gizmoStart_.m[3][2] };
     Mat4 transform = gizmoStart_;
 
+    // Shift is the fine adjustment, as in Blender: the object follows a
+    // pointer of its own, which covers a tenth of the mouse's way while the
+    // key is down. Pressing or letting go of it in mid-drag makes no jump,
+    // since only the way from here on is scaled.
+    const float pace = fine ? 0.1f : 1.0f;
+    gizmoPointer_.x += ((float)x - gizmoMouseLast_.x) * pace;
+    gizmoPointer_.y += ((float)y - gizmoMouseLast_.y) * pace;
+    gizmoMouseLast_ = { (float)x, (float)y };
+    const float pointerX = gizmoPointer_.x, pointerY = gizmoPointer_.y;
+
     if (gizmoMode_ == GizmoMode::Move) {
-        const Ray ray = RayAt(x, y);
+        const Ray ray = RayThrough(pointerX, pointerY);
         Vec3 position = origin;
         if (gizmoActive_ == kGizmoCentre) {
-            // Across the ground, standing on whatever is under it.
+            // The square moves on both ground axes at once and keeps the
+            // height, as Blender's plane handle does: the object follows the
+            // pointer and nothing else. Dropping it onto whatever lay under
+            // the pointer made it jump -- onto bridges, roofs and trees
+            // overhead, and onto itself. Ctrl still stands it on the ground
+            // below, looked for from just above the object.
             Vec3 point;
             if (!OnGround(ray, origin.z, point)) return;
             position = origin + (point - gizmoPlaneStart_);
             position.z = origin.z;
             float ground = 0.0f;
-            if (gizmoPlacement_ != kGizmoTool && GroundBelow({ position.x, position.y, position.z + 200.0f }, gizmoSection_, gizmoPlacement_, ground))
+            // A road node belongs on the ground and follows it. An object
+            // keeps its height unless Ctrl asks for the ground under it.
+            const bool node = gizmoPlacement_ == kGizmoPoint;
+            const bool snap = node || (gizmoPlacement_ != kGizmoTool && (::GetKeyState(VK_CONTROL) & 0x8000));
+            if (snap && GroundBelow({ position.x, position.y, position.z + (node ? 200.0f : -45.0f) },
+                                    gizmoSection_, gizmoPlacement_, ground))
                 position.z = ground;
         } else {
             float t = 0.0f;
@@ -1011,7 +1236,7 @@ void Viewport::UpdateGizmoDrag(int x, int y) {
         Vec2 centre;
         if (!GizmoProject(view, origin, centre)) return;
         const float x0 = gizmoMouseStart_.x - centre.x, y0 = gizmoMouseStart_.y - centre.y;
-        const float x1 = (float)x - centre.x, y1 = (float)y - centre.y;
+        const float x1 = pointerX - centre.x, y1 = pointerY - centre.y;
 
         Mat4 change = Mat4::Identity();
         if (gizmoMode_ == GizmoMode::Rotate) {

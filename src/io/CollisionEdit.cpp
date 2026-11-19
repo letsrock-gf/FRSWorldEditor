@@ -295,12 +295,11 @@ void Editor::Changed(u32 section, u32 pack) {
     if (!loaded) return;
     if (pack < loaded->collision.size()) loaded->collision[pack].edited = true;
     loaded->MarkCollisionChanged(pack);
-    if (std::find(touched_.begin(), touched_.end(), section) == touched_.end())
-        touched_.push_back(section);
+    Touch(section, pack);
 }
 
-std::vector<u32> Editor::TakeTouchedSections() {
-    std::vector<u32> out;
+std::vector<std::pair<u32, u32>> Editor::TakeTouched() {
+    std::vector<std::pair<u32, u32>> out;
     out.swap(touched_);
     return out;
 }
@@ -326,8 +325,7 @@ bool Editor::Undo() {
         *pack = std::move(state.data);
         loaded->collisionChanged = state.sectionChanged;
         loaded->changedCollisionPacks = state.changedPacks;
-        if (std::find(touched_.begin(), touched_.end(), state.section) == touched_.end())
-            touched_.push_back(state.section);
+        Touch(state.section, state.pack);
     }
     LOG_INFO("collision: undid \"%S\"", step.label.c_str());
     return true;
@@ -596,6 +594,34 @@ size_t Editor::SetRaceGroup(const std::vector<PolygonRef>& refs, u8 group) {
     return all.size();
 }
 
+size_t Editor::Flip(const std::vector<PolygonRef>& refs) {
+    const std::vector<PolygonRef> all = WithCopies(refs);
+    if (all.empty()) return 0;
+    std::vector<std::pair<u32, u32>> packs;
+    for (const PolygonRef& ref : all) packs.push_back({ ref.section, ref.pack });
+    Remember(L"Flip collision side", packs);
+    for (const PolygonRef& ref : all) {
+        nfs::CollisionPack* pack = Pack(ref.section, ref.pack);
+        if (!pack || ref.polygon >= pack->polygons.size()) continue;
+        Vec3* c = pack->polygons[ref.polygon].corners;
+        if (pack->polygons[ref.polygon].barrier) {
+            // Ends at 0/1 and 2/3; each slot keeps its own height (a wall's
+            // bottom at 0, top at 2).
+            for (int i : { 0, 1 }) {
+                std::swap(c[i].x, c[i + 2].x);
+                std::swap(c[i].y, c[i + 2].y);
+            }
+        } else if (pack->polygons[ref.polygon].quad) {
+            std::swap(c[1], c[3]);
+        } else {
+            std::swap(c[1], c[2]);
+            c[3] = c[2];
+        }
+        Changed(ref.section, ref.pack);
+    }
+    return all.size();
+}
+
 bool Editor::BeginMove(const std::vector<PolygonRef>& refs) {
     if (moving_) EndMove(false);
     moveRefs_ = WithCopies(refs);
@@ -624,8 +650,7 @@ void Editor::UpdateMove(const Vec3& offset) {
             if (!polygon.barrier) corner.z += offset.z;
         }
         pack->polygons[ref.polygon] = polygon;
-        if (std::find(touched_.begin(), touched_.end(), ref.section) == touched_.end())
-            touched_.push_back(ref.section);
+        Touch(ref.section, ref.pack);
     }
 }
 
@@ -858,7 +883,7 @@ void Editor::SetShape(const PolygonRef& ref, const nfs::CollisionPolygon& polygo
     nfs::CollisionPack* pack = Pack(ref.section, ref.pack);
     if (!pack || ref.polygon >= pack->polygons.size()) return;
     pack->polygons[ref.polygon] = polygon;
-    if (std::find(touched_.begin(), touched_.end(), ref.section) == touched_.end()) touched_.push_back(ref.section);
+    Touch(ref.section, ref.pack);
 }
 
 const nfs::CollisionPolygon* Editor::Polygon(const PolygonRef& ref) const {

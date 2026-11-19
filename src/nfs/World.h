@@ -5,6 +5,7 @@
 #include "io/MeshOverlay.h"
 #include "nfs/WorldAnimation.h"
 #include "nfs/Collision.h"
+#include "nfs/GameFormat.h"
 #include "nfs/Preculler.h"
 #include "nfs/SectionTable.h"
 #include "nfs/Scenery.h"
@@ -12,6 +13,7 @@
 #include "nfs/SolidList.h"
 #include "nfs/TexturePack.h"
 
+#include <deque>
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
@@ -53,11 +55,51 @@ struct LoadedSection {
     // into `collision`) whose polygons differ from what is on disk.
     bool collisionChanged = false;
     std::vector<u32> changedCollisionPacks;
+    // NFS World: the polygons the edit list took out of a pack when the region
+    // was read (pack index, polygons) -- what the Edits tab lists and can put back.
+    std::vector<std::pair<u32, std::vector<CollisionPolygon>>> savedCollisionCuts;
+    std::vector<std::pair<u32, std::vector<CollisionPolygon>>> savedCollisionAdds;   // and put into one
     void MarkCollisionChanged(u32 pack) {
         collisionChanged = true;
         for (u32 p : changedCollisionPacks) if (p == pack) return;
         changedCollisionPacks.push_back(pack);
     }
+    // Shipped scenery records the editor moved: where each stood and where
+    // it stands now. The instance itself already carries the new transform.
+    struct MovedNative {
+        u32  sceneryNumber = 0;
+        u32  record = 0;
+        Mat4 original;
+        Mat4 moved;
+    };
+    std::vector<MovedNative> movedNatives;
+
+    // NFS World keeps a texture's larger levels apart from its pack, in packs
+    // of their own (0xB3300011). Format is left Unknown here: it is the pack
+    // texture's, looked up by hash when the pixels are used.
+    std::vector<Texture> streamMips;
+
+    // Bytes that stand in for a range of the section's file when it is
+    // written: the pixels of a replaced texture.
+    struct BytePatch {
+        u32 hash = 0;
+        size_t offset = 0;        // into the section's file, as shipped
+        std::vector<u8> bytes;
+
+        // The stored copy as shipped and as it is with the replacement in.
+        // They differ when the image came in at another size, and then the
+        // pack is laid out again around it when the section is written.
+        size_t shippedSize = 0;
+        u16 shippedWidth = 0, shippedHeight = 0;
+        u8  shippedMips = 0;
+        u32 shippedBase = 0;
+        u16 width = 0, height = 0;
+        u8  mipCount = 0;
+        u32 base = 0;             // bytes of the largest level
+        u8  blockBytes = 16;      // of one 4x4 block in this format
+        bool Resized() const { return width != shippedWidth || height != shippedHeight; }
+    };
+    std::vector<std::unique_ptr<BytePatch>> texturePatches;
 
     // Models from other positioned sections to be copied into this one when
     // the placements are written, so they can be placed here. Hashes.
@@ -87,8 +129,7 @@ struct TextureAnimation {
     float            fps = 0.0f;
 };
 
-// The games whose worlds the editor reads.
-enum class Game { Underground2, Underground1 };
+// The games whose worlds the editor reads: nfs::Game, in nfs/GameFormat.h.
 
 // One track region: the L4Rx.BUN layout file plus its STREAML4Rx.BUN payload.
 //
@@ -175,6 +216,65 @@ public:
     // looking at: a texture found there is not the region's to copy or export.
     const Texture* FindDisplayTexture(u32 hash) const;
 
+    // The largest stored version of a texture. In NFS World that is usually
+    // one of the levels kept apart; `out` then has the pack texture's name and
+    // format with the larger pixels.
+    bool LargestTexture(u32 hash, Texture& out) const;
+    // NFS World: the texture as the game has it once everything is streamed
+    // in -- the levels kept apart, largest first, then the pack's own. `bytes`
+    // holds the levels in that order and `out.pixels` points into it. False
+    // when the pack's copy is all there is.
+    bool FullTexture(u32 hash, Texture& out, std::vector<u8>& bytes) const;
+
+    // NFS World: images that stand in for textures, by hash, and the file
+    // each was kept as (io/WorldWrite.h).
+    struct TextureReplacement {
+        u32 hash = 0;
+        std::wstring file;
+    };
+    std::vector<TextureReplacement> textureReplacements;
+
+    // NFS World: models whose mesh was edited (in Blender), by hash, and the
+    // model-space OBJ each was kept as (io/WorldMesh.h).
+    struct MeshReplacement {
+        u32 hash = 0;
+        std::wstring file;
+    };
+    std::vector<MeshReplacement> meshReplacements;
+
+    // NFS World: models the editor made (io/WorldMesh.h), each written into
+    // the file of one section, from the model-space OBJ it was kept as.
+    struct NewModel {
+        u32 hash = 0;
+        u32 section = 0;          // the section's number
+        std::wstring file;
+    };
+    std::vector<NewModel> newModels;
+
+    // NFS World: textures the editor made for new models (io/WorldTexture.h),
+    // written into every texture section whose pack holds `like`, the game
+    // texture whose header and format they copy. A deque: the in-memory pack
+    // entry points into `pixels`.
+    struct NewTexture {
+        u32 hash = 0, like = 0;
+        std::string name;              // upper case, what `hash` is the hash of
+        std::wstring file;             // the kept image, by name in frs-original\textures
+        u32 width = 0, height = 0, mips = 0, fourCc = 0, baseBytes = 0;
+        std::vector<u8> pixels;        // every level, largest first
+        // A game texture copied for a model placed where it is not loaded: the
+        // header (0x90 bytes) it ships with, and more textures of the sections
+        // that need it whose packs take it too. Made again at every Save.
+        std::vector<u8> header;
+        std::vector<u32> moreLikes;
+    };
+    std::deque<NewTexture> newTextures;
+
+    // A model the editor made, put into a loaded section (a solid list of its
+    // own) and into the index FindModel reads. Replaces one of the same hash.
+    void AddModel(size_t loadedIndex, SolidObject model);
+    // Takes such a model out again.
+    void RemoveModel(u32 hash);
+
     // Every distinct texture in the region, deduplicated by hash. A region
     // repeats textures across its packs, so the raw packs are not a useful list.
     std::vector<const Texture*> AllTextures() const;
@@ -258,6 +358,11 @@ private:
         return layoutUnpacked_.empty() ? layout_.Span() : ByteSpan{ layoutUnpacked_.data(), layoutUnpacked_.size() };
     }
     Game         game_ = Game::Underground2;
+    // NFS World: the unpacked GLOBAL\GlobalB.lzc and the stand-in section
+    // its sky domes are loaded under (World::LoadWorldSky).
+    std::vector<u8> skyBundle_;
+    Section      skySection_;
+    void LoadWorldSky(const std::wstring& tracksDirectory);
     u32          trackNumber_ = 0;
     bool OpenUnderground1(const std::wstring& tracksDirectory, const std::wstring& region);
     // Underground 1's collision, one pack per drivable section (by zone).
@@ -268,6 +373,8 @@ private:
     std::vector<std::unique_ptr<FileMap>>     globalFiles_;
     std::vector<std::unique_ptr<TexturePack>> globalPacks_;
     void OpenGlobalPacks(const std::wstring& tracksDirectory);
+    bool OpenWorldStream(const std::wstring& tracksDirectory, const std::wstring& region);
+    std::wstring tracksDirectory_;
     SectionTable table_;
     std::vector<std::string> raceGroups_;
     std::unordered_map<u32, TextureAnimation> textureAnimations_;

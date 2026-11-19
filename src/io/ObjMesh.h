@@ -35,6 +35,11 @@ struct ObjMesh {
     std::vector<Vec3> normals;
     std::vector<Vec2> uvs;
     std::vector<u16>  indices;
+    // Per vertex: which of the object's own `v` lines it took its position
+    // from, counting from the object's first. Blender writes a mesh's
+    // vertices in its own order, so for a file the editor exported this is
+    // the vertex the mesh had in the game.
+    std::vector<u32>  sourcePositions;
 
     std::vector<ObjFaceGroup> groups;
 

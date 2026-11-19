@@ -1,7 +1,10 @@
 #include "nfs/World.h"
 
+#include "nfs/GameFormat.h"
+
 #include "io/MeshOverlay.h"
 #include "nfs/Jdlz.h"
+#include "nfs/EaCompress.h"
 
 #include "core/Log.h"
 
@@ -13,6 +16,7 @@
 
 #include <algorithm>
 #include <iterator>
+#include <map>
 
 namespace nfs {
 
@@ -76,8 +80,16 @@ std::vector<std::wstring> World::AvailableRegions(const std::wstring& tracksDire
         std::wstring name = find.cFileName;               // STREAML4RA.BUN
         if (name.size() <= 10) continue;
         // Underground 1's per-track parts, STREAML1RA_1001.BUN, are not regions.
-        if (name.find(L'_') != std::wstring::npos) continue;
+        // NFS World's files are: it has no stream of its own, only one file a
+        // section (below).
+        if (name.rfind(L"STREAML5R", 0) != 0 && name.find(L'_') != std::wstring::npos) continue;
         name = name.substr(6, name.size() - 6 - 4);       // L4RA
+        // NFS World: one file per section, STREAML5RA_<number or 0xhash>.BUN.
+        const size_t underscore = name.find(L'_');
+        if (underscore != std::wstring::npos) {
+            name.resize(underscore);
+            if (std::find(regions.begin(), regions.end(), name) != regions.end()) continue;
+        }
         regions.push_back(name);
     } while (::FindNextFileW(handle, &find));
 
@@ -95,6 +107,25 @@ bool World::Open(const std::wstring& tracksDirectory, const std::wstring& region
 
     if (!layout_.Open(tracksDirectory + L"\\" + region + L".BUN"))
         return false;
+
+    // NFS World's regions are L5Rx; everything else is read as Underground 2.
+    ActiveGame() = region.rfind(L"L5R", 0) == 0 ? Game::World : Game::Underground2;
+    tracksDirectory_ = tracksDirectory;
+
+    if (IsWorld()) {
+        if (!OpenWorldStream(tracksDirectory, region)) {
+            Close();
+            return false;
+        }
+        OpenGlobalPacks(tracksDirectory);
+        LoadWorldSky(tracksDirectory);
+        // No race barrier groups to name: NFS World has no 0x3412F (none in
+        // the 5790 TRACKS files, no loader for it in nfsw.exe), and its
+        // collision polygons carry no group byte (WorldCollision.cpp).
+        region_ = region;
+        sectionToLoaded_.assign(table_.Sections().size(), -1);
+        return true;
+    }
 
     if (!stream_.Open(tracksDirectory + L"\\STREAM" + region + L".BUN")) {
         layout_.Close();
@@ -232,6 +263,82 @@ std::string World::RaceBarrierGroupName(u8 group) const {
     return "GROUP_" + std::to_string(group);
 }
 
+// NFS World: lays every section's file end to end in a reserved range, so the
+// rest of the editor keeps addressing sections by an offset into one stream.
+// Nothing is read here; LoadSection reads a section's file when it is opened.
+bool World::OpenWorldStream(const std::wstring& tracksDirectory, const std::wstring& region) {
+    if (!table_.Parse(layout_.Span())) return false;
+
+    std::unordered_map<std::wstring, u64> sizes;
+    WIN32_FIND_DATAW find{};
+    HANDLE handle = ::FindFirstFileW((tracksDirectory + L"\\STREAM" + region + L"_*.BUN").c_str(), &find);
+    if (handle != INVALID_HANDLE_VALUE) {
+        do {
+            std::wstring name = find.cFileName;
+            for (wchar_t& c : name) c = (wchar_t)::towupper(c);
+            sizes[name] = ((u64)find.nFileSizeHigh << 32) | find.nFileSizeLow;
+        } while (::FindNextFileW(handle, &find));
+        ::FindClose(handle);
+    }
+
+    // A section the editor has written to is read from the copy kept of the
+    // shipped file, so what is shown is always the game as it came plus the
+    // edit list -- never an edit applied on top of itself.
+    const std::wstring kept = tracksDirectory + L"\\frs-original";
+    std::unordered_map<std::wstring, u64> keptSizes;
+    handle = ::FindFirstFileW((kept + L"\\STREAM" + region + L"_*.BUN").c_str(), &find);
+    if (handle != INVALID_HANDLE_VALUE) {
+        do {
+            std::wstring name = find.cFileName;
+            for (wchar_t& c : name) c = (wchar_t)::towupper(c);
+            keptSizes[name] = ((u64)find.nFileSizeHigh << 32) | find.nFileSizeLow;
+        } while (::FindNextFileW(handle, &find));
+        ::FindClose(handle);
+    }
+
+    // 64 KiB steps keep every payload's alignment what it is inside its own
+    // file, which is what the chunk reader derives the filler from.
+    constexpr u64 kStep = 0x10000;
+    u64 offset = 0;
+    size_t missing = 0;
+    for (Section& section : table_.MutableSections()) {
+        std::wstring key = section.fileName;
+        for (wchar_t& c : key) c = (wchar_t)::towupper(c);
+        const auto found = sizes.find(key);
+        const auto keptCopy = keptSizes.find(key);
+        if (keptCopy != keptSizes.end()) {
+            section.streamSize = (u32)keptCopy->second;
+            section.sourcePath = kept + L"\\" + section.fileName;
+        } else if (found != sizes.end()) {
+            section.streamSize = (u32)found->second;
+            section.sourcePath = tracksDirectory + L"\\" + section.fileName;
+        } else {
+            ++missing;
+            section.streamSize = 0;
+        }
+
+        section.streamOffset = offset;
+        section.geometrySize = section.streamSize;
+        section.originalStreamOffset = (u32)section.streamOffset;
+        section.originalStreamSize   = section.streamSize;
+        section.originalOtherSize    = section.streamSize;
+        offset += (section.streamSize + kStep - 1) & ~(kStep - 1);
+    }
+    if (missing) LOG_WARN("%zu sections of the table have no file in TRACKS", missing);
+    LOG_INFO("NFS World stream: %zu section files, %llu MiB of address space",
+             sizes.size(), (unsigned long long)(offset >> 20));
+
+    // Read before the file is let go: zones and lists are copied out, only
+    // their record offsets point back into it.
+    preculler_.Parse(layout_.Span());
+
+    // The table is parsed; the file is let go so that saving can write the
+    // section sizes back into it (io/WorldWrite.cpp).
+    layout_.Close();
+
+    return stream_.Reserve(offset ? offset : kStep);
+}
+
 void World::Close() {
     region_.clear();
     raceGroups_.clear();
@@ -240,6 +347,8 @@ void World::Close() {
     layout_.Close();
     layoutUnpacked_.clear();
     layoutUnpacked_.shrink_to_fit();
+    skyBundle_.clear();
+    skyBundle_.shrink_to_fit();
     trackCollision_.clear();
     game_ = Game::Underground2;
     trackNumber_ = 0;
@@ -280,6 +389,12 @@ const LoadedSection* World::LoadSection(const Section& section) {
         return nullptr;
     }
 
+    if (IsWorld()) {
+        if (section.streamSize == 0 ||
+            !stream_.Load(section.streamOffset, section.sourcePath, section.streamSize))
+            return nullptr;
+    }
+
     const ByteSpan buffer = SectionBytes(section);
 
     auto loadedSection = std::make_unique<LoadedSection>();
@@ -308,7 +423,10 @@ const LoadedSection* World::LoadSection(const Section& section) {
 
     ChunkReader reader(buffer, section.streamOffset);
     Chunk chunk;
+    std::vector<Chunk> animationChunks;   // NFS World: its moving scenery (WorldAnimation.h)
     while (reader.Next(chunk)) {
+        if (IsWorld() && (chunk.id & 0xFFFFFF0Fu) == 0x37200u && chunk.id >= 0x37220u && chunk.id <= 0x37270u)
+            animationChunks.push_back(chunk);
         if (chunk.id == kChunkSolidListPack) {
             SolidList list;
             if (ParseSolidList(chunk, list)) {
@@ -421,14 +539,46 @@ const LoadedSection* World::LoadSection(const Section& section) {
                 }
                 loadedSection->collision.push_back(std::move(pack));
             }
+        } else if (chunk.id == kChunkWorldCollisionPack && IsWorld()) {
+            CollisionPack pack;
+            if (ParseWorldCollision(chunk, pack)) {
+                static const char* selfTest = std::getenv("FRS_WORLD_COLLISION_SELFTEST");
+                if (selfTest) WorldCollisionSelfTest(chunk, pack, (u32)std::max(2, std::atoi(selfTest)));
+                loadedSection->collision.push_back(std::move(pack));
+            }
         } else if (chunk.id == kChunkTexturePack) {
             auto pack = std::make_unique<TexturePack>();
             if (pack->Parse(chunk))
                 loadedSection->texturePacks.push_back(std::move(pack));
         } else if (chunk.id == 0xB0300100u) {
             ReadTextureAnimations(chunk);
+        } else if (chunk.id == kChunkWorldStreamMips) {
+            ByteSpan list, pixels;
+            ChunkReader parts = ChunkReader::Children(chunk);
+            Chunk part;
+            while (parts.Next(part)) {
+                if (part.id == kChunkWorldStreamMipList) list = part.data;
+                else if (part.id == kChunkTpkPixelData)  pixels = part.data;
+            }
+            for (size_t at = 0; at + 32 <= list.size; at += 32) {
+                Texture level;
+                level.hash          = list.read<u32>(at);
+                // One level is stored for each texture here, the next texture's
+                // right behind it. The size at +8 and the count at +28 are
+                // those of a whole chain from this level down, which is not
+                // in the file: writing by them ran into the neighbour.
+                level.baseLevelSize = list.read<u32>(at + 12);
+                level.pixels        = pixels.sub(list.read<u32>(at + 4), level.baseLevelSize);
+                level.width         = list.read<u16>(at + 16);
+                level.height        = list.read<u16>(at + 18);
+                level.mipCount      = 1;
+                if (level.width && level.height && !level.pixels.empty())
+                    loadedSection->streamMips.push_back(std::move(level));
+            }
         }
     }
+
+    if (!animationChunks.empty()) objectAnimations_.AddWorldSection(animationChunks, (int)section.number);
 
     if (IsUnderground1()) {
         const auto found = trackCollision_.find(section.number);
@@ -436,6 +586,7 @@ const LoadedSection* World::LoadSection(const Section& section) {
     }
 
     if (loadedSection->solidLists.empty() && loadedSection->texturePacks.empty() &&
+        loadedSection->streamMips.empty() &&
         loadedSection->scenery.Empty() && loadedSection->collision.empty() &&
         loadedSection->placements.empty() && loadedSection->sceneryNumbers.empty())
         return nullptr;
@@ -504,6 +655,15 @@ void World::LoadAllSections(void (*progress)(size_t, size_t, void*), void* userD
     for (size_t i = 0; i < sections.size(); ++i) {
         LoadSection(sections[i]);
         if (progress) progress(i + 1, sections.size(), userData);
+    }
+    LogWorldCollisionSelfTest();
+    if (IsWorld()) {
+        size_t baked = 0;
+        for (const WorldAnimationTree& tree : objectAnimations_.Trees())
+            for (const WorldAnimationPart& part : tree.parts) baked += !part.baked.empty();
+        LOG_INFO("NFS World animations: %zu trees, %zu placements, %zu parts with frames; visibility: %zu zones",
+                 objectAnimations_.Trees().size(), objectAnimations_.Placements().size(), baked,
+                 preculler_.ZoneCount());
     }
 
     // Underground 1's scenery names no models: name each after the model it
@@ -619,6 +779,34 @@ std::vector<const SolidObject*> World::AllModels() const {
     return out;
 }
 
+// The list is a SolidList of its own: moving the vector of lists moves each
+// list's object vector, so pointers into the other lists stay good.
+void World::AddModel(size_t loadedIndex, SolidObject model) {
+    RemoveModel(model.hash);
+    if (loadedIndex >= loaded_.size()) return;
+    LoadedSection& section = *loaded_[loadedIndex];
+    SolidList list;
+    list.path = "frs-new";
+    list.objects.push_back(std::move(model));
+    section.solidLists.push_back(std::move(list));
+    const SolidObject& added = section.solidLists.back().objects.back();
+    modelsByHash_[added.hash] = &added;
+    modelHome_[added.hash] = loadedIndex;
+}
+
+void World::RemoveModel(u32 hash) {
+    for (auto& section : loaded_) {
+        auto& lists = section->solidLists;
+        const auto gone = std::remove_if(lists.begin(), lists.end(), [&](const SolidList& list) {
+            return list.path == "frs-new" && list.objects.size() == 1 && list.objects[0].hash == hash;
+        });
+        if (gone == lists.end()) continue;
+        lists.erase(gone, lists.end());
+        modelsByHash_.erase(hash);
+        modelHome_.erase(hash);
+    }
+}
+
 const SolidObject* World::FindModel(u32 hash) const {
     const auto it = modelsByHash_.find(hash);
     return it == modelsByHash_.end() ? nullptr : it->second;
@@ -649,6 +837,62 @@ const Texture* World::FindTexture(u32 hash) const {
         for (const auto& pack : section->texturePacks)
             if (const Texture* texture = pack->Find(hash)) return texture;
     return nullptr;
+}
+
+bool World::LargestTexture(u32 hash, Texture& out) const {
+    const Texture* base = FindTexture(hash);
+    if (!base) return false;
+    out = *base;
+    for (const auto& section : loaded_)
+        for (const Texture& level : section->streamMips) {
+            if (level.hash != hash || (u32)level.width * level.height <= (u32)out.width * out.height)
+                continue;
+            out.width         = level.width;
+            out.height        = level.height;
+            out.mipCount      = level.mipCount;
+            out.baseLevelSize = level.baseLevelSize;
+            out.pixels        = level.pixels;
+        }
+    return true;
+}
+
+bool World::FullTexture(u32 hash, Texture& out, std::vector<u8>& bytes) const {
+    const Texture* base = FindTexture(hash);
+    if (!base || base->pixels.empty()) return false;
+
+    // One of each size, smallest first: the same level is stored in every
+    // section that uses the texture.
+    std::vector<const Texture*> above;
+    for (const auto& section : loaded_)
+        for (const Texture& level : section->streamMips) {
+            if (level.hash != hash || level.width <= base->width || level.pixels.empty()) continue;
+            const auto at = std::lower_bound(above.begin(), above.end(), level.width,
+                                             [](const Texture* have, u32 width) { return have->width < width; });
+            if (at == above.end() || (*at)->width != level.width) above.insert(at, &level);
+        }
+
+    // A chain: each level twice the one under it, from the pack's first up.
+    u32 width = base->width, height = base->height;
+    size_t levels = 0;
+    for (; levels < above.size(); ++levels) {
+        if (above[levels]->width != width * 2 || above[levels]->height != height * 2) break;
+        width *= 2;
+        height *= 2;
+    }
+    if (!levels) return false;
+
+    bytes.clear();
+    for (size_t i = levels; i-- > 0;)
+        bytes.insert(bytes.end(), above[i]->pixels.data, above[i]->pixels.data + above[i]->pixels.size);
+    bytes.insert(bytes.end(), base->pixels.data, base->pixels.data + base->pixels.size);
+
+    out = *base;
+    out.width         = above[levels - 1]->width;
+    out.height        = above[levels - 1]->height;
+    out.mipCount      = (decltype(out.mipCount))(std::max<u32>(base->mipCount, 1) + levels);
+    out.baseLevelSize = above[levels - 1]->baseLevelSize;
+    out.pixels        = ByteSpan{ bytes.data(), bytes.size() };
+    return true;
 }
 
 const Texture* World::FindDisplayTexture(u32 hash) const {
@@ -905,6 +1149,94 @@ void World::NameUnderground1Scenery(LoadedSection& section) const {
     for (SceneryInfo& info : section.scenery.infos)
         if (info.name.empty())
             if (const SolidObject* model = FindModel(info.solidHash)) info.name = model->name;
+}
+
+// NFS World's sky is no track model: the domes (SKYDOME_1_DAWN, _NOON,
+// _LATEAFTERNOON, _SUNSET, _DUSK, _NIGHT; solid list "eLabSkyDomes.bin") are
+// in GLOBAL\GlobalB.lzc and their textures in GLOBAL\SkyDomeTextures.bin
+// (tools/nfsw/sky_probe.py). GlobalB.lzc: u32 0x66113388, unpacked size,
+// packed size, u32; then blocks {u32 0x55441122, size, packed (with this
+// 24-byte header), offset in the output, offset of the block - 16, 0}, each
+// a JDLZ or HUFF stream. Its solid lists that hold a SKYDOME go in a loaded
+// section of their own, at the origin like the library sections, with no
+// scenery: only the Sky option draws them.
+void World::LoadWorldSky(const std::wstring& tracksDirectory) {
+    const size_t slash = tracksDirectory.find_last_of(L"\\/");
+    const std::wstring global = (slash == std::wstring::npos ? L"." : tracksDirectory.substr(0, slash)) + L"\\GLOBAL\\";
+
+    auto textures = std::make_unique<FileMap>();
+    if (textures->Open(global + L"SkyDomeTextures.bin")) {
+        size_t packs = 0;
+        ChunkReader top(textures->Span(), 0);
+        Chunk chunk;
+        while (top.Next(chunk)) {
+            if (chunk.id != kChunkTexturePack) continue;
+            auto pack = std::make_unique<TexturePack>();
+            if (pack->Parse(chunk)) { globalPacks_.push_back(std::move(pack)); ++packs; }
+        }
+        LOG_INFO("sky textures: %zu packs from SkyDomeTextures.bin", packs);
+        globalFiles_.push_back(std::move(textures));
+    }
+
+    std::vector<u8> file;
+    if (!ReadWholeFile(global + L"GlobalB.lzc", file) || file.size() < 16 ||
+        *reinterpret_cast<const u32*>(file.data()) != 0x66113388u) {
+        LOG_WARN("sky: GLOBAL\\GlobalB.lzc missing or not the packed layout");
+        return;
+    }
+    const u32 total = *reinterpret_cast<const u32*>(file.data() + 4);
+    skyBundle_.assign(total, 0);
+    size_t blocks = 0, failed = 0;
+    std::vector<u8> out;
+    for (size_t at = 16; at + 24 <= file.size();) {
+        const u32* head = reinterpret_cast<const u32*>(file.data() + at);
+        if (head[0] != 0x55441122u || head[2] < 24 || at + head[2] > file.size()) break;
+        out.clear();
+        if (EaDecompress(ByteSpan{ file.data() + at + 24, head[2] - 24 }, out) && out.size() == head[1] &&
+            (size_t)head[3] + out.size() <= skyBundle_.size()) {
+            std::memcpy(skyBundle_.data() + head[3], out.data(), out.size());
+            ++blocks;
+        } else {
+            ++failed;
+        }
+        at += head[2];
+    }
+
+    auto sky = std::make_unique<LoadedSection>();
+    skySection_ = Section{};
+    skySection_.name = "SKY";
+    skySection_.fileName = L"GlobalB.lzc";
+    sky->info = &skySection_;
+    // The solid lists sit inside other containers, so every level is searched.
+    std::vector<ChunkReader> readers{ ChunkReader(ByteSpan{ skyBundle_.data(), skyBundle_.size() }, 0) };
+    std::map<u32, size_t> topIds;
+    Chunk chunk;
+    while (!readers.empty()) {
+        if (!readers.back().Next(chunk)) { readers.pop_back(); continue; }
+        if (readers.size() == 1) ++topIds[chunk.id];
+        if (chunk.id != kChunkSolidListPack) {
+            if (chunk.IsContainer() && readers.size() < 6) readers.push_back(ChunkReader::Children(chunk));
+            continue;
+        }
+        SolidList list;
+        if (!ParseSolidList(chunk, list)) continue;
+        if (std::none_of(list.objects.begin(), list.objects.end(),
+                         [](const SolidObject& o) { return o.name.rfind("SKYDOME", 0) == 0; }))
+            continue;
+        for (const SolidObject& o : list.objects) LOG_INFO("sky: model %s from GlobalB.lzc", o.name.c_str());
+        sky->solidLists.push_back(std::move(list));
+    }
+    for (const auto& [id, count] : topIds) LOG_INFO("sky: GlobalB.lzc top-level chunk %08X x%zu", id, count);
+    LOG_INFO("sky: GlobalB.lzc %u bytes, %zu blocks unpacked, %zu failed, %zu solid lists with a dome", total,
+             blocks, failed, sky->solidLists.size());
+    if (sky->solidLists.empty()) return;
+    for (SolidList& list : sky->solidLists)
+        for (SolidObject& object : list.objects) {
+            sky->bounds.Add(object.bounds);
+            modelsByHash_.emplace(object.hash, &object);
+            modelHome_.emplace(object.hash, loaded_.size());
+        }
+    loaded_.push_back(std::move(sky));
 }
 
 } // namespace nfs

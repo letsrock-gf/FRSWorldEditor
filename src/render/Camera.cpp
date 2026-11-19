@@ -68,10 +68,23 @@ void Camera::FrameBounds(const Aabb& bounds) {
 
     LookAt(centre + offset, centre);
 
-    // Scale the clip planes to the world being viewed. The movement speed is
-    // left alone: it is the one the person set, not a property of the view.
-    nearZ_ = std::max(0.5f, radius * 0.001f);
-    farZ_  = std::max(radius * 8.0f, 2000.0f);
+    // The clip planes are the person's (View > Clip Start/End), like the
+    // movement speed: framing something does not change them.
+}
+
+void Camera::OrbitTo(const Vec3& pivot, float yaw, float pitch) {
+    // The pivot keeps its place in view space, so it keeps its place on screen.
+    const Vec3 offset = position_ - pivot;
+    const float right = Dot(offset, Right()), forward = Dot(offset, Forward()), up = Dot(offset, Up());
+    SetYawPitch(yaw, pitch);
+    position_ = pivot + Right() * right + Forward() * forward + Up() * up;
+}
+
+void Camera::Orbit(const Vec3& pivot, float deltaX, float deltaY) {
+    float yaw = yaw_ - deltaX * sensitivity_;
+    if (yaw >  kPi) yaw -= 2.0f * kPi;
+    if (yaw < -kPi) yaw += 2.0f * kPi;
+    OrbitTo(pivot, yaw, pitch_ - deltaY * sensitivity_);
 }
 
 Mat4 Camera::ViewMatrix() const {

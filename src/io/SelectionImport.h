@@ -6,6 +6,7 @@
 #include "io/SectionSplice.h"
 
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace nfs { class World; }
@@ -114,3 +115,13 @@ bool PlanImport(const nfs::World& world, const std::wstring& objPath, ImportPlan
 // Writes the plan as overlay files under `gameFolder`\models.
 bool ApplyImport(const ImportPlan& plan, const std::wstring& gameFolder,
                  const std::wstring& region, ImportSummary& summary);
+
+// The manifest an OBJ was exported with: by object name, the mesh's hash and
+// the placement it was written from, plus the shared origin. False when no
+// manifest beside the OBJ names its objects. (The NFS World import reads it.)
+struct ManifestObject {
+    u32  hash = 0;
+    Mat4 transform;
+};
+bool ReadExportManifest(const std::wstring& objPath, std::unordered_map<std::string, ManifestObject>& objects,
+                        Vec3& origin);

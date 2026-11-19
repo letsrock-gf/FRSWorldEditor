@@ -3,11 +3,16 @@
 #include "core/Log.h"
 #include "render/RenderExtension.h"
 #include "render/GameLook.h"
+#include "nfs/GameFormat.h"
+
+#include "imgui.h"
+#include "imgui_internal.h"
 
 #include <windows.h>
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 #include <unordered_set>
@@ -270,9 +275,47 @@ void WorldRenderer::BuildInstances(const nfs::World& world) {
     LOG_INFO("road reflection: %zu of %zu placements reflect (flag 0x40, SceneryInfo +0x28 model)", reflecting, total);
 }
 
+void WorldRenderer::ReuploadSections(const nfs::World& world, const std::vector<size_t>& loaded) {
+    if (world_ != &world || !context_ || !context_->IsValid()) return;
+    for (size_t i : loaded) {
+        if (i >= sections_.size() || i >= world.Loaded().size()) continue;
+        auto gpu = std::make_unique<GpuSection>();
+        if (gpu->Upload(context_->Device(), *world.Loaded()[i])) {
+            sections_[i].libraryBounds = gpu->Bounds();
+            sections_[i].gpu = std::move(gpu);
+        } else {
+            sections_[i].gpu.reset();
+        }
+    }
+    objectByHash_.clear();
+    BuildInstances(world);
+}
+
 void WorldRenderer::RebuildInstances(const nfs::World& world) {
     if (world_ != &world) return;
     BuildInstances(world);
+}
+
+void WorldRenderer::UpdateNative(u32 loadedSection, int native, const Mat4& transform) {
+    if (loadedSection >= sections_.size()) return;
+    for (GpuInstance& instance : sections_[loadedSection].instances) {
+        if (instance.native != native) continue;
+        const GpuSection* owner = sections_[instance.section].gpu.get();
+        const nfs::SolidObject* model =
+            owner && instance.object < owner->Objects().size() ? owner->Objects()[instance.object].source
+                                                                : nullptr;
+        instance.transform = transform;
+        instance.mirrored  = Determinant3x3(transform) < 0.0f;
+        if (model && model->bounds.Valid()) {
+            instance.worldBounds = Transform(model->bounds, transform);
+            sections_[loadedSection].instanceBounds.Add(instance.worldBounds);
+        }
+        for (PickResult& picked : selection_) {
+            if (picked.loadedSection != loadedSection || picked.native != native) continue;
+            picked.transform = transform;
+            picked.worldBounds = instance.worldBounds;
+        }
+    }
 }
 
 void WorldRenderer::UpdatePlacement(u32 loadedSection, int placement, const Mat4& transform) {
@@ -527,8 +570,10 @@ void WorldRenderer::Render(const Camera& camera) {
         glReflectionValid_ = false;
         if (gameLook) {
             UpdateGameZone(camera.Position());
-            RenderReflection(device, camera, view, projection);
+            if (!glNfsw_) RenderReflection(device, camera, view, projection);   // NFS World: not done
         }
+        if (gameLook_ && !gameLook) DrawGameLookMessage();
+        if (gameLook && glNfsw_) DrawGameLookControls();
     }
 
     const D3DMATRIX d3dView       = ToD3D(view);
@@ -545,6 +590,7 @@ void WorldRenderer::Render(const Camera& camera) {
     ApplyRenderStates();
     animationClock_ = start;
     if (gameLook) {
+        if (glNfsw_ && !worldOnly_) RenderShadowMapNfsw(device, camera);
         BeginGameLook(device, view, projection, !worldOnly_, camera.Position());
     }
 
@@ -687,6 +733,15 @@ void WorldRenderer::Render(const Camera& camera) {
             if (culling_ && instance.worldBounds.Valid() &&
                 !frustum.Intersects(instance.worldBounds)) continue;
 
+            // size on screen = size / (2 * distance * tan(fov / 2)) * height
+            if (detailPixels_ > 0.0f && instance.worldBounds.Valid() && context_->Height()) {
+                const float perPixel = 2.0f * std::tan(camera.FieldOfView() * 0.5f) /
+                                       (float)context_->Height();
+                if (instance.worldBounds.Radius() <
+                    Length(instance.worldBounds.Center() - eye) * perPixel * detailPixels_)
+                    continue;
+            }
+
             const GpuObject& object = sections_[instance.section].gpu->Objects()[instance.object];
             if (BackdropHidden(object)) continue;
             if (BackdropOutOfZone(object, section.number)) continue;   // Game look: not in the camera's zone list
@@ -727,7 +782,7 @@ void WorldRenderer::Render(const Camera& camera) {
     }
     for (RenderExtension* extension : extensions_) extension->DrawWithWorld(device, *this);
     DrawSelection(device);
-    if (showCollision_) DrawCollision(device, collisionVisible);
+    if (showCollision_) DrawCollision(device, collisionVisible, culling_ ? &frustum : nullptr);
     collisionDrawn_ = showCollision_ ? collisionVisible : std::vector<size_t>{};
     for (RenderExtension* extension : extensions_) extension->DrawOverlay(device, camera, *this);
     DrawToolOverlay(device);
@@ -762,6 +817,11 @@ void WorldRenderer::PickOne(const Ray& ray, const GpuObject& object, const Mat4&
                             int placement, int native) const {
     if (!object.source) return;
     if (placement >= 0 && placement == excludePlacement_ && sectionIndex == excludeSection_) return;
+    // The same for one of the map's own objects, by its handle: without it
+    // an object being dragged finds its own top as the ground.
+    if (native >= 0 && IsNativeHandle(excludePlacement_) && native == NativeOfHandle(excludePlacement_) &&
+        sectionIndex == excludeSection_)
+        return;
     // Pickable exactly when drawn: with the game look on, the panorama and
     // distant pieces are drawn as ordinary scenery even with the backdrop off.
     if (BackdropHidden(object)) return;
@@ -1058,6 +1118,46 @@ bool WorldRenderer::ToggleSelection(const PickResult& selection) {
     return true;
 }
 
+size_t WorldRenderer::SelectSameModel() {
+    if (selection_.empty() || !selection_.front().object) return 0;
+    // By name: each section's file holds its own copy of a model it uses.
+    const std::string name = selection_.front().object->name;
+
+    std::vector<PickResult> chosen;
+    for (size_t i = 0; i < sections_.size(); ++i) {
+        const SectionRender& section = sections_[i];
+        if (section.alternate && !showAlternate_) continue;
+        const std::vector<char>& hiddenHere = HiddenFlags(i);
+        for (size_t k = 0; k < section.instances.size(); ++k) {
+            const GpuInstance& instance = section.instances[k];
+            if (hiddenHere[k]) continue;
+            const GpuObject& object = sections_[instance.section].gpu->Objects()[instance.object];
+            if (!object.source || object.source->name != name) continue;
+
+            PickResult same;
+            same.object        = object.source;
+            same.transform     = instance.transform;
+            same.worldBounds   = instance.worldBounds;
+            same.fromInstance  = true;
+            same.gpuSection    = instance.section;
+            same.gpuObject     = instance.object;
+            same.loadedSection = (u32)i;
+            same.placement     = instance.placement;
+            same.native        = instance.native;
+            if (world_ && i < world_->Loaded().size())
+                if (const nfs::Section* info = world_->Loaded()[i]->info) same.sectionName = info->name;
+            chosen.push_back(std::move(same));
+        }
+    }
+    // Something drawn by its own matrix and placed by no scenery: left as it is.
+    if (chosen.empty()) return selection_.size();
+
+    selection_ = std::move(chosen);
+    collisionSelection_.clear();
+    selectedOwner_ = nullptr; selectedExtra_ = -1;
+    return selection_.size();
+}
+
 void WorldRenderer::DrawSelection(IDirect3DDevice9* device) {
     if (selection_.empty()) return;
 
@@ -1115,7 +1215,8 @@ void WorldRenderer::DrawSelection(IDirect3DDevice9* device) {
     device->SetRenderState(D3DRS_CULLMODE, backfaceCulling_ ? cullMode_ : D3DCULL_NONE);
 }
 
-void WorldRenderer::DrawCollision(IDirect3DDevice9* device, const std::vector<size_t>& visible) {
+void WorldRenderer::DrawCollision(IDirect3DDevice9* device, const std::vector<size_t>& visible,
+                                  const Frustum* frustum) {
     if (visible.empty()) return;
 
     device->SetTexture(0, nullptr);
@@ -1139,14 +1240,12 @@ void WorldRenderer::DrawCollision(IDirect3DDevice9* device, const std::vector<si
     device->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
     device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
 
-    // Ground polygons have no consistent winding and walls are seen from both
-    // sides, so nothing is culled.
-    device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
-
-    for (size_t index : visible) sections_[index].collision->DrawSurfaces(device);
+    // Ground polygons have no consistent winding, so they are not culled;
+    // walls carry a copy per side and are (the side facing away is not drawn).
+    for (size_t index : visible) sections_[index].collision->DrawSurfaces(device, cullMode_, frustum);
 
     device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-    for (size_t index : visible) sections_[index].collision->DrawOutlines(device);
+    for (size_t index : visible) sections_[index].collision->DrawOutlines(device, frustum);
 
     DrawCollisionSelection(device);
 
@@ -1201,6 +1300,13 @@ void WorldRenderer::DrawSky(IDirect3DDevice9* device, const Camera& camera, Rend
         for (const GpuObject& object : sections_[i].gpu->Objects()) {
             if (!object.source || !object.isBackdrop || object.source->name.find("SKYDOME") == std::string::npos)
                 continue;
+            // NFS World loads six domes (GlobalB.lzc SKYDOME_1_*): the game look draws its stage's, the plain
+            // view the noon one.
+            if (nfs::IsWorld()) {
+                const u32 wanted = glNfsw_ && gameLook_ && glNfswSkyHash_ ? glNfswSkyHash_
+                                                                          : gamelook::GameHash("SKYDOME_1_NOON");
+                if (gamelook::GameHash(object.source->name.c_str()) != wanted) continue;
+            }
             const Aabb& local = object.source->bounds;
             const float radius = local.Valid() ? std::max({ local.max.x - local.min.x, local.max.y - local.min.y,
                                                             local.max.z - local.min.z }) * 0.5f : 1000.0f;
@@ -1225,6 +1331,17 @@ void WorldRenderer::DrawSky(IDirect3DDevice9* device, const Camera& camera, Rend
             Mat4 transform = Mat4::Identity();
             for (int r = 0; r < 3; ++r)
                 for (int c = 0; c < 3; ++c) transform.m[r][c] = object.transform.m[r][c] * scale;
+            // NFS World: the blended sunandsky SkyDomeRotation (state +0x158 -> sky +8, rea-sky-road-flares.md),
+            // degrees about +z; it equals the sun heading 0xD4496F5F in every stage.
+            if (nfs::IsWorld() && glNfsw_ && gameLook_ && glSkyRotation_ != 0.0f) {
+                const float a = glSkyRotation_ * 3.14159265f / 180.0f;
+                Mat4 spin = Mat4::Identity();
+                spin.m[0][0] = std::cos(a);
+                spin.m[0][1] = std::sin(a);
+                spin.m[1][0] = -std::sin(a);
+                spin.m[1][1] = std::cos(a);
+                transform = transform * spin;
+            }
             const Vec3 eye = camera.Position();
             transform.m[3][0] = eye.x;
             transform.m[3][1] = eye.y;
@@ -1281,6 +1398,15 @@ void WorldRenderer::RefreshCollision(size_t loadedSection) {
         sections_[loadedSection].collision = std::move(collision);
     else
         sections_[loadedSection].collision.reset();
+}
+
+void WorldRenderer::RefreshCollisionPack(size_t loadedSection, size_t pack) {
+    if (!world_ || !context_ || loadedSection >= sections_.size() ||
+        loadedSection >= world_->Loaded().size())
+        return;
+    CollisionMesh* mesh = sections_[loadedSection].collision.get();
+    if (!mesh || !mesh->UploadPack(context_->Device(), *world_->Loaded()[loadedSection], pack, showRaceGroups_))
+        RefreshCollision(loadedSection);
 }
 
 void WorldRenderer::SetCollisionSelectionList(std::vector<CollisionPick> picks) {
@@ -1361,6 +1487,10 @@ bool WorldRenderer::PickCollision(const Ray& ray, CollisionPick& out) const {
 
         const auto& packs = world_->Loaded()[index]->collision;
         for (size_t p = 0; p < packs.size(); ++p) {
+            // NFS World has the whole map's packs in one section: only those
+            // the ray crosses are gone through.
+            const Aabb* drawn = sections_[index].collision->PackBounds(p);
+            if (drawn && (!drawn->Valid() || IntersectRayAabb(ray, *drawn) < 0.0f)) continue;
             for (size_t i = 0; i < packs[p].polygons.size(); ++i) {
                 if (!showRaceGroups_ && packs[p].polygons[i].raceGroup != 0) continue;
                 CollisionPick candidate{ (u32)index, (u32)p, (u32)i };
@@ -1948,7 +2078,9 @@ bool WorldRenderer::BackdropHidden(const GpuObject& object) const {
     // The game draws the panorama pieces as ordinary scenery (in the zones
     // that list their sections, see BackdropOutOfZone); the dome is drawn
     // round the camera by DrawSky.
-    if (gameLook_ && gameLookReady_ && object.source && object.source->name.rfind("SKYDOME", 0) != 0) return false;
+    // NFS World: its zone / backdrop rules are not read; the game look draws what the normal view draws.
+    if (gameLook_ && gameLookReady_ && !glNfsw_ && object.source && object.source->name.rfind("SKYDOME", 0) != 0)
+        return false;
     return true;
 }
 
@@ -1966,7 +2098,7 @@ void WorldRenderer::UpdateGameZone(const Vec3& eye) {
 }
 
 bool WorldRenderer::BackdropOutOfZone(const GpuObject& object, u32 sectionNumber) const {
-    if (object.backdropKind == kBackdropNone || !glActive_ || !glFogged_) return false;
+    if (object.backdropKind == kBackdropNone || !glActive_ || !glFogged_ || glNfsw_) return false;
     if (!glZoneFound_) return sectionNumber % 100 >= 10;
     return !std::binary_search(glZoneList_.begin(), glZoneList_.end(), sectionNumber);
 }
@@ -1975,6 +2107,10 @@ void WorldRenderer::ReleaseDeviceObjects() {
     ReleaseTyped(glReflection_);
     ReleaseTyped(glReflectionDepth_);
     ReleaseTyped(glReflectionBlur_);
+    ReleaseTyped(glShadowDepth_);
+    ReleaseTyped(glShadowColour_);
+    glShadowFailed_ = false;
+    glShadowValid_ = false;
     glReflectionFailed_ = false;
     glReflectionValid_ = false;
 }
@@ -1990,6 +2126,18 @@ void WorldRenderer::ReleaseGameLook() {
     ReleaseTyped(glFilterVs_);
     ReleaseTyped(glFilterPs_);
     ReleaseTyped(glMissing_);
+    for (NfswShader& slot : glFx_) {
+        ReleaseTyped(slot.vs);
+        ReleaseTyped(slot.ps);
+        slot = NfswShader{};
+    }
+    glParams_.clear();
+    ReleaseTyped(glNfswDecl_);
+    ReleaseTyped(glBlack_);
+    ReleaseTyped(glBlackCube_);
+    ReleaseTyped(glFlatNormal_);
+    ReleaseTyped(glZeroColour_);
+    glNfsw_ = false;
     gameLookReady_ = false;
     gameLookTried_ = false;
     fogRegion_.clear();
@@ -2003,9 +2151,10 @@ bool WorldRenderer::EnsureGameLook(IDirect3DDevice9* device) {
     if (gameLookTried_ || !device) return false;
     gameLookTried_ = true;
     if (gameFolder_.empty()) {
-        gameLookStatus_ = "Game look: no game folder";
+        gameLookStatus_ = "Game look unavailable: no game folder";
         return false;
     }
+    if (nfs::IsWorld()) return EnsureGameLookNfsw(device);
     std::wstring exe = gameFolder_;
     if (exe.back() != L'\\' && exe.back() != L'/') exe += L'\\';
     exe += L"SPEED2.EXE";
@@ -2078,9 +2227,11 @@ void WorldRenderer::BeginGameLook(IDirect3DDevice9* device, const Mat4& view, co
     glBound_ = -1;
     glView_ = view;
     glProjection_ = projection;
+    glEye_ = eye;
 
     // The fog struct of this view (sub_614300) and the constants eDisplayFrame derives from it.
-    if (mainView) {
+    // NFS World: fog is not done (GameLook.h NfswLight lacks Fog_One_Over_BrBm / Fog_Const_1 / _2).
+    if (mainView && !glNfsw_) {
         std::string region;
         if (world_)
             for (wchar_t ch : world_->Region()) region += (char)ch;
@@ -2117,9 +2268,13 @@ void WorldRenderer::BeginGameLook(IDirect3DDevice9* device, const Mat4& view, co
     device->SetRenderState(D3DRS_LIGHTING, FALSE);
     device->SetRenderState(D3DRS_COLORWRITEENABLE, 15);
     device->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
-    device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);   // every world effect's .fxo: CULLMODE = NONE
+    // Underground 2: every world effect's .fxo has CULLMODE = NONE. NFS World's effects take Cull_Mode from
+    // the game (not read); culling off shows the back of hills over what stands behind them, so the
+    // editor's culling stays (the instance loop sets it per instance, mirrored ones flipped).
+    device->SetRenderState(D3DRS_CULLMODE, glNfsw_ && backfaceCulling_ ? cullMode_ : D3DCULL_NONE);
     device->SetRenderState(D3DRS_ALPHAFUNC, D3DCMP_GREATEREQUAL);
-    device->SetFVF(kWorldVertexFvf);
+    if (glNfsw_) device->SetVertexDeclaration(glNfswDecl_);
+    else device->SetFVF(kWorldVertexFvf);
     for (DWORD stage = 0; stage < 2; ++stage) {
         device->SetTextureStageState(stage, D3DTSS_TEXCOORDINDEX, stage);
         device->SetTextureStageState(stage, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
@@ -2134,6 +2289,9 @@ void WorldRenderer::EndGameLook(IDirect3DDevice9* device) {
     device->SetPixelShader(nullptr);
     device->SetRenderState(D3DRS_FOGENABLE, FALSE);
     device->SetTexture(1, nullptr);
+    device->SetTexture(2, nullptr);
+    device->SetTexture(3, nullptr);
+    device->SetStreamSource(1, nullptr, 0, 0);
     device->SetTextureStageState(1, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
     device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
     device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
@@ -2154,6 +2312,7 @@ void WorldRenderer::EndGameLook(IDirect3DDevice9* device) {
 
 bool WorldRenderer::DrawObjectGameLook(IDirect3DDevice9* device, const GpuObject& object, RenderStats& stats,
                                        DrawPass pass) {
+    if (glNfsw_) return DrawObjectGameLookNfsw(device, object, stats, pass);
     // sub_5BDDE0: WORLDVIEW = l2w * View, WORLDVIEWPROJECTION = l2w * ViewProj. The vs_1_1 code reads
     // them as columns (dp4 oPos.x, v0, c0). The game's view space looks down +z; the editor's (right
     // handed) looks down -z, so WorldView's third column -- the one the fog reads -- goes in negated.
@@ -2246,6 +2405,598 @@ bool WorldRenderer::DrawObjectGameLook(IDirect3DDevice9* device, const GpuObject
         stats.triangles += draw.primitiveCount;
     }
     return other;
+}
+
+// ---------------------------------------------------------------------------
+// Game look on NFS World: the game's effects by material effect id (GameLook.h GameEffect)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Technique pass p0 of each effect, by vs / ps dword sizes (work/toon-research/fx-dump of the installed exe):
+// shadowed = technique A (or the only one), plain = its sibling without the shadow map.
+struct NfswFxSpec {
+    const wchar_t* resource;
+    const char* shadowedName; size_t shadowedVs, shadowedPs;
+    const char* plainName;    size_t plainVs, plainPs;
+};
+constexpr NfswFxSpec kNfswFx[] = {
+    { L"IDI_WORLD_FX",                "world_A",              584, 382, "world_B",              558, 241 },
+    { L"IDI_WORLDZBIAS_FX",           "zbias world_A",        663, 382, "zbias world_B",        637, 241 },
+    { L"IDI_WORLDNORMALMAP_FX",       "world_normal_A",       554, 561, "world_normal_B",       532, 419 },
+    // road_3_0_A comes first in the file, so it wins slot A when it validates (0x63A780).
+    { L"IDI_WORLDROAD_FX",            "road_3_0_A",           543, 665, "road_B",               512, 451 },
+    { L"IDI_WORLDPRELIT_FX",          "world_prelit_A",       423,  77, "world_prelit_A",       423,  77 },
+    { L"IDI_WORLDZBIASPRELIT_FX",     "world_zbias_prelit_A", 512,  84, "world_zbias_prelit_A", 512,  84 },
+    { L"IDI_GLASSREFLECTSHADER_FX",   "glass_reflect_A",      505, 590, "glass_reflect_B",      484, 102 },
+    { L"IDI_GLASSREFLECTNMSHADER_FX", "glass_reflect_nm_A",   569, 648, "glass_reflect_nm_B",   484, 102 },
+    { L"IDI_TREE_FX",                 "tree_A",               469, 230, "tree_A",               469, 230 },
+    { L"IDI_SKY_FX",                  "sky",                   79,  61, "sky",                   79,  61 },
+    { L"IDI_WATERSHADER_FX",          "water_2_0",            237,  61, "water_2_0",            237,  61 },
+    { L"IDI_WORLD_SHADOW_MAP_FX",     "world (shadow map)",    85,  59, "world (shadow map)",    85,  59 },
+};
+
+void Columns(const Mat4& m, float* out) {
+    for (int r = 0; r < 4; ++r)
+        for (int k = 0; k < 4; ++k) out[r * 4 + k] = m.m[k][r];
+}
+
+} // namespace
+
+bool WorldRenderer::EnsureGameLookNfsw(IDirect3DDevice9* device) {
+    static_assert(sizeof(kNfswFx) / sizeof(kNfswFx[0]) == kFxCount, "one spec per NfswFx");
+    std::wstring exe = gameFolder_;
+    if (exe.back() != L'\\' && exe.back() != L'/') exe += L'\\';
+    exe += L"nfsw.exe";
+    std::string failed;
+    auto code = [](const std::vector<uint32_t>& c) { return reinterpret_cast<const DWORD*>(c.data()); };
+    for (int fx = 0; fx < kFxCount && failed.empty(); ++fx) {
+        const NfswFxSpec& spec = kNfswFx[fx];
+        for (int shadowed = 0; shadowed < 2 && failed.empty(); ++shadowed) {
+            NfswShader& slot = glFx_[fx * 2 + shadowed];
+            std::string why;
+            if (!gamelook::ExtractGameEffect(exe, spec.resource, shadowed ? spec.shadowedVs : spec.plainVs,
+                                             shadowed ? spec.shadowedPs : spec.plainPs,
+                                             shadowed ? spec.shadowedName : spec.plainName, slot.fx, why)) {
+                failed = why;
+                break;
+            }
+            if (FAILED(device->CreateVertexShader(code(slot.fx.vs.code), &slot.vs)) ||
+                FAILED(device->CreatePixelShader(code(slot.fx.ps.code), &slot.ps)))
+                failed = "the device refused " + slot.fx.name + " (vs_2_0 / ps_2_0)";
+            slot.shadowed = slot.fx.ps.table.count("shadow_sampler") != 0;
+        }
+    }
+    // SolidVertex: position, normal (float3; the file's SHORT4 widened on load), colour, uv; stream 1: colour
+    // 1 (GpuObject::colour1, the baked night lights); stream 2: tangent (GpuObject::tangent, SHORT4N as the
+    // file's normal). A mesh without them reads one zero with stride 0.
+    const D3DVERTEXELEMENT9 elements[] = {
+        { 0, 0, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0 },
+        { 0, 12, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_NORMAL, 0 },
+        { 0, 24, D3DDECLTYPE_D3DCOLOR, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_COLOR, 0 },
+        { 0, 28, D3DDECLTYPE_FLOAT2, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 0 },
+        { 1, 0, D3DDECLTYPE_D3DCOLOR, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_COLOR, 1 },   // streams in order
+        { 2, 0, D3DDECLTYPE_SHORT4N, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TANGENT, 0 },
+        D3DDECL_END(),
+    };
+    if (failed.empty() && FAILED(device->CreateVertexDeclaration(elements, &glNfswDecl_)))
+        failed = "the device refused the vertex declaration";
+    if (failed.empty() && FAILED(device->CreateVertexBuffer(16, D3DUSAGE_WRITEONLY, 0, D3DPOOL_MANAGED, &glZeroColour_, nullptr)))
+        failed = "no vertex buffer for missing colour 1 / tangents";
+    if (failed.empty() &&
+        (FAILED(device->CreateTexture(1, 1, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &glBlack_, nullptr)) ||
+         FAILED(device->CreateTexture(1, 1, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &glMissing_, nullptr)) ||
+         FAILED(device->CreateTexture(1, 1, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &glFlatNormal_, nullptr)) ||
+         FAILED(device->CreateCubeTexture(1, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &glBlackCube_, nullptr))))
+        failed = "no 1x1 textures";
+    if (!failed.empty()) {
+        ReleaseGameLook();
+        gameLookTried_ = true;
+        gameLookStatus_ = "Game look unavailable: " + failed;
+        LOG_WARN("%s", gameLookStatus_.c_str());
+        return false;
+    }
+    if (void* zero = nullptr; SUCCEEDED(glZeroColour_->Lock(0, 0, &zero, 0))) {
+        std::memset(zero, 0, 16);
+        glZeroColour_->Unlock();
+    }
+    for (IDirect3DTexture9* texture : { glBlack_, glMissing_, glFlatNormal_ }) {
+        D3DLOCKED_RECT locked{};
+        if (SUCCEEDED(texture->LockRect(0, &locked, nullptr, 0))) {
+            // A normal map that is not found reads as the flat normal (0.5, 0.5, 1) * 2 - 1 = (0, 0, 1).
+            *static_cast<u32*>(locked.pBits) = texture == glBlack_ ? 0xFF000000u
+                                             : texture == glFlatNormal_ ? 0xFF8080FFu : kMissingTextureColor;
+            texture->UnlockRect(0);
+        }
+    }
+    for (int face = 0; face < 6; ++face) {
+        D3DLOCKED_RECT locked{};
+        if (SUCCEEDED(glBlackCube_->LockRect((D3DCUBEMAP_FACES)face, 0, &locked, nullptr, 0))) {
+            *static_cast<u32*>(locked.pBits) = 0xFF000000u;
+            glBlackCube_->UnlockRect((D3DCUBEMAP_FACES)face, 0);
+        }
+    }
+    for (const NfswShader& slot : glFx_)
+        LOG_INFO("game look: %S %s vs %zu / ps %zu dwords, %zu vs + %zu ps constants, preshader ops %zu / %zu, %zu defaults",
+                 kNfswFx[&slot - glFx_.data() >= 0 ? (&slot - glFx_.data()) / 2 : 0].resource, slot.fx.name.c_str(),
+                 slot.fx.vs.code.size(), slot.fx.ps.code.size(), slot.fx.vs.table.size(), slot.fx.ps.table.size(),
+                 slot.fx.vs.presOps.size(), slot.fx.ps.presOps.size(), slot.fx.defaults.size());
+
+    // The time-of-day stages of GLOBAL\attributes.bin.
+    {
+        std::wstring global = gameFolder_;
+        if (global.back() != L'\\' && global.back() != L'/') global += L'\\';
+        global += L"GLOBAL";
+        std::string error;
+        if (gamelook::LoadLighting(global, glStages_, glSuns_, error)) {
+            LOG_INFO("game look: %zu timeofdaylighting and %zu sunandsky stages from attributes.bin", glStages_.size(),
+                     glSuns_.size());
+        } else {
+            glStages_.clear();
+            glSuns_.clear();
+            glLightSource_ = "captured daytime frame (attributes.bin: " + error + ")";
+            LOG_WARN("game look: no time of day (%s); the captured daytime light is used", error.c_str());
+        }
+    }
+    glNfsw_ = true;
+    UpdateNfswLight();
+    // FRS_GAMELOOK_TOD1=<day>,<night>: cvTimeOfDayParams1 for a test capture (night lights alone: 0,1).
+    // FRS_GAMELOOK_TIME=<0..8>: the time-of-day position for a test capture.
+    if (const char* time = std::getenv("FRS_GAMELOOK_TIME")) {
+        glTimeOfDay_ = (float)std::atof(time);
+        UpdateNfswLight();
+        LOG_INFO("game look: time of day %.2f from FRS_GAMELOOK_TIME (%s)", glTimeOfDay_, glLightSource_.c_str());
+    }
+    if (const char* tod = std::getenv("FRS_GAMELOOK_TOD1")) {
+        float x = 0, y = 0;
+        if (std::sscanf(tod, "%f,%f", &x, &y) == 2) {
+            glNfswLight_.timeOfDay1[0] = x;
+            glNfswLight_.timeOfDay1[1] = y;
+            FillNfswParams();
+            LOG_INFO("game look: cvTimeOfDayParams1 = (%g, %g) from FRS_GAMELOOK_TOD1", x, y);
+        }
+    }
+    gameLookReady_ = true;
+    gameLookStatus_ = "Game look: nfsw.exe effects by material, time of day from attributes.bin";
+    LOG_INFO("%s", gameLookStatus_.c_str());
+    return true;
+}
+
+// The effect the game gives a draw: nfsw.exe table 0xC84B5C by material effect id (rea-sky-road-flares.md).
+int WorldRenderer::NfswEffectFor(const GpuObject& object, const GpuDraw& draw) const {
+    if (glDrawingShadow_) return kFxCaster;
+    if (glDrawingSky_) return kFxSky;
+    switch (draw.effectId) {
+        case 0x1: return kFxZBias;
+        case 0x2: return kFxNormal;
+        case 0x3: return kFxRoad;
+        case 0x4: return kFxPrelit;
+        case 0x5: return kFxZBiasPrelit;
+        case 0xA: return kFxGlass;
+        case 0xB: return kFxGlassNm;
+        case 0xC: return kFxTree;
+        case 0xE: return kFxSky;
+        case 0xF: return kFxWater;
+        // 0 World; 6 WorldBone and 7 WorldFE (bone matrices / front end not part of the map view), 8 / 9 Car
+        // and D UCAP drawn with World.
+        default: return object.source && !object.source->hasNormals ? kFxPrelit : kFxWorld;
+    }
+}
+
+void WorldRenderer::SetNfswParam(const char* name, const float* value, int count) {
+    auto& slot = glParams_[name];
+    slot.fill(0.0f);
+    std::memcpy(slot.data(), value, sizeof(float) * (size_t)(std::min)(count, 16));
+}
+
+// Sets every constant `shader` reads that has a value (glParams_ over the effect's own defaults) and runs
+// its preshaders.
+void WorldRenderer::ApplyNfswShader(IDirect3DDevice9* device, const NfswShader& shader) {
+    auto value = [&](const std::string& name) -> const float* {
+        const auto set = glParams_.find(name);
+        if (set != glParams_.end()) return set->second.data();
+        const auto initial = shader.fx.defaults.find(name);
+        return initial != shader.fx.defaults.end() && initial->second.size() >= 1 ? initial->second.data() : nullptr;
+    };
+    float padded[64];
+    auto feed = [&](const gamelook::ShaderProgram& program, bool pixel) {
+        for (const auto& [name, slot] : program.table) {
+            if (slot.sampler) continue;
+            const float* v = value(name);
+            if (!v) continue;
+            const auto initial = shader.fx.defaults.find(name);
+            const size_t have = glParams_.count(name) ? 16 : initial->second.size();
+            const int rows = (std::min)(slot.count, 16);
+            std::memset(padded, 0, sizeof padded);
+            std::memcpy(padded, v, sizeof(float) * (std::min)((size_t)rows * 4, have));
+            if (pixel) device->SetPixelShaderConstantF((UINT)slot.reg, padded, (UINT)rows);
+            else device->SetVertexShaderConstantF((UINT)slot.reg, padded, (UINT)rows);
+        }
+        program.RunPreshader([&](const std::string& name) { return value(name); },
+                             [&](int reg, const float* v) {
+                                 if (pixel) device->SetPixelShaderConstantF((UINT)reg, v, 1);
+                                 else device->SetVertexShaderConstantF((UINT)reg, v, 1);
+                             });
+    };
+    feed(shader.fx.vs, false);
+    feed(shader.fx.ps, true);
+}
+
+bool WorldRenderer::DrawObjectGameLookNfsw(IDirect3DDevice9* device, const GpuObject& object, RenderStats& stats,
+                                           DrawPass pass) {
+    // Per object: the matrices (columns: dp4 oPos.x, v0, c0), and the light, eye and camera direction in
+    // the object's own space (cvLocalLightVec = inverse world x sun, FUN_0063AD40).
+    D3DMATRIX d3dWorld{};
+    device->GetTransform(D3DTS_WORLD, &d3dWorld);
+    Mat4 world;
+    std::memcpy(world.m, &d3dWorld, sizeof d3dWorld);
+    float m[16];
+    Columns(world * (glDrawingShadow_ ? glShadowViewProj_ : glView_ * glProjection_), m);
+    SetNfswParam("cmWorldViewProj", m, 16);
+    Columns(world, m);
+    SetNfswParam("cmWorld", m, 16);
+    Columns(world * glView_, m);
+    SetNfswParam("cmWorldView", m, 16);
+    const Mat4 inverse = InverseAffine(world);
+    const Vec3 sunWorld{ glNfswLight_.lightVec[0], glNfswLight_.lightVec[1], glNfswLight_.lightVec[2] };
+    const Vec3 sun = Normalize(inverse.TransformDirection(sunWorld));
+    const Vec3 eye = inverse.TransformPoint(glEye_);
+    const Vec3 forward = Normalize(inverse.TransformDirection(
+        Vec3{ -glView_.m[0][2], -glView_.m[1][2], -glView_.m[2][2] }));   // view looks down -z
+    const float sun4[4] = { sun.x, sun.y, sun.z, 0.0f }, eye4[4] = { eye.x, eye.y, eye.z, 1.0f };
+    const float forward4[4] = { forward.x, forward.y, forward.z, 0.0f };
+    SetNfswParam("cvLocalLightVec", sun4, 4);
+    SetNfswParam("cvLocalEyePos", eye4, 4);
+    SetNfswParam("cvLocalCameraDir", forward4, 4);
+    // cvMeshCenter (tree_A) has no REG_ semantic: the effect's initial (0, 0, 0, 0) stays, as nothing shows
+    // the game setting it.
+    if (glShadowValid_) {
+        // Clip space of the shadow view to texture space: u = x/2 + 1/2, v = 1/2 - y/2, z kept.
+        Mat4 bias = Mat4::Identity();
+        bias.m[0][0] = 0.5f;
+        bias.m[1][1] = -0.5f;
+        bias.m[3][0] = 0.5f;
+        bias.m[3][1] = 0.5f;
+        Columns(world * glShadowViewProj_ * bias, m);
+        SetNfswParam("ShadowTransform", m, 16);
+    }
+
+    device->SetVertexDeclaration(glNfswDecl_);   // DrawSky and others put an FVF back
+    if (object.colour1) device->SetStreamSource(1, object.colour1, 0, 4);
+    else device->SetStreamSource(1, glZeroColour_, 0, 0);
+    if (object.tangent) device->SetStreamSource(2, object.tangent, 0, 8);
+    else device->SetStreamSource(2, glZeroColour_, 0, 0);
+
+    bool other = false;
+    int boundShader = -1;
+    for (const GpuDraw& draw : object.draws) {
+        const CachedTexture& texture = textures_.Get(device, AnimatedTexture(draw.textureHash));
+        const bool translucent = texture.texture && texture.Translucent();
+        if (glDrawingShadow_ && translucent) continue;   // casters: opaque and punch-through only
+        if (!glDrawingShadow_ && translucent != (pass == DrawPass::Translucent)) { other = true; continue; }
+        const int fx = NfswEffectFor(object, draw);
+        if (!glDrawingShadow_) {
+            glNoFogDraws_ += (draw.materialFlags >> 17) & 1u;
+            glNoFogById_[draw.effectId & 15] += (draw.materialFlags >> 17) & 1u;
+            if (glFlagSamples_.size() < 12 && std::find(glFlagSamples_.begin(), glFlagSamples_.end(), draw.materialFlags) == glFlagSamples_.end())
+                glFlagSamples_.push_back(draw.materialFlags);
+            ++glSelectorDraws_[draw.materialFlags >> 28];
+        }
+        if (!glDrawingShadow_ && ++glDrawsById_[draw.effectId & 15] && ++glDrawsCounted_ == 50000) {
+            std::string ids;
+            for (int i = 0; i < 16; ++i) ids += " " + std::to_string(glDrawsById_[i]);
+            std::string selectors;
+            for (int i = 0; i < 16; ++i) selectors += " " + std::to_string(glSelectorDraws_[i]);
+            LOG_INFO("game look: draws by material effect id 0..F:%s; normal maps %d found / %d missing, specular "
+                     "maps %d / %d; no-fog bit 17 on %d draws; tod0 selector 0..F:%s", ids.c_str(), glMapCount_[0][0],
+                     glMapCount_[0][1], glMapCount_[1][0], glMapCount_[1][1], glNoFogDraws_, selectors.c_str());
+            std::string perId, samples;
+            for (int i = 0; i < 16; ++i) perId += " " + std::to_string(glNoFogById_[i]);
+            for (u32 f : glFlagSamples_) { char t[16]; std::snprintf(t, sizeof t, " %08X", f); samples += t; }
+            LOG_INFO("game look: bit 17 by effect id:%s; material dword0 samples:%s", perId.c_str(), samples.c_str());
+            const gamelook::NfswLight& l = glNfswLight_;
+            LOG_INFO("game look: %s: sun (%.3f %.3f %.3f), shadow light (%.3f %.3f %.3f), diffuse (%.3f %.3f %.3f), "
+                     "ambient (%.3f %.3f %.3f) x%.0f, specular (%.3f %.3f %.3f) power %.2f, tod0 (%.2f %.2f %.2f) "
+                     "tod1 (%.2f %.2f), fog Br+Bm (%.6f %.6f %.6f) MW %.3f const3 (%.2f %.2f %.2f %.3f)",
+                     glLightSource_.c_str(), l.lightVec[0], l.lightVec[1], l.lightVec[2], l.shadowVec[0], l.shadowVec[1],
+                     l.shadowVec[2], l.diffuse[0], l.diffuse[1], l.diffuse[2], l.ambient[0], l.ambient[1], l.ambient[2],
+                     l.ambient[3], l.specular[0], l.specular[1], l.specular[2], l.specularPower, l.timeOfDay0[1],
+                     l.timeOfDay0[2], l.timeOfDay0[3], l.timeOfDay1[0], l.timeOfDay1[1], l.fogBrPlusBm[0],
+                     l.fogBrPlusBm[1], l.fogBrPlusBm[2], l.fogValueMW[0], l.fogConst3[0], l.fogConst3[1],
+                     l.fogConst3[2], l.fogConst3[3]);
+        }
+        const bool shadowed = glShadowValid_ && !glDrawingShadow_;
+        const int index = fx * 2 + (shadowed ? 1 : 0);
+        const NfswShader& shader = glFx_[index];
+        float offset[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        if (animate_ && texture.scrollType != 0) ScrollOffset(texture, animationClock_, offset[0], offset[1]);
+        SetNfswParam("cvTextureOffset", offset, 4);
+        // FUN_0063A2E0 sets cfFogEnable = 1 - bit 17 and cvTimeOfDayParams0.x from bits 28..31 of the runtime
+        // material dword. The file's dword 0 (SolidMaterial::worldFlags) is not that dword: its bit 17 is set
+        // on every WorldNormalMap and WorldRoad draw of L5RA, so it is not used; fog stays on, tod0.x = 1.
+        if (index != glBound_) {
+            glBound_ = index;
+            device->SetVertexShader(shader.vs);
+            device->SetPixelShader(shader.ps);
+            device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+        }
+        if (index != boundShader) boundShader = index;
+        ApplyNfswShader(device, shader);
+
+        // Samplers by name: material slots 0 / 1 / 3, the shadow map, and black where no source is known.
+        for (const auto& [name, slot] : shader.fx.ps.table) {
+            if (!slot.sampler) continue;
+            IDirect3DBaseTexture9* bound = glBlack_;
+            if (name == "DIFFUSEMAP_SAMPLER") bound = texture.texture ? texture.texture : glMissing_;
+            else if (name == "NORMALMAP_SAMPLER" || name == "SPECULARMAP_SAMPLER") {
+                const bool normal = name[0] == 'N';
+                const CachedTexture& map = textures_.Get(device, normal ? draw.normalHash : draw.specularHash);
+                bound = map.texture ? (IDirect3DBaseTexture9*)map.texture : normal ? glFlatNormal_ : glBlack_;
+                ++glMapCount_[normal ? 0 : 1][map.texture ? 0 : 1];
+            } else if (name == "shadow_sampler") {
+                bound = glShadowDepth_;
+                device->SetSamplerState(slot.reg, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);   // hardware PCF
+                device->SetSamplerState(slot.reg, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+                device->SetSamplerState(slot.reg, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+                device->SetSamplerState(slot.reg, D3DSAMP_ADDRESSU, D3DTADDRESS_BORDER);
+                device->SetSamplerState(slot.reg, D3DSAMP_ADDRESSV, D3DTADDRESS_BORDER);
+                device->SetSamplerState(slot.reg, D3DSAMP_BORDERCOLOR, 0xFFFFFFFFu);
+            } else if (name == "ENVIROMAP_SAMPLER") bound = glBlackCube_;
+            device->SetTexture(slot.reg, bound);
+            if (name != "shadow_sampler" && slot.reg > 0) {
+                device->SetSamplerState(slot.reg, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+                device->SetSamplerState(slot.reg, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+                device->SetSamplerState(slot.reg, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
+                device->SetSamplerState(slot.reg, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+                device->SetSamplerState(slot.reg, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+            }
+        }
+
+        // As the Underground 2 path: alpha test for PUNCHTHRU, blend from the texture's type.
+        const bool punch = texture.texture && texture.punchThru;
+        device->SetRenderState(D3DRS_ALPHATESTENABLE, punch ? TRUE : FALSE);
+        device->SetRenderState(D3DRS_ALPHAREF, punch ? 0x5F : 0);
+        device->SetRenderState(D3DRS_ALPHABLENDENABLE, translucent ? TRUE : FALSE);
+        if (translucent) {
+            device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+            device->SetRenderState(D3DRS_DESTBLEND,
+                                   texture.blend == SurfaceBlend::Additive ? D3DBLEND_ONE : D3DBLEND_INVSRCALPHA);
+        }
+        device->SetRenderState(D3DRS_ZWRITEENABLE, translucent || glDrawingSky_ ? FALSE : TRUE);
+        device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, (INT)object.baseVertex, draw.minVertex, draw.vertexCount,
+                                     draw.startIndex, draw.primitiveCount);
+        stats.drawCalls++;
+        stats.triangles += draw.primitiveCount;
+    }
+    return other;
+}
+
+// The sun's shadow map for world_A: a depth texture seen from the sun over the ground round the camera,
+// drawn with IDI_WORLD_SHADOW_MAP_FX. world_A fades the shadow out where v < 0.2 (ps: sat((0.2 - v) * 5)
+// is added to the lit fraction), so the far side of the box goes to v = 0 and the camera's side to v = 1.
+void WorldRenderer::RenderShadowMapNfsw(IDirect3DDevice9* device, const Camera& camera) {
+    glShadowValid_ = false;
+    if (!glFx_[kFxCaster * 2].vs || glShadowFailed_ || !glShadowsOn_) return;
+    // ponytail: 2048 texels over 2 * 150 units round a point ahead of the camera; the game's own size and
+    // fitting are not read yet (rea-sky-road-flares.md item 5).
+    constexpr UINT kSize = 2048;
+    constexpr float kRadius = 150.0f;
+    if (!glShadowDepth_) {
+        if (FAILED(device->CreateTexture(kSize, kSize, 1, D3DUSAGE_DEPTHSTENCIL, D3DFMT_D24X8, D3DPOOL_DEFAULT,
+                                         &glShadowDepth_, nullptr)) ||
+            FAILED(device->CreateRenderTarget(kSize, kSize, D3DFMT_A8R8G8B8, D3DMULTISAMPLE_NONE, 0, FALSE,
+                                              &glShadowColour_, nullptr))) {
+            ReleaseTyped(glShadowDepth_);
+            ReleaseTyped(glShadowColour_);
+            glShadowFailed_ = true;
+            LOG_WARN("game look: no sun shadows (the device cannot make a %ux%u D24X8 depth texture)", kSize, kSize);
+            return;
+        }
+    }
+    const Vec3 eye = camera.Position();
+    Vec3 forward = camera.Forward();
+    forward.z = 0.0f;
+    forward = Length(forward) > 1e-3f ? Normalize(forward) : Vec3{ 0.0f, 1.0f, 0.0f };
+    const Vec3 centre = eye + forward * (kRadius * 0.6f);
+    // The game fits its shadow map along the second sunandsky vector L+0x120 (0x64BFD0), not the shading sun.
+    Vec3 sun = Normalize(Vec3{ glNfswLight_.shadowVec[0], glNfswLight_.shadowVec[1], glNfswLight_.shadowVec[2] });
+    if (sun.z < 0.05f) return;   // sun at or below the horizon: no shadow map
+    const Mat4 view = LookAtRH(centre + sun * 1000.0f, centre, forward);
+    Mat4 projection = Mat4::Identity();   // orthographic, right handed, z to [0, 1]
+    const float nearZ = 1.0f, farZ = 2000.0f;
+    projection.m[0][0] = 1.0f / kRadius;
+    projection.m[1][1] = 1.0f / kRadius;
+    projection.m[2][2] = 1.0f / (nearZ - farZ);
+    projection.m[3][2] = nearZ / (nearZ - farZ);
+    glShadowViewProj_ = view * projection;
+
+    IDirect3DSurface9* depth = nullptr;
+    if (FAILED(glShadowDepth_->GetSurfaceLevel(0, &depth)) || !depth) return;
+    IDirect3DSurface9* oldTarget = nullptr;
+    IDirect3DSurface9* oldDepth = nullptr;
+    D3DVIEWPORT9 oldViewport{};
+    device->GetRenderTarget(0, &oldTarget);
+    device->GetDepthStencilSurface(&oldDepth);
+    device->GetViewport(&oldViewport);
+    for (DWORD s = 0; s < 4; ++s) device->SetTexture(s, nullptr);
+    device->SetRenderTarget(0, glShadowColour_);
+    device->SetDepthStencilSurface(depth);
+    const D3DVIEWPORT9 viewport{ 0, 0, kSize, kSize, 0.0f, 1.0f };
+    device->SetViewport(&viewport);
+    device->Clear(0, nullptr, D3DCLEAR_ZBUFFER | D3DCLEAR_TARGET, 0xFFFFFFFFu, 1.0f, 0);
+    device->SetRenderState(D3DRS_COLORWRITEENABLE, 0);
+    device->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+    device->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+    device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+    const float slope = 2.0f, bias = 0.0005f;
+    device->SetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, *(const DWORD*)&slope);
+    device->SetRenderState(D3DRS_DEPTHBIAS, *(const DWORD*)&bias);
+
+    glActive_ = true;
+    glDrawingShadow_ = true;
+    glBound_ = -1;
+    Frustum frustum;
+    frustum.Build(glShadowViewProj_);
+    const bool usingVisibility = streaming_ && haveVisible_ && !visibleSections_.empty();
+    RenderStats stats;
+    size_t boundSection = (size_t)-1;
+    for (size_t i = 0; i < sections_.size() && showScenery_; ++i) {
+        const SectionRender& section = sections_[i];
+        if (section.alternate && !showAlternate_) continue;
+        if (GameHidesSection(section.number)) continue;
+        if (usingVisibility &&
+            !std::binary_search(visibleSections_.begin(), visibleSections_.end(), section.number))
+            continue;
+        if (section.instanceBounds.Valid() && !frustum.Intersects(section.instanceBounds)) continue;
+        const std::vector<char>& hiddenHere = HiddenFlags(i);
+        for (size_t k = 0; k < section.instances.size(); ++k) {
+            const GpuInstance& instance = section.instances[k];
+            if (hiddenHere[k]) continue;
+            if (instance.worldBounds.Valid() && !frustum.Intersects(instance.worldBounds)) continue;
+            const GpuSection* gpu = sections_[instance.section].gpu.get();
+            if (!gpu || instance.object >= gpu->Objects().size()) continue;
+            const GpuObject& object = gpu->Objects()[instance.object];
+            if (BackdropHidden(object) || HiddenModel(object) || GameHidesModel(object)) continue;
+            if (object.isBackdrop) continue;
+            if (boundSection != instance.section) {
+                device->SetStreamSource(0, gpu->VertexBuffer(), 0, sizeof(nfs::SolidVertex));
+                device->SetIndices(gpu->IndexBuffer());
+                boundSection = instance.section;
+            }
+            const D3DMATRIX world = ToD3D(instance.transform);
+            device->SetTransform(D3DTS_WORLD, &world);
+            DrawObjectGameLookNfsw(device, object, stats, DrawPass::Solid);
+        }
+    }
+    glDrawingShadow_ = false;
+    glActive_ = false;
+    glBound_ = -1;
+    const float zero = 0.0f;
+    device->SetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, *(const DWORD*)&zero);
+    device->SetRenderState(D3DRS_DEPTHBIAS, *(const DWORD*)&zero);
+    device->SetRenderState(D3DRS_COLORWRITEENABLE, 15);
+    device->SetRenderTarget(0, oldTarget);
+    device->SetDepthStencilSurface(oldDepth);
+    device->SetViewport(&oldViewport);
+    if (oldTarget) oldTarget->Release();
+    if (oldDepth) oldDepth->Release();
+    depth->Release();
+    glShadowValid_ = true;
+    static bool told = false;
+    if (!told) {
+        told = true;
+        LOG_INFO("game look: sun shadow map %ux%u, %u casters drawn, %u triangles", kSize, kSize, stats.drawCalls,
+                 stats.triangles);
+    }
+}
+
+// The light of the time-of-day position glTimeOfDay_ (see WorldRenderer.h).
+void WorldRenderer::UpdateNfswLight() {
+    if (glStages_.empty()) { FillNfswParams(); return; }
+    auto stageNamed = [&](const char* name) -> const gamelook::LightingStage* {
+        for (const auto& stage : glStages_)
+            if (stage.name == name) return &stage;
+        return nullptr;
+    };
+    auto sunNamed = [&](const std::string& name) -> const gamelook::SunAndSkyStage* {
+        for (const auto& sun : glSuns_)
+            if (sun.name == name) return &sun;
+        return nullptr;
+    };
+    float position = std::fmod(glTimeOfDay_, 8.0f);
+    if (position < 0.0f) position += 8.0f;
+    const int a = (int)position % 8, b = (a + 1) % 8;
+    const float t = position - (float)(int)position;
+    const gamelook::LightingStage* from = stageNamed(gamelook::kDayCycle[a]);
+    const gamelook::LightingStage* to = stageNamed(gamelook::kDayCycle[b]);
+    if (!from || !to) return;
+    // The sky dome: the nearer stage's sunandsky SkyDomeModel (= bStringHash of SKYDOME_1_<name>).
+    if (const gamelook::SunAndSkyStage* sun = sunNamed((t < 0.5f ? from : to)->sunAndSky)) glNfswSkyHash_ = sun->skyDomeModel;
+    const gamelook::SunAndSkyStage* sunA = sunNamed(from->sunAndSky);
+    const gamelook::SunAndSkyStage* sunB = sunNamed(to->sunAndSky);
+    if (sunA && sunB) glSkyRotation_ = sunA->skyDomeRotation + (sunB->skyDomeRotation - sunA->skyDomeRotation) * t;
+    glNfswLight_ = gamelook::ComputeNfswLight(*from, *to, t, sunNamed(from->sunAndSky), sunNamed(to->sunAndSky),
+                                              glLightSource_);
+    FillNfswParams();
+}
+
+// The frame's parameter values from glNfswLight_ (rea-lighting-fog.md), by the effects' parameter names.
+void WorldRenderer::FillNfswParams() {
+    const gamelook::NfswLight& l = glNfswLight_;
+    SetNfswParam("cvDiffuseColour", l.diffuse, 4);
+    SetNfswParam("cvAmbientColour", l.ambient, 4);
+    // World / WorldNormalMap: (SpecularColour.xyz, W+0x36A0); road: x scaled by 1 - W+0x290 (0 dry).
+    const float specular[4] = { l.specular[0] * (1.0f - l.rain), l.specular[1], l.specular[2], l.wetness };
+    const float specular2[4] = { l.specular2[0] * (1.0f - l.rain), l.specular2[1], l.specular2[2], l.wetness };
+    SetNfswParam("cvSpecularColour", specular, 4);
+    SetNfswParam("cvSpecularColour2", specular2, 4);
+    SetNfswParam("cvSpecularLight2DirCoeff", l.light2Dir, 4);
+    const float power[4] = { l.specularPower, 0, 0, 0 }, power2[4] = { l.specularPower2, 0, 0, 0 };
+    SetNfswParam("cfSpecularPower", power, 4);
+    SetNfswParam("cfSpecularPower2", power2, 4);
+    SetNfswParam("cvTimeOfDayParams0", l.timeOfDay0, 4);
+    SetNfswParam("cvTimeOfDayParams1", l.timeOfDay1, 4);
+    const float fog[4] = { glFogOn_ ? l.fogEnable[0] : 0.0f, 0, 0, 0 };
+    SetNfswParam("cfFogEnable", fog, 4);
+    SetNfswParam("Fog_Br_Plus_Bm", l.fogBrPlusBm, 4);
+    SetNfswParam("Fog_One_Over_BrBm", l.fogOneOverBrBm, 4);
+    SetNfswParam("Fog_Const_1", l.fogConst1, 4);
+    SetNfswParam("Fog_Const_2", l.fogConst2, 4);
+    SetNfswParam("Fog_Const_3", l.fogConst3, 4);
+    SetNfswParam("cvFogValueMW", l.fogValueMW, 4);
+    const float inv[4] = { (1.0f - l.shadowStrength) * (1.0f - l.rain), 0, 0, 0 };   // 0x633880
+    SetNfswParam("InvShadowStrength", inv, 4);
+    const float scale[4] = { 1.0f / 2048.0f, 0, 0, 0 };   // RenderShadowMapNfsw kSize
+    SetNfswParam("ShadowMapScale", scale, 4);
+    // Headlights off: no car in the view. The spotlight matrix keeps oT3.w = 1 so its projected lookups stay
+    // finite; cvSpotlightDirection0 = 0.
+    float spot[16] = {};
+    spot[15] = 1.0f;
+    SetNfswParam("cmSpotlightModelViewProjection0", spot, 16);
+    const float zero[4] = { 0, 0, 0, 0 };
+    SetNfswParam("cvSpotlightDirection0", zero, 4);
+}
+
+// The game look's own controls, over the viewport while it is on (NFS World): time of day, shadows, fog.
+void WorldRenderer::DrawGameLookControls() {
+    ImGuiContext* context = ImGui::GetCurrentContext();
+    if (!context || !context->WithinFrameScope || glStages_.empty()) return;
+    const ImVec2 at = ImGui::GetMainViewport()->WorkPos;
+    ImGui::SetNextWindowPos(ImVec2(at.x + 12.0f, at.y + 80.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowBgAlpha(0.85f);
+    ImGui::SetNextWindowCollapsed(true, ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Game look", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
+        const int a = (int)std::fmod(glTimeOfDay_, 8.0f) % 8;
+        ImGui::Text("Time of day: %s -> %s", gamelook::kDayCycle[a], gamelook::kDayCycle[(a + 1) % 8]);
+        bool changed = ImGui::SliderFloat("##tod", &glTimeOfDay_, 0.0f, 7.999f, "%.2f");
+        for (int i = 0; i < 8; ++i) {
+            if (i) ImGui::SameLine();
+            if (ImGui::SmallButton(gamelook::kDayCycle[i])) { glTimeOfDay_ = (float)i; changed = true; }
+        }
+        changed |= ImGui::Checkbox("Sun shadows", &glShadowsOn_);
+        ImGui::SameLine();
+        changed |= ImGui::Checkbox("Fog", &glFogOn_);
+        if (changed) UpdateNfswLight();
+        ImGui::TextDisabled("%s", glLightSource_.c_str());
+    }
+    ImGui::End();
+}
+
+// Why the game look is off, over the viewport (the status bar's last part shows the frame figures).
+void WorldRenderer::DrawGameLookMessage() const {
+    if (!gameLookTried_ || gameLookReady_ || mode_ == RenderMode::Wireframe) return;
+    ImGuiContext* context = ImGui::GetCurrentContext();
+    if (!context || !context->WithinFrameScope) return;
+    ImDrawList* list = ImGui::GetForegroundDrawList();
+    const ImVec2 at = ImGui::GetMainViewport()->WorkPos;
+    const ImVec2 text = ImGui::CalcTextSize(gameLookStatus_.c_str());
+    const ImVec2 corner{ at.x + 12.0f, at.y + 40.0f };
+    list->AddRectFilled(ImVec2(corner.x - 6, corner.y - 4), ImVec2(corner.x + text.x + 6, corner.y + text.y + 4),
+                        IM_COL32(120, 20, 20, 220), 4.0f);
+    list->AddText(corner, IM_COL32(255, 255, 255, 255), gameLookStatus_.c_str());
 }
 
 // The road reflection (eDisplayFrame 0x5CAB15..0x5CACC6, g_RoadReflectionEnable = 3): view 4 shares the

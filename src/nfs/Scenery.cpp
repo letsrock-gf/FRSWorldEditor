@@ -1,6 +1,7 @@
 #include "nfs/Scenery.h"
 
 #include "core/Log.h"
+#include "nfs/GameFormat.h"
 
 #include <algorithm>
 #include <cstring>
@@ -43,6 +44,31 @@ constexpr size_t kU1InstRotation      = 0x1C;
 // into it, so the rows are only unit length for instances drawn at 1:1.
 constexpr float kRotationScale = 1.0f / 8192.0f;
 
+// --- NFS World ---------------------------------------------------------------
+// Measured on STREAML5RA_100.BUN: 72 bytes per model, with four detail-level
+// hashes after a 24-byte name, and 96 bytes per placement, whose 3x3 matrix is
+// plain floats.
+constexpr size_t kWorldInfoEntrySize = 72;
+constexpr size_t kWorldInfoNameSize  = 24;
+constexpr size_t kWorldInfoSolidHash = 0x18;   // the most detailed of four
+constexpr size_t kWorldInfoRadius    = 0x38;
+
+constexpr size_t kWorldInstanceEntrySize = 96;
+constexpr size_t kWorldInstBoundsMin     = 0x00;
+constexpr size_t kWorldInstFlags         = 0x0C;
+constexpr size_t kWorldInstBoundsMax     = 0x10;
+constexpr size_t kWorldInstTranslation   = 0x20;
+constexpr size_t kWorldInstRotation      = 0x2C;   // 3x3 of float, row major
+
+// A placement record does not say which model it places. Chunk 0x3410F does:
+// 32 bytes per row, sixteen of them filled in by the game at load, then the
+// placement's index and the model's. The table is longer than the placements
+// and ends in zeroed rows. Checked on every section: with this link the model's
+// box lands on the box the record stores, median 0.02 units apart.
+constexpr size_t kWorldLinkEntrySize = 32;
+constexpr size_t kWorldLinkInstance  = 0x10;
+constexpr size_t kWorldLinkInfo      = 0x14;
+
 Vec3 ReadVec3(ByteSpan span, size_t offset) {
     return { span.read<float>(offset),
              span.read<float>(offset + 4),
@@ -76,13 +102,14 @@ Mat4 ReadTransform(ByteSpan entry, size_t rotationAt = kInstRotation, size_t tra
 } // namespace
 
 bool ParseScenery(const Chunk& sceneryChunk, Scenery& out, bool underground1) {
-    ByteSpan infoData, instanceData;
+    ByteSpan infoData, instanceData, linkData;
 
     ChunkReader reader = ChunkReader::Children(sceneryChunk);
     Chunk child;
     while (reader.Next(child)) {
         if (child.id == kChunkSceneryInfos)          infoData     = child.data;
         else if (child.id == kChunkSceneryInstances) instanceData = child.data;
+        else if (child.id == kChunkWorldSceneryLinks) linkData    = child.data;
     }
 
     if (infoData.empty() || instanceData.empty()) return false;
@@ -95,6 +122,57 @@ bool ParseScenery(const Chunk& sceneryChunk, Scenery& out, bool underground1) {
     // parking building, because index 0 meant a tree in its own table and a
     // building in the one that happened to be first.
     const u32 infoBase = (u32)out.infos.size();
+
+    if (IsWorld()) {
+        const size_t worldInfos = infoData.size / kWorldInfoEntrySize;
+        for (size_t i = 0; i < worldInfos; ++i) {
+            const ByteSpan entry = infoData.sub(i * kWorldInfoEntrySize, kWorldInfoEntrySize);
+
+            SceneryInfo info;
+            info.name      = ReadName(entry, kInfoName, kWorldInfoNameSize);
+            info.solidHash = entry.read<u32>(kWorldInfoSolidHash);
+            info.radius    = entry.read<float>(kWorldInfoRadius);
+            info.raw.assign(entry.data, entry.data + entry.size);
+            out.infos.push_back(std::move(info));
+        }
+
+        const size_t worldInstances = instanceData.size / kWorldInstanceEntrySize;
+        const size_t links = linkData.size / kWorldLinkEntrySize;
+        std::vector<bool> placed(worldInstances, false);
+        for (size_t row = 0; row < links; ++row) {
+            const ByteSpan link = linkData.sub(row * kWorldLinkEntrySize, kWorldLinkEntrySize);
+            const size_t i = link.read<u32>(kWorldLinkInstance);
+            // The zeroed rows at the end read as placement 0, which the first
+            // row has already taken.
+            if (i >= worldInstances || placed[i]) continue;
+            placed[i] = true;
+
+            const ByteSpan entry =
+                instanceData.sub(i * kWorldInstanceEntrySize, kWorldInstanceEntrySize);
+
+            SceneryInstance instance;
+            instance.infoIndex       = infoBase + link.read<u32>(kWorldLinkInfo);
+            instance.flags           = entry.read<u32>(kWorldInstFlags);
+            instance.record          = (u32)i;
+            instance.worldBounds.min = ReadVec3(entry, kWorldInstBoundsMin);
+            instance.worldBounds.max = ReadVec3(entry, kWorldInstBoundsMax);
+
+            Mat4 m = Mat4::Identity();
+            for (int row = 0; row < 3; ++row)
+                for (int col = 0; col < 3; ++col)
+                    m.m[row][col] =
+                        entry.read<float>(kWorldInstRotation + (size_t)(row * 3 + col) * 4);
+            const Vec3 translation = ReadVec3(entry, kWorldInstTranslation);
+            m.m[3][0] = translation.x;
+            m.m[3][1] = translation.y;
+            m.m[3][2] = translation.z;
+            instance.transform = m;
+
+            if (instance.infoIndex >= out.infos.size()) continue;
+            out.instances.push_back(instance);
+        }
+        return !out.instances.empty();
+    }
 
     if (underground1) {
         const size_t infoCount = infoData.size / kU1InfoEntrySize;

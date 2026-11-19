@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/Types.h"
+#include "nfs/GameFormat.h"
 
 // Chunk identifiers used by the NFSU2 asset containers.
 //
@@ -18,6 +19,9 @@ enum ChunkId : u32 {
     kChunkSceneryInstances   = 0x00034103,  // placement of each model in the world
     kChunkSceneryGroups      = 0x00034104,
     kChunkSceneryOverrides   = 0x00034106,
+    kChunkWorldSceneryLinks  = 0x0003410F,  // NFS World: (placement, model) index pairs
+    kChunkWorldSceneryBoxes  = 0x0003410E,  // NFS World: one culling box per link row
+    kChunkWorldSceneryNodes  = 0x00034105,  // NFS World: the culling tree, 48 bytes a node
     kChunkSectionTable       = 0x00034110,  // streaming sections: offset/size into STREAMx.BUN
     kChunkVisibleSections    = 0x80034150,
 
@@ -28,6 +32,7 @@ enum ChunkId : u32 {
     kChunkCollisionCellRefs  = 0x00034136,  // (polygon index, 4x4 sub-cell mask) per cell entry
     kChunkCollisionCells     = 0x00034137,  // (first ref, ref count) per 32-unit grid cell
     kChunkRaceBarrierGroups  = 0x0003412F,  // layout file: names of the race barrier groups (polygon byte 0)
+    kChunkWorldCollisionPack = 0x0003B801,  // NFS World: articles and instances of one collision section
 
     // --- Geometry -------------------------------------------------------------
     kChunkSolidListPack      = 0x80134000,
@@ -46,6 +51,8 @@ enum ChunkId : u32 {
 
     // --- Textures -------------------------------------------------------------
     kChunkTexturePack        = 0xB3300000,
+    kChunkWorldStreamMips    = 0xB3300011,  // NFS World: the larger levels of a pack's textures
+    kChunkWorldStreamMipList = 0x33310022,  // 32 bytes each: hash, offset, size, base size, width, height, mips
     kChunkTpkInfoBlock       = 0xB3310000,
     kChunkTpkHeader          = 0x33310001,  // pack name and path
     kChunkTpkHashTable       = 0x33310002,
@@ -76,7 +83,7 @@ inline bool IsContainer(u32 id) { return (id & 0x80000000u) != 0; }
 // texture-like, so it survives a glance, while nothing in the world matches.
 inline u32 PayloadAlignment(u32 id) {
     switch (id) {
-        case kChunkMeshVertices:        return 128;
+        case kChunkMeshVertices:        return IsWorld() ? 16 : 128;   // measured: 16 in every NFS World object
         case kChunkTpkPixelData:        return 128;
         case kChunkSolidObjectTexRefs:  return 8;
         default:                        return 16;

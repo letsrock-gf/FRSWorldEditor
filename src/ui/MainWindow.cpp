@@ -27,6 +27,8 @@
 #include "ui/MarkersExtension.h"
 #include "ui/RoadsExtension.h"
 #include "ui/SetupWizard.h"
+#include "io/WorldMesh.h"
+#include "io/WorldWrite.h"
 #include "ui/WorldDialogs.h"
 
 #include <commctrl.h>
@@ -34,6 +36,7 @@
 #include <commdlg.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <tlhelp32.h>
 
 #include <algorithm>
 #include <cmath>
@@ -47,13 +50,17 @@
 namespace {
 
 const wchar_t* kWindowClass = L"FRSWorldEditor.MainWindow";
-const wchar_t* kWindowTitle = L"FRS World Editor - Need for Speed Underground 2";
-const wchar_t* kSettingsKey = L"Software\\FRSWorldEditor";
+const wchar_t* kWindowTitle = L"FRS World Editor - NFS World port";
+const wchar_t* kSettingsKey = L"Software\\FRSWorldEditorNFSW";   // apart from the Underground 2 editor's
 const wchar_t* kSupportUrl = L"https://buymeacoffee.com/chrystianfarias";
 // Bumped when the setup has something new to install; an older value runs it again.
 constexpr DWORD kSetupVersion = 2;   // 2: loader applies edits only to their own region
 // Asks for the setup once the window is up, on the first run.
 constexpr UINT kRunSetupMessage = WM_APP + 1;
+// Opens the stored game folder once the window is up: loading a whole region
+// inside WM_CREATE kept the window off screen for half a minute, which read
+// as the editor not having started.
+constexpr UINT kOpenStoredMessage = WM_APP + 2;
 // FRSFastTest reads its switch when the game starts; this long after the
 // launch it certainly has, and the switch goes back off.
 constexpr DWORD kFastBootRestoreMs = 15000;
@@ -300,6 +307,7 @@ void DarkTitleBar(HWND window) {
 } // namespace
 
 bool MainWindow::Create(HINSTANCE instance, int showCommand) {
+    undo::Register(this);
     instance_ = instance;
 
     INITCOMMONCONTROLSEX controls{};
@@ -428,6 +436,16 @@ LRESULT MainWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             if (wParam == kGameViewTimer) UpdateGameView();
             return 0;
 
+        case kOpenStoredMessage:
+            if (!startFolder_.empty()) {
+                ::SetWindowTextW(window_, (std::wstring(kWindowTitle) + L" - loading the map...").c_str());
+                ::UpdateWindow(window_);
+                SetGameFolder(startFolder_);
+                startFolder_.clear();
+                UpdateTitle();
+            }
+            return 0;
+
         case kRunSetupMessage:
             RunSetup();
             return 0;
@@ -463,7 +481,12 @@ LRESULT MainWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
         }
 
         case WM_COMMAND:
+            // Each command is a step of its own even when no frame is drawn
+            // between them (a minimized window gets no Tick): the state before
+            // it is the one Ctrl+Z goes back to.
+            TrackEdits();
             OnCommand(LOWORD(wParam), HIWORD(wParam), (HWND)lParam);
+            TrackEdits();
             return 0;
 
         case WM_NOTIFY: {
@@ -629,6 +652,7 @@ void MainWindow::OnCreate() {
     edits_.Show(false);         // it lives on the Edits tab, which starts hidden
     edits_.SetExtraRows([this](std::vector<EditsPanel::ExtraRow>& rows) {
         for (auto& extension : extensions_) extension->EditRows(rows);
+        WorldEditRows(rows);
     });
     // Collision changes are listed one by one from the collision log, not
     // as whole packs.
@@ -636,6 +660,7 @@ void MainWindow::OnCreate() {
         return collisionTools_ && collisionTools_->LogCovers(section);
     };
     edits_.onRevertExtra = [this](const void* owner, const std::vector<size_t>& indices) {
+        if (owner == this) { RevertWorldEditRows(indices); return; }
         if (EditorExtension* extension = ExtensionOf(owner)) extension->RevertRows(indices);
     };
     catalog_.SetExtraRows([this](std::vector<ModelCatalog::Row>& rows) {
@@ -809,17 +834,49 @@ void MainWindow::OnCreate() {
 
     UpdateMenuChecks();
     SetStatusText(0, L"No region loaded");
-    SetStatusText(3, L"Left click: select   Right mouse: look   WASD: move   Q/E: down/up   Wheel: speed");
+    SetStatusText(3, L"LMB select   MMB/RMB drag orbit   Shift+drag pan   Wheel zoom   Ctrl+RMB look   F frame   WASD: move   Q/E: down/up   Wheel: speed");
 
     // Pick the folder back up from the last session. The first run -- or one
     // after an update with something new to install -- opens the setup once
     // the window is on screen.
+    textures_.onReplace = [this](u32 hash, bool restore) { ReplaceTexture(hash, restore); };
+
+    // The clip planes and detail size of the last session.
+    {
+        // start, end, detail pixels, mouse sensitivity, zoom percent per notch
+        float view[5] = { 0.5f, 6000.0f, 2.0f, 1.0f, 20.0f };
+        DWORD size = sizeof(view);
+        ::RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, L"View", RRF_RT_REG_BINARY, nullptr, view, &size);
+        ApplyViewSettings(view, false);
+    }
+
     // FRS_GAME_FOLDER opens another game folder for this session only, without
     // replacing the stored one (testing Underground 1 beside Underground 2).
     const wchar_t* overrideFolder = _wgetenv(L"FRS_GAME_FOLDER");
-    const std::wstring stored = overrideFolder && *overrideFolder ? std::wstring(overrideFolder) : LoadStoredGameFolder();
-    if (!stored.empty() && DirectoryExists(stored + L"\\TRACKS"))
-        SetGameFolder(stored);
+    std::wstring stored = overrideFolder && *overrideFolder ? std::wstring(overrideFolder) : LoadStoredGameFolder();
+
+    // Nothing chosen yet: this build lives inside the NFS World project, so
+    // look for its Data2015 in the folders above the editor before asking.
+    if (stored.empty()) {
+        wchar_t self[MAX_PATH] = {};
+        ::GetModuleFileNameW(nullptr, self, MAX_PATH);
+        std::wstring folder = self;
+        for (size_t slash; (slash = folder.find_last_of(L'\\')) != std::wstring::npos;) {
+            folder.resize(slash);
+            if (IsWorldFolder(folder + L"\\Data2015") && IsGameFolder(folder + L"\\Data2015")) {
+                stored = folder + L"\\Data2015";
+                StoreGameFolder(stored);
+                StoreSetupVersion(kSetupVersion);
+                LOG_INFO("NFS World found beside the editor: %S", stored.c_str());
+                break;
+            }
+        }
+    }
+
+    if (!stored.empty() && DirectoryExists(stored + L"\\TRACKS")) {
+        startFolder_ = stored;
+        ::PostMessageW(window_, kOpenStoredMessage, 0, 0);
+    }
     if (StoredSetupVersion() < kSetupVersion) ::PostMessageW(window_, kRunSetupMessage, 0, 0);
 }
 
@@ -1124,6 +1181,17 @@ void MainWindow::OnCommand(int id, int notification, HWND control) {
         case ID_WORLD_SAVE_AS:   SaveWorldAs(); break;
         case ID_WORLD_PUBLISH:   PublishWorld(); break;
         case ID_WORLD_LOAD_ALL:  LoadAllSections(); break;
+        case ID_EDIT_UNDO:         Undo(); break;
+        case ID_EDIT_REDO:         Redo(); break;
+        case ID_VIEW_CLIP:         EditClip(); break;
+        case ID_CAMERA_FRAME_SEL:  viewport_.FrameSelection(); break;
+        case ID_VIEW_FRONT: case ID_VIEW_BACK: case ID_VIEW_RIGHT: case ID_VIEW_LEFT:
+        case ID_VIEW_TOP: case ID_VIEW_BOTTOM: case ID_VIEW_OPPOSITE:
+        case ID_VIEW_ORBIT_LEFT: case ID_VIEW_ORBIT_RIGHT: case ID_VIEW_ORBIT_UP:
+        case ID_VIEW_ORBIT_DOWN:
+            viewport_.View((int)id);
+            break;
+
         case ID_WORLD_FRAME:
             if (world_) viewport_.FrameBounds(world_->TrackBounds());
             else        viewport_.FrameWorld();
@@ -1244,6 +1312,16 @@ void MainWindow::OnCommand(int id, int notification, HWND control) {
         case ID_OBJECT_PROPERTIES: EditSelectedPlacement(); break;
         case ID_OBJECT_SNAP:       SnapSelectedPlacement(); break;
         case ID_OBJECT_COPY:       CopySelection(); break;
+        case ID_OBJECT_SELECT_SAME: {
+            WorldRenderer& renderer = viewport_.GetRenderer();
+            const std::string name = renderer.Selection().empty() || !renderer.Selection().front().object
+                                         ? std::string() : renderer.Selection().front().object->name;
+            const size_t count = renderer.SelectSameModel();
+            if (!count) { SetStatusText(2, L"Select an object first"); break; }
+            SetStatusText(2, Format(L"%zu objects named %S selected", count, name.c_str()));
+            LOG_INFO("select same: %zu objects named '%s'", count, name.c_str());
+            break;
+        }
         case ID_OBJECT_PASTE:      PasteClipboard(); break;
         case ID_OBJECT_SAVE:       SavePlacements(); break;
         case ID_OBJECT_GRAB:
@@ -1663,6 +1741,11 @@ void MainWindow::SaveWorld() {
     // reopen the region once written.
     for (auto& extension : extensions_) extension->Save();
     if (!SavePlacements()) return;
+    // NFS World: the edits are in the game's files and the list kept beside
+    // them (io/WorldWrite.h), and a world file holds none of that. One is
+    // written when it has been asked for with Save World As, never offered
+    // on every save.
+    if (worldPath_.empty() && IsWorldFolder(gameFolder_)) return;
     // Then the world file: the first time, wherever the person wants it.
     if (worldPath_.empty()) { SaveWorldAs(); return; }
     if (WriteWorldFile(worldPath_)) SetStatusText(2, Format(L"World \"%s\" saved", worldName_.c_str()));
@@ -1747,6 +1830,7 @@ void MainWindow::LaunchGame() {
                       MB_ICONINFORMATION | MB_OK);
         return;
     }
+    if (IsWorldFolder(gameFolder_)) { LaunchWorldGame(); return; }
 
     // Running already: the button flips between the game and the map.
     if (game_.Running() && game_.Fullscreen()) {
@@ -1786,7 +1870,7 @@ void MainWindow::LaunchGame() {
     bool elsewhere = false;
     for (auto& extension : extensions_) elsewhere = elsewhere || extension->LaunchesElsewhere();
     if (elsewhere) ::DeleteFileW((gameFolder_ + L"\\models\\launch-pose.txt").c_str());
-    else WriteLaunchPose();
+    else WriteLaunchPose(gameFolder_ + L"\\models\\launch-pose.txt");
 
     // FRSFastTest reads its switch once, as the game starts. Unless the player
     // keeps it on for every start, it is on for this launch only.
@@ -1825,24 +1909,105 @@ void MainWindow::RestoreFastBoot(bool onlyWhenRead) {
 // The ground under the camera, facing the way it looks: where FRSWorldLoader
 // puts the car once the session is in gameplay. FRSFastTest takes the game
 // straight to free roam; without it the pose waits for the player to get there.
-void MainWindow::WriteLaunchPose() {
-    const std::wstring path = gameFolder_ + L"\\models\\launch-pose.txt";
+// NFS World reads the same line from <game>\scripts\editor-fast-test.txt
+// (mods\editor-fast-test-v1).
+bool MainWindow::WriteLaunchPose(const std::wstring& path) {
     ::DeleteFileW(path.c_str());
-    if (!world_) return;
+    if (!world_) return false;
     const Camera& camera = viewport_.GetCamera();
     const Vec3 eye = camera.Position();
     float ground = 0.0f;
     if (!nfs::GroundBelow(*world_, eye.x, eye.y, eye.z, ground)) {
+        LOG_INFO("launch pose: no collision ground under (%.1f, %.1f, %.1f)", eye.x, eye.y, eye.z);
         SetStatusText(2, L"No ground under the camera: the car starts where the game puts it");
-        return;
+        return false;
     }
     const float heading = std::fmod(Degrees(camera.Yaw()) + 360.0f, 360.0f);
-    ::CreateDirectoryW((gameFolder_ + L"\\models").c_str(), nullptr);
+    ::CreateDirectoryW(path.substr(0, path.find_last_of(L'\\')).c_str(), nullptr);
     FILE* file = nullptr;
-    if (::_wfopen_s(&file, path.c_str(), L"wt") != 0 || !file) return;
+    if (::_wfopen_s(&file, path.c_str(), L"wt") != 0 || !file) return false;
     std::fprintf(file, "pose %.3f %.3f %.3f %.2f\n", eye.x, eye.y, ground, heading);
     std::fclose(file);
-    LOG_INFO("launch pose (%.1f, %.1f, %.1f) heading %.1f", eye.x, eye.y, ground, heading);
+    LOG_INFO("launch pose (%.1f, %.1f, %.1f) heading %.1f -> %S", eye.x, eye.y, ground, heading, path.c_str());
+    return true;
+}
+
+// NFS World: no plugin to switch on and no embedded window. The edits are
+// saved into the game's files, the pose goes where editor-fast-test.asi reads
+// it once the car is in free roam, and the game starts through the project's
+// offline launcher (scripts\launch-offline.cjs beside the game folder).
+// ponytail: the menus (title, persona) are not skipped; the car moves once the
+// player reaches free roam.
+void MainWindow::LaunchWorldGame() {
+    const std::wstring posePath = gameFolder_ + L"\\scripts\\editor-fast-test.txt";
+
+    // FRS_TEST_LAUNCH_POSE=<file>: only the pose, written there, for scripted
+    // checks; nothing saved and no game started.
+    wchar_t testPath[MAX_PATH] = {};
+    if (::GetEnvironmentVariableW(L"FRS_TEST_LAUNCH_POSE", testPath, MAX_PATH)) {
+        // 30 m above the middle of the first ground polygon, looking along +Y.
+        if (world_)
+            for (const auto& section : world_->Loaded())
+                for (const nfs::CollisionPack& pack : section->collision)
+                    for (const nfs::CollisionPolygon& polygon : pack.polygons) {
+                        if (polygon.barrier) continue;
+                        const Vec3* c = polygon.corners;
+                        viewport_.GetCamera().SetPosition({ (c[0].x + c[1].x + c[2].x) / 3, (c[0].y + c[1].y + c[2].y) / 3,
+                                                            (c[0].z + c[1].z + c[2].z) / 3 + 30 });
+                        viewport_.GetCamera().SetYawPitch(1.5707964f, -0.3f);
+                        goto placed;
+                    }
+    placed:
+        LOG_INFO("launch pose test: %s", WriteLaunchPose(testPath) ? "written" : "not written");
+        return;
+    }
+
+    // A running nfsw.exe is someone playing: its files are in use, and the
+    // launcher would not start a second one anyway.
+    bool running = false;
+    if (HANDLE snapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0); snapshot != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W entry{ sizeof(entry) };
+        for (BOOL more = ::Process32FirstW(snapshot, &entry); more && !running; more = ::Process32NextW(snapshot, &entry))
+            running = ::_wcsicmp(entry.szExeFile, L"nfsw.exe") == 0;
+        ::CloseHandle(snapshot);
+    }
+    if (running) {
+        ::MessageBoxW(window_, L"NFS World is already running. Close it first: the edits are saved into "
+                               L"its files before it starts.", kWindowTitle, MB_ICONINFORMATION | MB_OK);
+        return;
+    }
+
+    const std::wstring root = gameFolder_.substr(0, gameFolder_.find_last_of(L'\\'));
+    const std::wstring launcher = root + L"\\scripts\\launch-offline.cjs";
+    if (::GetFileAttributesW(launcher.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        ::MessageBoxW(window_, Format(L"The offline launcher was not found:\n%s", launcher.c_str()).c_str(),
+                      kWindowTitle, MB_ICONWARNING | MB_OK);
+        return;
+    }
+
+    SaveWorld();
+    const bool posed = WriteLaunchPose(posePath);
+
+    // Its own console, minimised: the launcher keeps the offline server up
+    // while the game runs and prints why when it cannot start it.
+    std::wstring command = L"node \"" + launcher + L"\" --game-dir \"" + gameFolder_ + L"\"";
+    STARTUPINFOW startup{ sizeof(startup) };
+    startup.dwFlags = STARTF_USESHOWWINDOW;
+    startup.wShowWindow = SW_SHOWMINNOACTIVE;
+    PROCESS_INFORMATION process{};
+    if (!::CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NEW_CONSOLE, nullptr,
+                          root.c_str(), &startup, &process)) {
+        LOG_WARN("launch: could not run %S (error %lu)", command.c_str(), ::GetLastError());
+        ::DeleteFileW(posePath.c_str());
+        ::MessageBoxW(window_, Format(L"Could not run\n%s\n\nIs Node.js installed and on the PATH?",
+                                      command.c_str()).c_str(), kWindowTitle, MB_ICONWARNING | MB_OK);
+        return;
+    }
+    ::CloseHandle(process.hThread);
+    ::CloseHandle(process.hProcess);
+    LOG_INFO("launch: %S (process %lu)", command.c_str(), process.dwProcessId);
+    SetStatusText(2, posed ? L"NFS World starting -- the car goes to the camera once you are in free roam"
+                           : L"NFS World starting -- no ground under the camera, the car starts where the game puts it");
 }
 
 void MainWindow::StopGame() {
@@ -1983,6 +2148,13 @@ void MainWindow::ImportEditedObjectsImpl() {
 
     wchar_t path[MAX_PATH] = L"";
 
+    // FRS_TEST_IMPORT=<file.obj> takes it the way a save in Blender does
+    // (quick edit), without the dialog, for scripted checks.
+    if (::GetEnvironmentVariableW(L"FRS_TEST_IMPORT", path, MAX_PATH)) {
+        ImportObj(path, true);
+        return;
+    }
+
     OPENFILENAMEW dialog{};
     dialog.lStructSize = sizeof(dialog);
     dialog.hwndOwner   = window_;
@@ -2005,6 +2177,50 @@ void MainWindow::ImportEditedObjectsImpl() {
 void MainWindow::ImportObj(const std::wstring& path, bool quick, const Vec3* newOrigin) {
     if (!world_) return;
     if (RefuseReadOnlyWorld()) return;
+
+    if (IsWorldFolder(gameFolder_)) {
+        // NFS World: the meshes go into the map's own section files at the
+        // next Save (io/WorldMesh.h), never into a models folder the game
+        // does not read. A shape the manifest does not name (or any, with
+        // `newOrigin`) becomes a new model placed where it stands.
+        io::WorldMeshImport result;
+        const bool staged = io::ImportWorldMeshes(*world_, tracksFolder_, path, result, newOrigin);
+        std::vector<size_t> touched = result.sections;
+        for (size_t i = 0; i < world_->Loaded().size(); ++i)
+            for (u32 hash : result.hashes)
+                if (world_->Loaded()[i]->HoldsModel(hash)) { touched.push_back(i); break; }
+        std::sort(touched.begin(), touched.end());
+        touched.erase(std::unique(touched.begin(), touched.end()), touched.end());
+        viewport_.GetRenderer().ReuploadSections(*world_, touched);
+        if (result.created) {
+            const nfs::LoadedSection* last = world_->Loaded()[result.sections.back()].get();
+            viewport_.GetRenderer().SelectPlacement((u32)result.sections.back(), (int)last->placements.size() - 1);
+        }
+        if (!result.done.empty()) LOG_INFO("mesh edit: staged\n%S", result.done.c_str());
+        if (!result.refused.empty()) LOG_WARN("mesh edit: left alone\n%S", result.refused.c_str());
+
+        std::wstring status = staged ? Format(L"Blender: %zu meshes changed -- Save writes them into the game's files",
+                                              result.staged)
+                                     : std::wstring(L"Blender: no mesh could be taken");
+        if (!result.refused.empty())
+            status += Format(L" -- %zu left alone (see the log)", result.objectsRead - result.staged);
+        SetStatusText(2, status);
+        if (!quick) {
+            std::wstring message = Format(L"Read %zu objects from the OBJ.\n\n", result.objectsRead);
+            if (!result.done.empty()) message += L"Changed (written into the game's files at the next Save):\n" + result.done + L"\n";
+            if (!result.refused.empty()) message += L"Left alone:\n" + result.refused + L"\n";
+            message += L"Only the edited model changes: the farther levels of detail the map names for it keep "
+                       L"their shape, and collision is not touched.";
+            if (result.created)
+                message += L"\n\nA new model draws with game textures its section already uses (named tex_<hash> or by "
+                           L"the texture's name); any other material gets a new texture FRS_<name> from its image "
+                           L"(or its colour), written into the texture section of the game texture its material copies. "
+                           L"It has no collision.";
+            ::MessageBoxW(window_, message.c_str(), kWindowTitle,
+                          (staged ? MB_ICONINFORMATION : MB_ICONWARNING) | MB_OK);
+        }
+        return;
+    }
 
     // Everything that needs the region is read first, because the region has to
     // be closed before the file can be written: the editor keeps the stream in a
@@ -2464,7 +2680,10 @@ void MainWindow::ExportSelectedObjects() {
     dialog.lpstrDefExt = L"obj";
     dialog.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
 
-    if (!::GetSaveFileNameW(&dialog)) return;
+    // FRS_TEST_EXPORT=<file.obj> writes there without asking, for scripted checks.
+    wchar_t scripted[MAX_PATH] = {};
+    if (::GetEnvironmentVariableW(L"FRS_TEST_EXPORT", scripted, MAX_PATH)) ::wcsncpy_s(path, scripted, _TRUNCATE);
+    else if (!::GetSaveFileNameW(&dialog)) return;
 
     ExportSummary summary;
     if (!ExportSelection(*world_, selection, path, region, summary)) {
@@ -2503,6 +2722,15 @@ void MainWindow::SetGameFolder(const std::wstring& folder) {
     tracksFolder_ = folder + L"\\TRACKS";
     viewport_.GetRenderer().SetGameFolder(folder);
     modelsFolder_ = folder + L"\\models";
+    if (IsWorldFolder(folder)) {
+        // The NFS World port only reads the game so far. Whatever the editor
+        // writes goes beside the editor, never into the game's folder.
+        wchar_t self[MAX_PATH] = {};
+        ::GetModuleFileNameW(nullptr, self, MAX_PATH);
+        std::wstring beside = self;
+        beside.resize(beside.find_last_of(L'\\'));
+        modelsFolder_ = beside + L"\\nfsw-models";
+    }
     // The world file last opened or saved, and how <game>\models stood then.
     {
         wchar_t path[MAX_PATH * 2] = {};
@@ -2562,7 +2790,288 @@ void MainWindow::OpenRegion(std::wstring region) {
     LoadAllSections();
 }
 
+// --- undo -----------------------------------------------------------------------
+
+MainWindow::EditSnapshot MainWindow::TakeEditSnapshot() const {
+    EditSnapshot snapshot;
+    u64 hash = 1469598103934665603ull;
+    auto mix = [&hash](const void* data, size_t size) {
+        for (size_t i = 0; i < size; ++i) hash = (hash ^ ((const u8*)data)[i]) * 1099511628211ull;
+    };
+
+    const auto& loaded = world_->Loaded();
+    for (size_t i = 0; i < loaded.size(); ++i) {
+        const nfs::LoadedSection& section = *loaded[i];
+        if (section.placements.empty() && section.removedNatives.empty() &&
+            section.importedModels.empty() && section.movedNatives.empty())
+            continue;
+
+        EditSnapshot::Part part;
+        part.loaded         = i;
+        part.placements     = section.placements;
+        part.removedNatives = section.removedNatives;
+        part.importedModels = section.importedModels;
+        part.movedNatives   = section.movedNatives;
+        part.changed        = section.placementsChanged;
+        for (const auto& moved : part.movedNatives) {
+            mix(&moved.sceneryNumber, sizeof(moved.sceneryNumber));
+            mix(&moved.record, sizeof(moved.record));
+            mix(&moved.moved, sizeof(moved.moved));
+        }
+
+        mix(&i, sizeof(i));
+        for (const auto& placement : part.placements) {
+            mix(&placement.sceneryNumber, sizeof(placement.sceneryNumber));
+            mix(&placement.instance.modelHash, sizeof(placement.instance.modelHash));
+            mix(&placement.instance.transform, sizeof(placement.instance.transform));
+        }
+        for (const auto& removed : part.removedNatives) mix(&removed, sizeof(removed));
+        for (const u32 model : part.importedModels) mix(&model, sizeof(model));
+        const size_t counts[3] = { part.placements.size(), part.removedNatives.size(),
+                                   part.importedModels.size() };
+        mix(counts, sizeof(counts));
+
+        snapshot.parts.push_back(std::move(part));
+    }
+    snapshot.hash = hash;
+    return snapshot;
+}
+
+void MainWindow::ApplyEditSnapshot(const EditSnapshot& snapshot) {
+    auto stand = [](nfs::LoadedSection* section, u32 number, u32 record, const Mat4& transform) {
+        for (nfs::SceneryInstance& instance : section->scenery.instances)
+            if (instance.sceneryNumber == number && instance.record == record) {
+                instance.transform = transform;
+                return;
+            }
+    };
+
+    size_t next = 0;
+    for (size_t i = 0; i < world_->Loaded().size(); ++i) {
+        nfs::LoadedSection* section = world_->MutableLoaded(i);
+
+        // The map's own objects go back where they shipped, then to where
+        // this snapshot has them.
+        const bool hadMoves = !section->movedNatives.empty();
+        for (const auto& moved : section->movedNatives)
+            stand(section, moved.sceneryNumber, moved.record, moved.original);
+        section->movedNatives.clear();
+
+        if (next < snapshot.parts.size() && snapshot.parts[next].loaded == i) {
+            const EditSnapshot::Part& part = snapshot.parts[next++];
+            section->movedNatives = part.movedNatives;
+            for (const auto& moved : section->movedNatives)
+                stand(section, moved.sceneryNumber, moved.record, moved.moved);
+            section->placements        = part.placements;
+            section->removedNatives    = part.removedNatives;
+            section->importedModels    = part.importedModels;
+            section->placementsChanged = true;
+        } else if (hadMoves || !section->placements.empty() || !section->removedNatives.empty() ||
+                   !section->importedModels.empty()) {
+            // It had nothing then, so it has nothing again; still to be written.
+            section->placements.clear();
+            section->removedNatives.clear();
+            section->importedModels.clear();
+            section->placementsChanged = true;
+        }
+    }
+    viewport_.GetRenderer().ClearSelection();
+    viewport_.GetRenderer().RebuildInstances(*world_);
+}
+
+void MainWindow::TrackEdits() {
+    if (!world_) return;
+    // A drag is one step: wait for it to end.
+    if (viewport_.Transforming() || viewport_.GizmoDragging() || ::GetKeyState(VK_LBUTTON) < 0)
+        return;
+
+    EditSnapshot now = TakeEditSnapshot();
+    if (!haveCurrent_) {
+        current_ = std::move(now);
+        haveCurrent_ = true;
+        return;
+    }
+    if (now.hash == current_.hash) return;
+
+    undo_.push_back(std::move(current_));
+    undoStamps_.push_back(undo::NextStamp());
+    if (undo_.size() > 200) { undo_.erase(undo_.begin()); undoStamps_.erase(undoStamps_.begin()); }
+    redo_.clear();
+    current_ = std::move(now);
+}
+
+// One Ctrl+Z for the whole editor: a tool's unfinished step first (a point of
+// a barrier being drawn, a move in hand), then whichever part made the latest
+// step -- roads, terrain, a mesh or a collision edit, or the objects here.
+void MainWindow::Undo() {
+    if (collisionTools_) { collisionTools_->UndoCommand(); return; }
+    if (!undo::UndoLatest()) SetStatusText(2, L"Nothing to undo");
+}
+
+u64 MainWindow::LatestUndoStamp() const {
+    const_cast<MainWindow*>(this)->TrackEdits();
+    return undoStamps_.empty() ? 0 : undoStamps_.back();
+}
+
+bool MainWindow::UndoLatest() {
+    TrackEdits();
+    if (!world_ || undo_.empty()) return false;
+    redo_.push_back(std::move(current_));
+    current_ = std::move(undo_.back());
+    undo_.pop_back();
+    undoStamps_.pop_back();
+    ApplyEditSnapshot(current_);
+    SetStatusText(2, Format(L"Undone (%zu more)", undo_.size()));
+    return true;
+}
+
+void MainWindow::Redo() {
+    if (!world_ || redo_.empty()) { SetStatusText(2, L"Nothing to redo"); return; }
+    undo_.push_back(std::move(current_));
+    undoStamps_.push_back(undo::NextStamp());
+    current_ = std::move(redo_.back());
+    redo_.pop_back();
+    ApplyEditSnapshot(current_);
+    SetStatusText(2, Format(L"Redone (%zu more)", redo_.size()));
+}
+
+// --- clip and detail --------------------------------------------------------------
+
+void MainWindow::ApplyViewSettings(const float values[5], bool store) {
+    const float clipStart    = Clamp(values[0], 0.01f, 1000.0f);
+    const float clipEnd      = Clamp(values[1], clipStart + 1.0f, 200000.0f);
+    const float detailPixels = Clamp(values[2], 0.0f, 200.0f);
+    const float sensitivity  = Clamp(values[3], 0.05f, 10.0f);
+    const float zoomPercent  = Clamp(values[4], 1.0f, 90.0f);
+
+    viewport_.GetCamera().SetClipPlanes(clipStart, clipEnd);
+    viewport_.GetCamera().SetSensitivity(0.0035f * sensitivity);
+    viewport_.GetRenderer().SetDetailPixels(detailPixels);
+    viewport_.SetZoomStep(zoomPercent / 100.0f);
+    if (!store) return;
+
+    HKEY key = nullptr;
+    if (::RegCreateKeyExW(HKEY_CURRENT_USER, kSettingsKey, 0, nullptr, 0, KEY_WRITE, nullptr, &key,
+                          nullptr) != ERROR_SUCCESS)
+        return;
+    const float view[5] = { clipStart, clipEnd, detailPixels, sensitivity, zoomPercent };
+    ::RegSetValueExW(key, L"View", 0, REG_BINARY, (const BYTE*)view, sizeof(view));
+    ::RegCloseKey(key);
+}
+
+namespace {
+
+INT_PTR CALLBACK ClipDialog(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam) {
+    static const int kFields[5] = { IDC_CLIP_START, IDC_CLIP_END, IDC_CLIP_DETAIL,
+                                    IDC_CLIP_SENSITIVITY, IDC_CLIP_ZOOM };
+    switch (message) {
+        case WM_INITDIALOG: {
+            ::SetWindowLongPtrW(dialog, DWLP_USER, lParam);
+            const float* values = (const float*)lParam;
+            for (int i = 0; i < 5; ++i) {
+                wchar_t text[32];
+                ::swprintf_s(text, L"%g", values[i]);
+                ::SetDlgItemTextW(dialog, kFields[i], text);
+            }
+            return TRUE;
+        }
+        case WM_COMMAND:
+            if (LOWORD(wParam) == IDOK) {
+                float* values = (float*)::GetWindowLongPtrW(dialog, DWLP_USER);
+                for (int i = 0; i < 5; ++i) {
+                    wchar_t text[32] = {};
+                    ::GetDlgItemTextW(dialog, kFields[i], text, 32);
+                    for (wchar_t& c : text) if (c == L',') c = L'.';   // 0,5 as typed here
+                    values[i] = std::wcstof(text, nullptr);
+                }
+                ::EndDialog(dialog, IDOK);
+                return TRUE;
+            }
+            if (LOWORD(wParam) == IDCANCEL) { ::EndDialog(dialog, IDCANCEL); return TRUE; }
+            break;
+        default:
+            break;
+    }
+    return FALSE;
+}
+
+} // namespace
+
+void MainWindow::ReplaceTexture(u32 hash, bool restore, const std::wstring& image) {
+    if (!world_) return;
+    if (!IsWorldFolder(gameFolder_)) {
+        ::MessageBoxW(window_, L"Replacing a texture in place is for NFS World. In Underground 2, "
+                               L"textures come in with an imported OBJ.", kWindowTitle, MB_ICONINFORMATION | MB_OK);
+        return;
+    }
+    auto& list = world_->textureReplacements;
+    const auto same = [hash](const nfs::World::TextureReplacement& r) { return r.hash == hash; };
+
+    if (restore) {
+        io::UnstageTextureReplacement(*world_, hash);
+        list.erase(std::remove_if(list.begin(), list.end(), same), list.end());
+        SetStatusText(2, L"Texture back as shipped (not written yet: Ctrl+Shift+S)");
+    } else {
+        wchar_t path[MAX_PATH] = {};
+        OPENFILENAMEW dialog{};
+        dialog.lStructSize = sizeof(dialog);
+        dialog.hwndOwner   = textures_.Handle() ? textures_.Handle() : window_;
+        dialog.lpstrFilter = L"Images (dds, png, tga, bmp, jpg)\0*.dds;*.png;*.tga;*.bmp;*.jpg;*.jpeg\0All files\0*.*\0";
+        dialog.lpstrFile   = path;
+        dialog.nMaxFile    = MAX_PATH;
+        dialog.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+        if (!image.empty()) ::wcsncpy_s(path, image.c_str(), _TRUNCATE);
+        else if (!::GetOpenFileNameW(&dialog)) return;
+
+        // The image is kept beside the shipped copies, so the edit list can
+        // name it and the replacement survives the original being moved.
+        const std::wstring source = path;
+        const size_t dot = source.find_last_of(L'.');
+        const std::wstring fileName =
+            Format(L"%08X", hash) + (dot == std::wstring::npos ? std::wstring(L".png") : source.substr(dot));
+        const std::wstring kept = io::KeptTextureFolder(tracksFolder_) + L"\\" + fileName;
+        if (!::CopyFileW(source.c_str(), kept.c_str(), FALSE)) {
+            ::MessageBoxW(window_, (L"Could not keep a copy of the image as\n" + kept).c_str(), kWindowTitle,
+                          MB_ICONWARNING | MB_OK);
+            return;
+        }
+
+        std::wstring error;
+        const size_t staged = io::StageTextureReplacement(*world_, hash, kept, error);
+        list.erase(std::remove_if(list.begin(), list.end(), same), list.end());
+        if (!staged) {
+            ::MessageBoxW(window_, error.c_str(), kWindowTitle, MB_ICONWARNING | MB_OK);
+            return;
+        }
+        list.push_back({ hash, fileName });
+        SetStatusText(2, Format(L"Texture replaced in %zu stored copies (not written yet: Ctrl+Shift+S)", staged));
+    }
+
+    // The pixels changed under the uploaded textures: upload again. Only the
+    // textures: setting the world anew dropped the selection, and with it the
+    // browser's list of the selected object's textures.
+    viewport_.GetRenderer().ReloadTextures();
+    textures_.SetWorld(world_.get());
+}
+
+void MainWindow::EditClip() {
+    const Camera& camera = viewport_.GetCamera();
+    float values[5] = { camera.NearPlane(), camera.FarPlane(), viewport_.GetRenderer().DetailPixels(),
+                        camera.Sensitivity() / 0.0035f, viewport_.ZoomStep() * 100.0f };
+    if (::DialogBoxParamW(instance_, MAKEINTRESOURCEW(IDD_CLIP), window_, ClipDialog,
+                          (LPARAM)values) != IDOK)
+        return;
+    ApplyViewSettings(values, true);
+    SetStatusText(2, Format(L"Clip %g to %g, detail %g px, sensitivity %g", viewport_.GetCamera().NearPlane(),
+                            viewport_.GetCamera().FarPlane(), viewport_.GetRenderer().DetailPixels(),
+                            viewport_.GetCamera().Sensitivity() / 0.0035f));
+}
+
 void MainWindow::CloseRegion() {
+    undo_.clear();
+    undoStamps_.clear();
+    redo_.clear();
+    haveCurrent_ = false;
     for (auto& extension : extensions_) extension->OnRegionClosed();
     properties_.ForgetPictures();
     ForgetShellThumbnails();
@@ -2588,6 +3097,8 @@ void MainWindow::LoadAllSections() {
 
     const DWORD parseStart = ::GetTickCount();
     world_->LoadAllSections();
+    // What was removed and moved in earlier sessions, on top of the shipped map.
+    if (IsWorldFolder(gameFolder_)) io::LoadWorldEdits(*world_, tracksFolder_);
     const DWORD parseMs = ::GetTickCount() - parseStart;
 
     SetStatusText(0, L"Uploading to the GPU...");
@@ -2638,6 +3149,26 @@ void MainWindow::LoadAllSections() {
     PopulateSectionTree();
 
     LOG_INFO("region loaded: parse %lu ms, upload %lu ms", parseMs, uploadMs);
+
+    // FRS_TEST_TEXTURE=<hash in hex>;<image>: replaces that texture and saves,
+    // for scripted checks (with FRS_WRITE_TRACKS, into a folder that is not the game's).
+    wchar_t test[600] = {};
+    if (::GetEnvironmentVariableW(L"FRS_TEST_TEXTURE", test, 600)) {
+        if (wchar_t* separator = std::wcschr(test, L';')) {
+            *separator = 0;
+            ReplaceTexture((u32)std::wcstoul(test, nullptr, 16), false, separator + 1);
+            SavePlacements();
+        }
+    }
+    // FRS_TEST_REVERT=1: takes back every row the Edits tab lists for NFS World
+    // (which saves), for scripted checks -- with FRS_WRITE_TRACKS.
+    wchar_t revert[8] = {};
+    if (::GetEnvironmentVariableW(L"FRS_TEST_REVERT", revert, 8)) {
+        edits_.RefreshExtra();
+        std::vector<size_t> all(worldEditRows_.size());
+        for (size_t i = 0; i < all.size(); ++i) all[i] = i;
+        RevertWorldEditRows(all);
+    }
 }
 
 void MainWindow::PopulateSectionTree() {
@@ -3160,6 +3691,7 @@ void MainWindow::Tick(float deltaSeconds) {
     // Under the game the map is not seen -- but the panels round it are,
     // and they are drawn by the viewport.
     if (shell_ || !(game_.Embedded() && game_.Shown())) viewport_.Tick(deltaSeconds);
+    TrackEdits();
 
     // The status bar only needs to keep up with the eye, not with the frame rate.
     lastStatusUpdate_ += deltaSeconds;
@@ -3509,6 +4041,23 @@ void MainWindow::PlaceModel(u32 hash, bool copy, size_t target, const Vec3& poin
     const float heading = Degrees(viewport_.GetCamera().Yaw()) + 180.0f;
     placed.transform = nfs::ComposePlacement(point, heading, 0.0f, 0.0f, 1.0f);
 
+    // A model the game baked where it stands (vertices in world coordinates,
+    // its records flag 0x400 with an identity matrix) has its origin far
+    // outside its box: its bottom centre goes to the point, not its origin.
+    if (const Aabb& b = model->bounds; b.Valid()) {
+        constexpr float pad = 1.0f;
+        const bool originInside = b.min.x - pad <= 0.0f && b.max.x + pad >= 0.0f &&
+                                  b.min.y - pad <= 0.0f && b.max.y + pad >= 0.0f &&
+                                  b.min.z - pad <= 0.0f && b.max.z + pad >= 0.0f;
+        if (!originInside) {
+            const Vec3 base{ (b.min.x + b.max.x) * 0.5f, (b.min.y + b.max.y) * 0.5f, b.min.z };
+            const Vec3 at = placed.transform.TransformPoint(base);
+            placed.transform.m[3][0] += point.x - at.x;
+            placed.transform.m[3][1] += point.y - at.y;
+            placed.transform.m[3][2] += point.z - at.z;
+        }
+    }
+
     // What the game already uses for this model -- its flags and its entry in
     // the model table -- is copied from a shipped instance when there is one,
     // since not every field of either is understood.
@@ -3734,6 +4283,30 @@ void MainWindow::PasteClipboard() {
 bool MainWindow::SavePlacements() {
     if (!world_) return false;
     if (RefuseReadOnlyWorld()) return false;
+    if (IsWorldFolder(gameFolder_)) {
+        // NFS World: removed, moved and newly placed objects and replaced
+        // textures are written into the section files (io/WorldWrite.h).
+
+        io::WorldWriteReport report;
+        if (!io::WriteWorldEdits(*world_, tracksFolder_, report)) {
+            LOG_ERROR("NFS World save failed: %S", report.error.c_str());
+            ::MessageBoxW(window_, report.error.c_str(), kWindowTitle, MB_ICONWARNING | MB_OK);
+            return false;
+        }
+        for (const auto& section : world_->Loaded()) section->placementsChanged = false;
+        SetStatusText(2, Format(L"Written to the game: %zu sections (%zu removed, %zu moved, %zu added, %zu meshes, "
+                                L"collision: %zu deleted, %zu added%s), %zu put back", report.written, report.removed,
+                                report.moved, report.added, report.meshes, report.collision, report.collisionAdded,
+                                report.collisionSkipped
+                                    ? Format(L", %zu NOT in the game: outside every collision box",
+                                             report.collisionSkipped).c_str() : L"",
+                                report.restored));
+        LOG_INFO("NFS World save: %zu sections written, %zu removed, %zu moved, %zu added, %zu meshes, "
+                 "%zu collision polygons deleted, %zu added, %zu left out (outside every collision box), %zu restored",
+                 report.written, report.removed, report.moved, report.added, report.meshes, report.collision,
+                 report.collisionAdded, report.collisionSkipped, report.restored);
+        return true;
+    }
     if (!HasUnsavedPlacements()) {
         SetStatusText(2, L"No placements to write.");
         return true;
@@ -3823,7 +4396,130 @@ void MainWindow::RevertTickedEdits() {
                   MB_ICONINFORMATION | MB_OK);
 }
 
+void MainWindow::WorldEditRows(std::vector<EditsPanel::ExtraRow>& rows) {
+    worldEditRows_.clear();
+    if (!world_ || !nfs::IsWorld()) return;
+    const auto add = [&](WorldEditRow entry, const wchar_t* kind, std::wstring what, std::wstring detail) {
+        EditsPanel::ExtraRow row;
+        row.owner  = this;
+        row.index  = worldEditRows_.size();
+        row.kind   = kind;
+        row.what   = std::move(what);
+        row.detail = std::move(detail);
+        rows.push_back(std::move(row));
+        worldEditRows_.push_back(entry);
+    };
+
+    const auto& loaded = world_->Loaded();
+    for (size_t s = 0; s < loaded.size(); ++s) {
+        const nfs::LoadedSection& section = *loaded[s];
+        if (section.removedNatives.empty() && section.movedNatives.empty() && section.placements.empty()) continue;
+        const std::wstring where = L"section " + (section.info ? Widen(section.info->name) : std::wstring(L"?"));
+        const auto nameOf = [&](u32 scenery, u32 record) -> std::wstring {
+            for (const nfs::SceneryInstance& instance : section.scenery.instances)
+                if (instance.sceneryNumber == scenery && instance.record == record)
+                    return instance.infoIndex < section.scenery.infos.size()
+                               ? Widen(section.scenery.infos[instance.infoIndex].name) : std::wstring(L"?");
+            return L"?";
+        };
+        for (const auto& removed : section.removedNatives)
+            add({ WorldEditRow::Removed, s, removed.first, removed.second }, L"Object removed",
+                nameOf(removed.first, removed.second), where);
+        for (const auto& moved : section.movedNatives)
+            add({ WorldEditRow::Moved, s, moved.sceneryNumber, moved.record }, L"Object moved",
+                nameOf(moved.sceneryNumber, moved.record), where);
+        for (size_t p = 0; p < section.placements.size(); ++p)
+            add({ WorldEditRow::Placed, s, (u32)p, 0 }, L"Object placed",
+                Widen(section.placements[p].instance.modelName), where);
+    }
+    for (const auto& replaced : world_->textureReplacements) {
+        const nfs::Texture* texture = world_->FindTexture(replaced.hash);
+        add({ WorldEditRow::Texture, 0, replaced.hash, 0 }, L"Texture replaced",
+            texture ? Widen(texture->name) : Format(L"%08X", replaced.hash), replaced.file);
+    }
+    for (const auto& edited : world_->meshReplacements) {
+        const nfs::SolidObject* model = world_->FindModel(edited.hash);
+        const size_t slash = edited.file.find_last_of(L"\\/");
+        add({ WorldEditRow::Model, 0, edited.hash, 0 }, L"Model edited",
+            model ? Widen(model->name) : Format(L"%08X", edited.hash),
+            slash == std::wstring::npos ? edited.file : edited.file.substr(slash + 1));
+    }
+}
+
+// Takes those edits back and writes the game, as reverting a collision row
+// does. An edited model is not taken back here: nothing yet puts the shipped
+// mesh back in the editor's memory, so its row is left and said so.
+void MainWindow::RevertWorldEditRows(const std::vector<size_t>& indices) {
+    if (!world_) return;
+    std::vector<WorldEditRow> chosen;
+    for (size_t index : indices)
+        if (index < worldEditRows_.size()) chosen.push_back(worldEditRows_[index]);
+
+    size_t objects = 0, textures = 0, models = 0;
+    std::vector<std::pair<size_t, u32>> placed;      // section, placement index
+    std::vector<u32> hashes;
+    for (const WorldEditRow& row : chosen) {
+        if (row.kind == WorldEditRow::Texture) { hashes.push_back(row.a); continue; }
+        if (row.kind == WorldEditRow::Model)   { ++models; continue; }
+        if (row.kind == WorldEditRow::Placed)  { placed.push_back({ row.section, row.a }); continue; }
+        nfs::LoadedSection* section = world_->MutableLoaded((u32)row.section);
+        if (!section) continue;
+        if (row.kind == WorldEditRow::Removed) {
+            auto& removed = section->removedNatives;
+            const auto found = std::find(removed.begin(), removed.end(), std::make_pair(row.a, row.b));
+            if (found == removed.end()) continue;
+            removed.erase(found);
+        } else {
+            auto& moved = section->movedNatives;
+            const auto found = std::find_if(moved.begin(), moved.end(), [&](const nfs::LoadedSection::MovedNative& m) {
+                return m.sceneryNumber == row.a && m.record == row.b;
+            });
+            if (found == moved.end()) continue;
+            for (nfs::SceneryInstance& instance : section->scenery.instances)
+                if (instance.sceneryNumber == row.a && instance.record == row.b) instance.transform = found->original;
+            moved.erase(found);
+        }
+        section->placementsChanged = true;
+        ++objects;
+    }
+    // Last first within a section, so the indices still to go stay valid.
+    std::sort(placed.begin(), placed.end(), [](const auto& a, const auto& b) {
+        return a.first != b.first ? a.first < b.first : a.second > b.second;
+    });
+    for (const auto& [index, placement] : placed) {
+        nfs::LoadedSection* section = world_->MutableLoaded((u32)index);
+        if (!section || placement >= section->placements.size()) continue;
+        section->placements.erase(section->placements.begin() + placement);
+        section->placementsChanged = true;
+        ++objects;
+    }
+    if (objects) {
+        viewport_.GetRenderer().ClearSelection();
+        viewport_.GetRenderer().RebuildInstances(*world_);
+    }
+    for (u32 hash : hashes) { ReplaceTexture(hash, true); ++textures; }
+
+    LOG_INFO("edits tab: %zu object edits and %zu textures taken back, %zu model edits left", objects, textures, models);
+    SetStatusText(2, Format(L"Taken back: %zu object edits, %zu textures%s", objects, textures,
+                            models ? Format(L"; %zu model edits were left (they cannot be taken back here yet)",
+                                            models).c_str() : L""));
+    edits_.RefreshExtra();
+    // Into the game, as the other rows of this tab are.
+    if (objects || textures) ::PostMessageW(window_, WM_COMMAND, ID_OBJECT_SAVE, 0);
+}
+
 void MainWindow::UpdateProperties() {
+    // The texture browser lists what the selection draws with, and the whole
+    // region when nothing is selected.
+    if (textures_.Handle()) {
+        std::vector<u32> hashes;
+        for (const PickResult& picked : viewport_.GetRenderer().Selection())
+            if (picked.object)
+                hashes.insert(hashes.end(), picked.object->textureHashes.begin(),
+                              picked.object->textureHashes.end());
+        textures_.SetFilter(std::move(hashes));
+    }
+
     using Row = PropertiesPanel::Row;
     PropertiesPanel::View view;
     const auto add = [&view](const wchar_t* group, const wchar_t* name, std::wstring value,
@@ -3888,8 +4584,11 @@ void MainWindow::UpdateProperties() {
                                                                           : L"Model library (header matrix)";
     add(L"Object", L"Model", model ? Widen(model->name) : L"?", L"The solid object this places.");
     add(L"Object", L"Source", source,
-        L"Placed objects can be edited and deleted. The map's own can be copied, removed, or moved -- "
-        L"G, R, the gizmo or these fields; moving one replaces it with a placement of the same model.");
+        nfs::IsWorld()
+            ? L"Placed objects can be edited and deleted. The map's own can be copied, removed, or moved -- "
+              L"G, R, the gizmo or these fields; it moves where it stands, the same record of the map."
+            : L"Placed objects can be edited and deleted. The map's own can be copied, removed, or moved -- "
+              L"G, R, the gizmo or these fields; moving one replaces it with a placement of the same model.");
     add(L"Object", L"Section", section && section->info ? Widen(section->info->name) : L"?",
         L"The streaming section that places it: the game draws it while that section is loaded.");
     add(L"Object", L"Model stored in",
@@ -3929,6 +4628,15 @@ void MainWindow::ApplyPropertyFields(bool rehome) {
     if (!world_) return;
     Mat4 transform;
     if (!properties_.Read(transform)) return;
+    // NFS World: one of the map's own objects moves where it stands, as it
+    // does with the gizmo -- nothing is detached there (Viewport::DetachNatives
+    // returns 0), so without this the fields did nothing.
+    if (nfs::IsWorld() && !viewport_.SelectedPlacement(section, placement)) {
+        const auto movables = viewport_.SelectedMovables();
+        if (movables.size() != 1) return;
+        viewport_.SetPlacementTransform(movables.front().first, movables.front().second, transform);
+        return;
+    }
     // One of the map's own objects edited in the fields: it becomes a placement first.
     if (!viewport_.SelectedPlacement(section, placement)) viewport_.DetachNatives();
     if (!viewport_.SelectedPlacement(section, placement)) return;

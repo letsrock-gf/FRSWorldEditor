@@ -26,6 +26,9 @@ struct CollisionPolygon {
     // A vertical wall along corners[0] -> corners[2], unbounded in height.
     // Its z values are left at zero; a viewer has to pick its own height.
     bool barrier = false;
+    // NFS World: a barrier that carries its own height. corners[0] is one end
+    // at the bottom, corners[2] the other end at the top.
+    bool wall    = false;
     u8   surface = 0;   // byte 2: index into the game's surface table (SurfaceName)
     u8   raceGroup = 0; // byte 0: race barrier group, 0 = always there (see World)
     u8   flags   = 0;   // byte 3: 0x10 quad, 0x02 vertical, 0x16 barrier
@@ -33,6 +36,10 @@ struct CollisionPolygon {
     // writes; the named fields above are read from them (SyncFromAttributes).
     // Byte 1 is recomputed on every encode.
     u8   attributes[4] = {};
+    // NFS World: which polygon of the shipped pack this is, in the order the
+    // parser lists them; kNoSource for one the editor made.
+    static constexpr u32 kNoSource = 0xFFFFFFFFu;
+    u32  source = kNoSource;
 
     void SyncFromAttributes() {
         raceGroup = attributes[0];
@@ -62,6 +69,7 @@ struct CollisionPack {
     Vec3 gridOrigin;        // corner of cell (0, 0); cells are 32 units square
     Aabb bounds;            // barriers stretch it to z = +/-127
     std::vector<CollisionPolygon> polygons;
+    u32  shippedPolygons = 0;   // NFS World: how many the pack held as parsed
 
     // The order polygons are listed in within a grid cell, as a rank per
     // polygon (lower first). It is not the file order: the game's tool lists
@@ -107,6 +115,7 @@ private:
     mutable std::vector<std::pair<float, float>> barrierZ_;   // per polygon, for barriers
     mutable const CollisionPolygon* barrierFor_ = nullptr;
     mutable size_t barrierSize_ = 0;
+    static constexpr float kWallShown    = 4.0f;   // drawn height of an NFS World wall
 };
 
 // A fingerprint of the polygons, so an import can tell which state of a pack
@@ -119,6 +128,68 @@ bool ParseCollision(const Chunk& collisionChunk, CollisionPack& out);
 // Decodes a run of 32-byte polygon records (0x00034134; Underground 1 keeps
 // the same records for a whole track in its bundle's 0x00034132).
 void ParseCollisionPolygons(ByteSpan polygons, std::vector<CollisionPolygon>& out);
+// Parses one NFS World pack, chunk 0x0003B801 (see WorldCollision.cpp). Read
+// only: `surface` is a byte folded from the surface's hash, `attributes` holds
+// the hash itself and `flags` the triangle's or barrier's flag byte.
+bool ParseWorldCollision(const Chunk& collisionChunk, CollisionPack& out);
+
+// Takes polygons out of an NFS World pack where it stands: `payload` is the
+// chunk's payload, filler included, and `removed` the `source` of each polygon
+// to drop. The articles that lose polygons are written again -- a strip cut in
+// two keeps its centre, its vertices and its winding -- and the pack is laid
+// out again inside the same bytes, so no size changes anywhere. Nothing else
+// can be written yet: a moved or new polygon would have to change its
+// instance's box, which the map's own index of instances (L5RA.BUN 0x3B800,
+// not decoded) was built from.
+// False, with `payload` untouched, when the pack is not laid out the way every
+// shipped one is or the result does not fit.
+bool RemoveFromWorldCollision(u8* payload, size_t size, const std::vector<u32>& removed,
+                              std::wstring& error);
+
+// The same with polygons to add, and the pack allowed to grow: `out` is the new
+// payload (filler included), longer than `payload` by a multiple of 0x100 or
+// the same size. An added polygon goes into the article of the smallest
+// instance whose box holds it in plan, as single-triangle strips (or barrier
+// records); only that instance's half height grows. The game reaches instances
+// through a grid built from their boxes (nfsw.exe 0x6F2570; the grid itself,
+// L5RA.BUN 0x3B800, is not decoded), so a polygon outside every box of its
+// pack cannot be reached and is not written: `skipped` counts those. Ground no
+// single box holds is cut along the boxes it crosses instead, a piece per box;
+// `spill` is other packs' ground of that kind, cut into this pack's boxes only.
+// `placed`, when given, gets per polygon (added, then spill) 0 = nothing
+// written, 1 = pieces, 2 = whole into one box.
+// `grown`, when given, gets the instances that got polygons, for the grid.
+// `pack` is the pack as loaded, for the height the editor shows its barriers at.
+struct GridEntry { u32 key; float x0, x1, z0, z1; };   // pack << 16 | instance; box in collision x and z
+bool RewriteWorldCollision(ByteSpan payload, const CollisionPack& pack, const std::vector<u32>& removed,
+                           const std::vector<CollisionPolygon>& added, size_t& skipped,
+                           std::vector<u8>& out, std::wstring& error,
+                           const std::vector<CollisionPolygon>& spill = {}, std::vector<u8>* placed = nullptr,
+                           std::vector<GridEntry>* grown = nullptr);
+
+// Ground that lies a little under added ground (a speed bump, cobbles, a ramp
+// laid on the road) loses the part under it. A wheel keeps the face it found
+// while its point stays inside it in plan (nfsw.exe 0x6dcbc0, per wheel from
+// 0x6fc8f0 through 0x6f5f50), so with the road still under a bump it rides the
+// road's plane, then the bump's once it searches again: the height jumps by the
+// bump's in one step and the shock throws the car, at any speed. With one face
+// under each point the wheel follows the bump. True when `ground` was cut:
+// `pieces` (triangles, possibly none) then stand for it.
+bool CutUnderRaised(const CollisionPolygon& ground, const std::vector<const CollisionPolygon*>& raised,
+                    std::vector<CollisionPolygon>& pieces);
+
+// Adds each entry's key to list 0 of every cell of the section's collision grid
+// (chunk 0x3B802, `raw` with its filler) that its box touches, making cells
+// that are missing. False when nothing changed or the layout is not the shipped
+// one; `out` is then left alone.
+bool AddToCollisionGrid(ByteSpan raw, const std::vector<GridEntry>& entries, std::vector<u8>& out);
+
+// A check of that writer on a copy of one shipped pack: every `every`-th
+// polygon, then a block of neighbours, taken out and read back. The totals
+// are logged by LogWorldCollisionSelfTest. Run on the whole map by starting
+// the editor with FRS_WORLD_COLLISION_SELFTEST=<every>; nothing is written.
+void WorldCollisionSelfTest(const Chunk& chunk, const CollisionPack& shipped, u32 every);
+void LogWorldCollisionSelfTest();
 
 // Writes a pack back out as a complete 0x80034130 chunk, header included.
 //

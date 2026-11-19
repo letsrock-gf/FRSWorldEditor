@@ -51,6 +51,10 @@ class CollisionTools : public EditorExtension, public ViewportTool, public UndoP
 public:
     explicit CollisionTools(CollisionToolsHost host) : host_(std::move(host)) {}
 
+    // Edit > Undo and Ctrl+Z of the whole editor: this tool's own unfinished
+    // step first, then the latest step of whichever part made it.
+    void UndoCommand() { Undo(); }
+
     // The command Ctrl+Z sends (Collision > Undo), for a tool that takes it first.
     static constexpr int kUndoCommand = 44004;
 
@@ -137,6 +141,7 @@ private:
     void SetSelectionSurface(u8 surface);
     void ClearSelectionRaceGroup();
     void SelectCopies();
+    void FlipSelection();
     void Undo();
 
     bool BeginMove();

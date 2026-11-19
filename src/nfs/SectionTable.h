@@ -25,9 +25,23 @@ struct Section {
 
     u32 order = 0;           // streaming priority / ordering key
 
+    // NFS World: the section is a file of its own in TRACKS, and streamOffset
+    // is where the editor laid it in its virtual stream (World::Open). Empty
+    // for Underground 2.
+    std::wstring fileName;
+    // The file the editor reads it from: the copy kept in TRACKS\frs-original
+    // once the section has been written to, the game's own file otherwise.
+    std::wstring sourcePath;
+
     // Where this entry sits in L4Rx.BUN. A mesh that outgrows its section
     // moves, and moving it means correcting the offset and size right here.
     u64 tableEntryOffset = 0;
+
+    // NFS World: in how many parts the game streams this section's file. 1 for
+    // a section of the map; 5 for a texture section -- everything up to its
+    // larger-level packs, then each of the four packs -- whose entry says
+    // where each part ends (io/WorldWrite.cpp).
+    u32 streamParts = 1;
 
     // What the shipped table said, before any edit repointed it. Rebuilding a
     // section has to start from the bytes the game came with: starting from an
@@ -63,6 +77,9 @@ public:
     bool Parse(ByteSpan bunFile);
 
     const std::vector<Section>& Sections() const { return sections_; }
+
+    // NFS World: World::Open places each section's file in the virtual stream.
+    std::vector<Section>& MutableSections() { return sections_; }
 
     // Applies a span of replacement bytes to the table as it was read.
     //

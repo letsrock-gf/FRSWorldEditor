@@ -67,32 +67,59 @@ u32 NearestPowerOfTwo(u32 size) {
     return best;
 }
 
-// Bilinear, per channel. Shrinking by more than half would want a box filter
-// to avoid skipping pixels, but a picture that far from a power of two is rare
-// and the nearest one never differs from the source by that much.
+// A picture brought to another size, per channel: bilinear where it grows,
+// averaged over the area each new pixel covers where it shrinks.
 std::vector<u32> Resample(const std::vector<u32>& source, u32 width, u32 height,
                           u32 toWidth, u32 toHeight) {
-    std::vector<u32> out((size_t)toWidth * toHeight);
-    for (u32 y = 0; y < toHeight; ++y) {
-        const float sy = std::max(0.0f, (y + 0.5f) * height / toHeight - 0.5f);
-        const u32 y0 = std::min((u32)sy, height - 1), y1 = std::min(y0 + 1, height - 1);
-        const float fy = sy - (float)y0;
-        for (u32 x = 0; x < toWidth; ++x) {
-            const float sx = std::max(0.0f, (x + 0.5f) * width / toWidth - 0.5f);
-            const u32 x0 = std::min((u32)sx, width - 1), x1 = std::min(x0 + 1, width - 1);
-            const float fx = sx - (float)x0;
-
-            const u32 a = source[(size_t)y0 * width + x0], b = source[(size_t)y0 * width + x1];
-            const u32 c = source[(size_t)y1 * width + x0], d = source[(size_t)y1 * width + x1];
-            u32 pixel = 0;
-            for (u32 shift = 0; shift < 32; shift += 8) {
-                const float top    = ((a >> shift) & 0xFF) * (1 - fx) + ((b >> shift) & 0xFF) * fx;
-                const float bottom = ((c >> shift) & 0xFF) * (1 - fx) + ((d >> shift) & 0xFF) * fx;
-                pixel |= (u32)(top * (1 - fy) + bottom * fy + 0.5f) << shift;
+    // One axis at a time. Each new pixel is a weighted sum of old ones: of
+    // the two it lies between where the picture grows, and of all it covers
+    // where the picture shrinks. The second matters since a texture takes the
+    // size of its image: a 4096-pixel image also makes the 512-pixel copy in
+    // the pack, and taking two pixels of every eight there shimmers.
+    struct Tap { u32 index; float weight; };
+    const auto taps = [](u32 from, u32 to) {
+        std::vector<std::vector<Tap>> all(to);
+        const float scale = (float)from / (float)to;
+        for (u32 t = 0; t < to; ++t) {
+            if (to >= from) {
+                const float at = std::max(0.0f, ((float)t + 0.5f) * scale - 0.5f);
+                const u32 a = std::min((u32)at, from - 1), b = std::min(a + 1, from - 1);
+                const float f = at - (float)a;
+                all[t] = { { a, 1.0f - f }, { b, f } };
+            } else {
+                const float begin = (float)t * scale, end = (float)(t + 1) * scale;
+                float total = 0.0f;
+                for (u32 i = (u32)begin; i < from && (float)i < end; ++i) {
+                    const float cover = std::min(end, (float)i + 1.0f) - std::max(begin, (float)i);
+                    if (cover > 0.0f) { all[t].push_back({ i, cover }); total += cover; }
+                }
+                if (all[t].empty()) { all[t].push_back({ std::min((u32)begin, from - 1), 1.0f }); total = 1.0f; }
+                for (Tap& tap : all[t]) tap.weight /= total;
             }
-            out[(size_t)y * toWidth + x] = pixel;
         }
-    }
+        return all;
+    };
+    const auto blend = [](const std::vector<Tap>& row, const u32* pixels, size_t stride) {
+        u32 pixel = 0;
+        for (u32 shift = 0; shift < 32; shift += 8) {
+            float sum = 0.0f;
+            for (const Tap& tap : row) sum += (float)((pixels[tap.index * stride] >> shift) & 0xFF) * tap.weight;
+            pixel |= std::min(255u, (u32)(sum + 0.5f)) << shift;
+        }
+        return pixel;
+    };
+
+    const auto across = taps(width, toWidth);
+    std::vector<u32> wide((size_t)toWidth * height);
+    for (u32 y = 0; y < height; ++y)
+        for (u32 x = 0; x < toWidth; ++x)
+            wide[(size_t)y * toWidth + x] = blend(across[x], source.data() + (size_t)y * width, 1);
+
+    const auto down = taps(height, toHeight);
+    std::vector<u32> out((size_t)toWidth * toHeight);
+    for (u32 y = 0; y < toHeight; ++y)
+        for (u32 x = 0; x < toWidth; ++x)
+            out[(size_t)y * toWidth + x] = blend(down[y], wide.data() + x, toWidth);
     return out;
 }
 
@@ -189,6 +216,29 @@ void CompressColourBlock(const u32* block, u8* out, bool allowTransparent) {
         lowR = std::min(lowR, r); highR = std::max(highR, r);
         lowG = std::min(lowG, g); highG = std::max(highG, g);
         lowB = std::min(lowB, b); highB = std::max(highB, b);
+    }
+
+    // Which two corners of the box the colours run between. Darkest to
+    // lightest is right when the channels rise together; where one falls as
+    // another rises -- magenta against green, a red sign on grass -- that line
+    // misses both colours and the block comes out grey. So each channel is
+    // measured against the widest one, and turned round when it runs against it.
+    {
+        const int range[3] = { highR - lowR, highG - lowG, highB - lowB };
+        const int widest = range[0] >= range[1] && range[0] >= range[2] ? 0 : range[1] >= range[2] ? 1 : 2;
+        const int shifts[3] = { 16, 8, 0 };
+        int sum[3] = {};
+        for (int i = 0; i < 16; ++i)
+            for (int c = 0; c < 3; ++c) sum[c] += (block[i] >> shifts[c]) & 0xFF;
+        long long together[3] = {};
+        for (int i = 0; i < 16; ++i) {
+            const int reference = (int)((block[i] >> shifts[widest]) & 0xFF) * 16 - sum[widest];
+            for (int c = 0; c < 3; ++c)
+                together[c] += (long long)reference * ((int)((block[i] >> shifts[c]) & 0xFF) * 16 - sum[c]);
+        }
+        if (together[0] < 0) std::swap(lowR, highR);
+        if (together[1] < 0) std::swap(lowG, highG);
+        if (together[2] < 0) std::swap(lowB, highB);
     }
 
     u16 c0 = Pack565(highR, highG, highB);
@@ -343,6 +393,30 @@ void Compress(const std::vector<u32>& bgra, u32 width, u32 height, bool alpha,
     }
 }
 
+// DXT3: sixteen 4-bit alphas, then the colour block.
+void CompressDxt3(const std::vector<u32>& bgra, u32 width, u32 height, std::vector<u8>& out) {
+    const u32 blocksX = std::max(1u, (width + 3) / 4);
+    const u32 blocksY = std::max(1u, (height + 3) / 4);
+    out.assign((size_t)blocksX * blocksY * 16, 0);
+
+    for (u32 by = 0; by < blocksY; ++by) {
+        for (u32 bx = 0; bx < blocksX; ++bx) {
+            u32 block[16];
+            for (u32 y = 0; y < 4; ++y)
+                for (u32 x = 0; x < 4; ++x) {
+                    const u32 px = std::min(bx * 4 + x, width - 1);
+                    const u32 py = std::min(by * 4 + y, height - 1);
+                    block[y * 4 + x] = bgra[(size_t)py * width + px];
+                }
+
+            u8* at = out.data() + ((size_t)by * blocksX + bx) * 16;
+            for (int i = 0; i < 16; ++i)
+                at[i / 2] |= (u8)(((block[i] >> 28) & 0xF) << (4 * (i % 2)));
+            CompressColourBlock(block, at + 8, false);
+        }
+    }
+}
+
 std::string Narrow(const std::wstring& text) {
     std::string out;
     out.reserve(text.size());
@@ -351,6 +425,80 @@ std::string Narrow(const std::wstring& text) {
 }
 
 } // namespace
+
+bool EncodeForSlot(const std::wstring& path, u32 width, u32 height, u32 fourcc, u32 mipCount,
+                   std::vector<u8>& out, std::wstring& error, const std::vector<u32>* alphaFrom,
+                   u32 alphaWidth, u32 alphaHeight) {
+    constexpr u32 kDxt1 = 0x31545844, kDxt3 = 0x33545844, kDxt5 = 0x35545844;
+    if (fourcc != kDxt1 && fourcc != kDxt3 && fourcc != kDxt5) {
+        error = L"That texture is in a format the editor does not write.";
+        return false;
+    }
+
+    std::wstring suffix = path.substr(std::min(path.find_last_of(L'.'), path.size()));
+    for (wchar_t& c : suffix) c = (wchar_t)::towlower(c);
+
+    u32 imageWidth = 0, imageHeight = 0;
+    std::vector<u32> level;
+    const bool read = suffix == L".tga" ? LoadTga(path, imageWidth, imageHeight, level)
+                                        : LoadImage(path, imageWidth, imageHeight, level);
+    if (!read || !imageWidth || !imageHeight) {
+        error = L"Could not read " + path;
+        return false;
+    }
+    if (imageWidth != width || imageHeight != height)
+        level = Resample(level, imageWidth, imageHeight, width, height);
+
+    // The picture's colours over the alpha the texture already had.
+    if (alphaFrom) {
+        std::vector<u32> sized;
+        if (alphaFrom->size() != level.size() && alphaWidth && alphaHeight &&
+            alphaFrom->size() == (size_t)alphaWidth * alphaHeight) {
+            sized = Resample(*alphaFrom, alphaWidth, alphaHeight, width, height);
+            alphaFrom = &sized;
+        }
+        if (alphaFrom->size() == level.size())
+            for (size_t i = 0; i < level.size(); ++i)
+                level[i] = (level[i] & 0x00FFFFFFu) | ((*alphaFrom)[i] & 0xFF000000u);
+    }
+
+    out.clear();
+    u32 levelWidth = width, levelHeight = height;
+    for (u32 mip = 0; mip < std::max(mipCount, 1u); ++mip) {
+        std::vector<u8> compressed;
+        if (fourcc == kDxt3) CompressDxt3(level, levelWidth, levelHeight, compressed);
+        else                 Compress(level, levelWidth, levelHeight, fourcc == kDxt5, compressed);
+        out.insert(out.end(), compressed.begin(), compressed.end());
+
+        std::vector<u32> smaller;
+        u32 smallerWidth = 0, smallerHeight = 0;
+        Halve(level, levelWidth, levelHeight, smaller, smallerWidth, smallerHeight);
+        level.swap(smaller);
+        levelWidth  = smallerWidth;
+        levelHeight = smallerHeight;
+    }
+    return true;
+}
+
+bool ImageHasAlpha(const std::wstring& path) {
+    std::wstring suffix = path.substr(std::min(path.find_last_of(L'.'), path.size()));
+    for (wchar_t& c : suffix) c = (wchar_t)::towlower(c);
+    u32 width = 0, height = 0;
+    std::vector<u32> pixels;
+    if (!(suffix == L".tga" ? LoadTga(path, width, height, pixels) : LoadImage(path, width, height, pixels))) return false;
+    for (const u32 pixel : pixels)
+        if ((pixel >> 24) < 250) return true;
+    return false;
+}
+
+bool ImageSize(const std::wstring& path, u32& width, u32& height) {
+    std::wstring suffix = path.substr(std::min(path.find_last_of(L'.'), path.size()));
+    for (wchar_t& c : suffix) c = (wchar_t)::towlower(c);
+    std::vector<u32> pixels;
+    width = height = 0;
+    return (suffix == L".tga" ? LoadTga(path, width, height, pixels) : LoadImage(path, width, height, pixels)) &&
+           width && height;
+}
 
 u32 TextureNameHash(const std::string& name) {
     u32 hash = 0xFFFFFFFFu;

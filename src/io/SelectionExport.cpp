@@ -1,6 +1,7 @@
 #include "io/SelectionExport.h"
 
 #include "core/Log.h"
+#include "nfs/GameFormat.h"
 #include "nfs/TextureDecode.h"
 #include "nfs/World.h"
 
@@ -199,6 +200,10 @@ bool ExportSelection(const nfs::World& world,
     std::fprintf(manifest, "  \"objects\": [\n");
 
     std::unordered_set<u32> usedTextures;
+    // NFS World: a second material of one model drawing with the same texture
+    // (another effect) gets a name of its own, tex_<hash>_m<n>, so the way back
+    // can tell the two apart.
+    std::vector<std::pair<std::string, u32>> aliases;
     size_t vertexBase = 1;      // OBJ indices start at one and run across the file
     size_t triangles  = 0;
     size_t written    = 0;
@@ -266,14 +271,22 @@ bool ExportSelection(const nfs::World& world,
             std::fprintf(obj, "vt %.5f %.5f\n", vertex.uv.x, 1.0f - vertex.uv.y);
         }
 
-        for (const nfs::SolidMaterial& material : model->materials) {
+        std::unordered_set<u32> textured;
+        for (size_t m = 0; m < model->materials.size(); ++m) {
+            const nfs::SolidMaterial& material = model->materials[m];
             const u32 textureHash =
                 material.textureIndex < model->textureHashes.size()
                     ? model->textureHashes[material.textureIndex] : 0;
 
             if (textureHash) {
                 usedTextures.insert(textureHash);
-                std::fprintf(obj, "usemtl tex_%08X\n", textureHash);
+                char name[48];
+                ::_snprintf_s(name, _TRUNCATE, "tex_%08X", textureHash);
+                if (nfs::IsWorld() && !textured.insert(textureHash).second) {
+                    ::_snprintf_s(name, _TRUNCATE, "tex_%08X_m%zu", textureHash, m);
+                    aliases.emplace_back(name, textureHash);
+                }
+                std::fprintf(obj, "usemtl %s\n", name);
             } else {
                 std::fprintf(obj, "usemtl untextured\n");
             }
@@ -332,9 +345,16 @@ bool ExportSelection(const nfs::World& world,
         std::fprintf(mtl, "# FRS World Editor selection export\n\n");
         std::fprintf(mtl, "newmtl untextured\nKd 0.60 0.60 0.60\n\n");
 
+        std::vector<std::pair<std::string, u32>> names;
         for (u32 hash : usedTextures) {
+            char name[32];
+            ::_snprintf_s(name, _TRUNCATE, "tex_%08X", hash);
+            names.emplace_back(name, hash);
+        }
+        names.insert(names.end(), aliases.begin(), aliases.end());
+        for (const auto& [name, hash] : names) {
             const nfs::Texture* texture = world.FindTexture(hash);
-            std::fprintf(mtl, "newmtl tex_%08X\n", hash);
+            std::fprintf(mtl, "newmtl %s\n", name.c_str());
             std::fprintf(mtl, "Kd 1.00 1.00 1.00\n");
             if (!texture) {
                 std::fprintf(mtl, "# texture %08X is not in this region\n\n", hash);
@@ -343,14 +363,41 @@ bool ExportSelection(const nfs::World& world,
 
             std::vector<u32> pixels;
             u32 width = 0, height = 0;
-            if (!nfs::DecodeTexture(*texture, 0, pixels, width, height)) {
+            // The largest stored version: in NFS World the pack holds a 128 to
+            // 256 pixel copy and the full size is kept apart, and a small copy
+            // stretched over a building reads in Blender as a bad mapping.
+            nfs::Texture largest;
+            const nfs::Texture& source = world.LargestTexture(hash, largest) ? largest : *texture;
+            if (!nfs::DecodeTexture(source, 0, pixels, width, height)) {
                 std::fprintf(mtl, "# %s could not be decoded\n\n", texture->name.c_str());
                 continue;
             }
 
+            // Opacity, by the rule the editor's own renderer draws with
+            // (render/GpuResources.cpp). Without it Blender shows a leaf card
+            // as a solid rectangle and a light beam as a black box over
+            // whatever it lights.
+            const bool additive = texture->alphaBlend == nfs::AlphaBlend::Additive;
+            const bool seeThrough = additive || texture->alphaBlend == nfs::AlphaBlend::Blend ||
+                                    texture->alphaUsage == nfs::AlphaUsage::PunchThru;
+            if (additive) {
+                // Added light has no opacity of its own: black adds nothing.
+                // Brightness stands in for it, and it goes into the picture's
+                // own alpha because that is the only one Blender's solid view
+                // reads -- a separate opacity map shows in rendered view alone.
+                for (u32& p : pixels) {
+                    const u32 brightest = std::max({ (p >> 16) & 0xFF, (p >> 8) & 0xFF, p & 0xFF });
+                    p = (p & 0x00FFFFFF) | (brightest * (p >> 24) / 255) << 24;
+                }
+            }
+
             const std::string file = SafeName(texture->name) + ".tga";
-            if (WriteTga(textureDir + L"\\" + Widen(file), pixels, width, height))
+            if (WriteTga(textureDir + L"\\" + Widen(file), pixels, width, height)) {
                 std::fprintf(mtl, "map_Kd textures/%s\n", file.c_str());
+                // Blender wires map_d to the material's alpha.
+                if (seeThrough) std::fprintf(mtl, "map_d textures/%s\n", file.c_str());
+                if (additive)   std::fprintf(mtl, "# added light in the game: its alpha here is its brightness\n");
+            }
             std::fprintf(mtl, "\n");
         }
         std::fclose(mtl);

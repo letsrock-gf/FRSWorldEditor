@@ -4,6 +4,7 @@
 
 #include <windows.h>
 
+#include <functional>
 #include <vector>
 
 // Lists the textures of a region and previews the selected one.
@@ -16,9 +17,17 @@ class TextureBrowser {
 public:
     void Show(HINSTANCE instance, HWND parent, const nfs::World* world);
     void SetWorld(const nfs::World* world);
+
+    // With hashes given, only those textures are listed: the selection's.
+    // Empty lists the whole region.
+    void SetFilter(std::vector<u32> hashes);
     void Close();
 
     HWND Handle() const { return dialog_; }
+
+    // Asked to put an image in a texture's place (false) or take it back out
+    // (true). The main window does it: it owns the world and the game folder.
+    std::function<void(u32 hash, bool restore)> onReplace;
 
 private:
     static INT_PTR CALLBACK DialogProc(HWND dialog, UINT message,
@@ -38,8 +47,10 @@ private:
     const nfs::World* world_ = nullptr;
 
     std::vector<const nfs::Texture*> textures_;
+    std::vector<u32> filter_;   // sorted
 
     // Decoded pixels of the current selection, top-down BGRA.
+    nfs::Texture shown_;        // the largest stored version of the selected texture
     std::vector<u32> pixels_;
     u32 pixelWidth_  = 0;
     u32 pixelHeight_ = 0;

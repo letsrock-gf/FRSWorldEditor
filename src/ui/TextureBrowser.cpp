@@ -6,9 +6,12 @@
 
 #include <commctrl.h>
 #include <commdlg.h>
+#include <objbase.h>
+#include <wincodec.h>
 
 #include <algorithm>
 #include <cstdio>
+#include <cwctype>
 
 namespace {
 
@@ -82,6 +85,14 @@ void TextureBrowser::Show(HINSTANCE instance, HWND parent, const nfs::World* wor
     ::SetForegroundWindow(dialog_);
 }
 
+void TextureBrowser::SetFilter(std::vector<u32> hashes) {
+    std::sort(hashes.begin(), hashes.end());
+    hashes.erase(std::unique(hashes.begin(), hashes.end()), hashes.end());
+    if (hashes == filter_) return;
+    filter_ = std::move(hashes);
+    if (dialog_) Populate();
+}
+
 void TextureBrowser::SetWorld(const nfs::World* world) {
     world_ = world;
     if (dialog_) Populate();
@@ -126,6 +137,14 @@ INT_PTR CALLBACK TextureBrowser::DialogProc(HWND dialog, UINT message,
             if (!self) break;
             switch (LOWORD(wParam)) {
                 case IDC_TEX_SAVE: self->SaveSelected(); return TRUE;
+                case IDC_TEX_REPLACE:
+                case IDC_TEX_RESTORE:
+                    if (const nfs::Texture* chosen = self->Selected())
+                        if (self->onReplace) self->onReplace(chosen->hash, LOWORD(wParam) == IDC_TEX_RESTORE);
+                    return TRUE;
+                case IDC_TEX_SEARCH:
+                    if (HIWORD(wParam) == EN_CHANGE) self->Populate();
+                    return TRUE;
                 case IDC_TEX_ZOOM:
                     ::InvalidateRect(::GetDlgItem(dialog, IDC_TEX_PREVIEW), nullptr, TRUE);
                     return TRUE;
@@ -142,8 +161,8 @@ INT_PTR CALLBACK TextureBrowser::DialogProc(HWND dialog, UINT message,
 
         case WM_GETMINMAXINFO: {
             auto* info = (MINMAXINFO*)lParam;
-            info->ptMinTrackSize.x = 660;
-            info->ptMinTrackSize.y = 480;
+            info->ptMinTrackSize.x = ::MulDiv(560, (int)::GetDpiForWindow(dialog), 96);
+            info->ptMinTrackSize.y = ::MulDiv(420, (int)::GetDpiForWindow(dialog), 96);
             return TRUE;
         }
 
@@ -162,19 +181,20 @@ void TextureBrowser::OnInit(HWND dialog) {
     list_   = ::GetDlgItem(dialog, IDC_TEX_LIST);
 
     ListView_SetExtendedListViewStyle(list_, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+    ::SendDlgItemMessageW(dialog, IDC_TEX_SEARCH, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search by name");
 
     struct { const wchar_t* title; int width; } columns[] = {
-        { L"Name",   170 },
-        { L"Size",    70 },
-        { L"Format",  50 },
-        { L"Used",    50 },
+        { L"Name",   150 },
+        { L"Size",    62 },
+        { L"Format",  52 },
+        { L"Used",    42 },
     };
 
     for (int i = 0; i < (int)std::size(columns); ++i) {
         LVCOLUMNW column{};
         column.mask     = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
         column.pszText  = (LPWSTR)columns[i].title;
-        column.cx       = columns[i].width;
+        column.cx       = ::MulDiv(columns[i].width, (int)::GetDpiForWindow(dialog), 96);
         column.iSubItem = i;
         ListView_InsertColumn(list_, i, &column);
     }
@@ -182,6 +202,11 @@ void TextureBrowser::OnInit(HWND dialog) {
 
 void TextureBrowser::Populate() {
     if (!list_) return;
+
+    // The texture that was chosen stays chosen when the list is made again:
+    // after replacing one, it is the one to look at.
+    const nfs::Texture* before = Selected();
+    const u32 chosen = before ? before->hash : 0;
 
     ListView_DeleteAllItems(list_);
     textures_.clear();
@@ -191,6 +216,29 @@ void TextureBrowser::Populate() {
     if (!world_) return;
 
     textures_ = world_->AllTextures();
+    if (!filter_.empty())
+        textures_.erase(std::remove_if(textures_.begin(), textures_.end(),
+                                       [this](const nfs::Texture* texture) {
+                                           return !std::binary_search(filter_.begin(), filter_.end(),
+                                                                      texture->hash);
+                                       }),
+                        textures_.end());
+
+    // The search field keeps the textures whose name holds what was typed,
+    // whatever the case. ponytail: the list is made again on every key;
+    // a short timer if that gets slow on a whole region.
+    wchar_t typed[128] = {};
+    ::GetDlgItemTextW(dialog_, IDC_TEX_SEARCH, typed, 128);
+    std::wstring search = typed;
+    for (wchar_t& c : search) c = (wchar_t)::towlower(c);
+    if (!search.empty())
+        textures_.erase(std::remove_if(textures_.begin(), textures_.end(),
+                                       [&search](const nfs::Texture* texture) {
+                                           std::wstring name = Widen(texture->name);
+                                           for (wchar_t& c : name) c = (wchar_t)::towlower(c);
+                                           return name.find(search) == std::wstring::npos;
+                                       }),
+                        textures_.end());
 
     // Most used first: those are the ones that decide how the world looks.
     std::sort(textures_.begin(), textures_.end(),
@@ -224,12 +272,21 @@ void TextureBrowser::Populate() {
     }
     ::SendMessageW(list_, WM_SETREDRAW, TRUE, 0);
 
-    ::SetWindowTextW(dialog_, Format(L"Texture browser - %zu textures",
-                                     textures_.size()).c_str());
+    std::wstring title = Format(filter_.empty() ? L"Texture browser - %zu textures"
+                                                : L"Texture browser - %zu textures of the selection",
+                                textures_.size());
+    if (!search.empty()) title += L" named *" + std::wstring(typed) + L"*";
+    ::SetWindowTextW(dialog_, title.c_str());
 
     if (!textures_.empty()) {
-        ListView_SetItemState(list_, 0, LVIS_SELECTED | LVIS_FOCUSED,
+        int row = 0;
+        for (size_t i = 0; i < textures_.size(); ++i)
+            if (chosen && textures_[i]->hash == chosen) { row = (int)i; break; }
+        ListView_SetItemState(list_, row, LVIS_SELECTED | LVIS_FOCUSED,
                               LVIS_SELECTED | LVIS_FOCUSED);
+        ListView_EnsureVisible(list_, row, FALSE);
+    } else {
+        OnSelectionChanged();   // nothing listed: the last texture's information goes too
     }
 }
 
@@ -245,7 +302,13 @@ void TextureBrowser::OnSelectionChanged() {
     pixels_.clear();
     pixelWidth_ = pixelHeight_ = 0;
 
-    if (texture && !nfs::DecodeTexture(*texture, 0, pixels_, pixelWidth_, pixelHeight_)) {
+    // The largest stored version is what is shown and saved: in NFS World the
+    // pack holds a small copy and the full size is kept apart.
+    shown_ = texture ? *texture : nfs::Texture();
+    if (texture && world_) world_->LargestTexture(texture->hash, shown_);
+    const nfs::Texture* shown = texture ? &shown_ : nullptr;
+
+    if (shown && !nfs::DecodeTexture(*shown, 0, pixels_, pixelWidth_, pixelHeight_)) {
         pixels_.clear();
         pixelWidth_ = pixelHeight_ = 0;
     }
@@ -255,9 +318,9 @@ void TextureBrowser::OnSelectionChanged() {
                           Format(L"%s\n%u x %u   %s   %u mip levels\nhash %08X   "
                                  L"used by %u materials",
                                  Widen(texture->name).c_str(),
-                                 texture->width, texture->height,
+                                 shown->width, shown->height,
                                  Widen(nfs::ToString(texture->format)).c_str(),
-                                 texture->mipCount, texture->hash,
+                                 shown->mipCount, texture->hash,
                                  world_ ? world_->TextureUsage(texture->hash) : 0).c_str());
     } else {
         ::SetDlgItemTextW(dialog_, IDC_TEX_INFO, L"");
@@ -319,27 +382,81 @@ void TextureBrowser::DrawPreview(const DRAWITEMSTRUCT& item) {
                     pixels_.data(), &info, DIB_RGB_COLORS, SRCCOPY);
 }
 
+namespace {
+
+// A PNG of the texture's largest level, alpha included. Written through
+// Windows' own imaging component, which the editor already reads images with,
+// so no compressor has to be brought in for it.
+bool WritePng(const std::wstring& path, const std::vector<u32>& bgra, u32 width, u32 height) {
+    if (!width || !height || bgra.size() < (size_t)width * height) return false;
+
+    IWICImagingFactory* factory = nullptr;
+    if (FAILED(::CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory))))
+        return false;
+
+    IWICStream* stream = nullptr;
+    IWICBitmapEncoder* encoder = nullptr;
+    IWICBitmapFrameEncode* frame = nullptr;
+    WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
+    const bool ok =
+        SUCCEEDED(factory->CreateStream(&stream)) &&
+        SUCCEEDED(stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE)) &&
+        SUCCEEDED(factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder)) &&
+        SUCCEEDED(encoder->Initialize(stream, WICBitmapEncoderNoCache)) &&
+        SUCCEEDED(encoder->CreateNewFrame(&frame, nullptr)) &&
+        SUCCEEDED(frame->Initialize(nullptr)) &&
+        SUCCEEDED(frame->SetSize(width, height)) &&
+        SUCCEEDED(frame->SetPixelFormat(&format)) &&
+        ::IsEqualGUID(format, GUID_WICPixelFormat32bppBGRA) &&
+        SUCCEEDED(frame->WritePixels(height, width * 4, (UINT)((size_t)width * height * 4), (BYTE*)bgra.data())) &&
+        SUCCEEDED(frame->Commit()) &&
+        SUCCEEDED(encoder->Commit());
+
+    if (frame) frame->Release();
+    if (encoder) encoder->Release();
+    if (stream) stream->Release();
+    factory->Release();
+    if (!ok) ::DeleteFileW(path.c_str());
+    return ok;
+}
+
+} // namespace
+
 void TextureBrowser::SaveSelected() {
     const nfs::Texture* texture = Selected();
-    if (!texture || pixels_.empty()) return;
+    if (!texture) return;
 
     wchar_t path[MAX_PATH] = {};
     const std::wstring name = Widen(texture->name);
     ::wcsncpy_s(path, name.c_str(), _TRUNCATE);
-    ::wcsncat_s(path, L".bmp", _TRUNCATE);
+    ::wcsncat_s(path, L".png", _TRUNCATE);
 
     OPENFILENAMEW dialog{};
     dialog.lStructSize = sizeof(dialog);
     dialog.hwndOwner   = dialog_;
-    dialog.lpstrFilter = L"Bitmap\0*.bmp\0";
+    dialog.lpstrFilter = L"PNG image\0*.png\0";
     dialog.lpstrFile   = path;
     dialog.nMaxFile    = MAX_PATH;
-    dialog.lpstrDefExt = L"bmp";
+    dialog.lpstrDefExt = L"png";
     dialog.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
 
-    if (!::GetSaveFileNameW(&dialog)) return;
+    // FRS_TEST_SAVE=<folder> saves there without asking, for scripted checks.
+    wchar_t scripted[MAX_PATH] = {};
+    if (::GetEnvironmentVariableW(L"FRS_TEST_SAVE", scripted, MAX_PATH)) {
+        const std::wstring target = std::wstring(scripted) + L"\\" + name + L".png";
+        ::wcsncpy_s(path, target.c_str(), _TRUNCATE);
+    } else if (!::GetSaveFileNameW(&dialog)) {
+        return;
+    }
 
-    if (!WriteBmp(path, pixels_, pixelWidth_, pixelHeight_))
+    // Alpha that is not opacity -- roads and walls keep gloss there -- makes the
+    // picture look empty in any viewer, though the browser shows it whole. Such
+    // a texture is saved opaque; replacing it keeps the alpha the game has.
+    std::vector<u32> saved = pixels_;
+    if (!nfs::AlphaIsOpacity(*texture))
+        for (u32& pixel : saved) pixel |= 0xFF000000u;
+
+    if (saved.empty() || !WritePng(path, saved, pixelWidth_, pixelHeight_))
         ::MessageBoxW(dialog_, L"Could not write the file.", L"Texture browser",
                       MB_ICONERROR | MB_OK);
 }
@@ -350,24 +467,55 @@ void TextureBrowser::Layout() {
     RECT client{};
     ::GetClientRect(dialog_, &client);
 
-    const int pad      = 8;
-    const int listWidth = 300;
-    const int footer   = 56;
+    // Everything is measured from the dialog's own font and DPI: sizes in
+    // fixed pixels were right at 100% only, and at 150% the three lines of
+    // information ran under the buttons.
+    const auto dpi = [this](int at96) { return ::MulDiv(at96, (int)::GetDpiForWindow(dialog_), 96); };
+    // The height of a line as the information control itself draws it.
+    int line = dpi(16);
+    HWND info = ::GetDlgItem(dialog_, IDC_TEX_INFO);
+    if (HDC dc = ::GetDC(info)) {
+        HFONT font = (HFONT)::SendMessageW(info, WM_GETFONT, 0, 0);
+        HGDIOBJ previous = font ? ::SelectObject(dc, font) : nullptr;
+        RECT three{ 0, 0, 1000, 0 };
+        if (::DrawTextW(dc, L"Ag\nAg\nAg", -1, &three, DT_CALCRECT) && three.bottom > 0)
+            line = (three.bottom + 2) / 3;
+        if (previous) ::SelectObject(dc, previous);
+        ::ReleaseDC(info, dc);
+    }
 
-    ::MoveWindow(list_, pad, pad, listWidth, client.bottom - 2 * pad, TRUE);
+    const int pad       = dpi(8);
+    const int listWidth = std::min(dpi(330), std::max(dpi(180), (int)client.right * 2 / 5));
+    const int button    = line + dpi(10);
+    const int infoH     = line * 3 + dpi(2);
+    // Under the picture: the information, then a row of what changes the
+    // texture, then a row of what looks at it and saves it.
+    const int footer    = dpi(4) + infoH + pad + button + dpi(6) + button;
+
+    const int searchH = line + dpi(6);
+    ::MoveWindow(::GetDlgItem(dialog_, IDC_TEX_SEARCH), pad, pad, listWidth, searchH, TRUE);
+    ::MoveWindow(list_, pad, pad + searchH + dpi(4), listWidth, client.bottom - 2 * pad - searchH - dpi(4), TRUE);
 
     const int previewX = pad * 2 + listWidth;
-    const int previewW = client.right - previewX - pad;
-    const int previewH = client.bottom - footer - 2 * pad;
-    ::MoveWindow(::GetDlgItem(dialog_, IDC_TEX_PREVIEW), previewX, pad,
-                 previewW, previewH, TRUE);
+    const int previewW = std::max(dpi(60), (int)client.right - previewX - pad);
+    const int previewH = std::max(dpi(60), (int)client.bottom - footer - 2 * pad);
+    ::MoveWindow(::GetDlgItem(dialog_, IDC_TEX_PREVIEW), previewX, pad, previewW, previewH, TRUE);
 
-    ::MoveWindow(::GetDlgItem(dialog_, IDC_TEX_INFO), previewX, pad + previewH + 4,
-                 previewW, 36, TRUE);
-    ::MoveWindow(::GetDlgItem(dialog_, IDC_TEX_ZOOM), previewX,
-                 client.bottom - pad - 18, 90, 18, TRUE);
-    ::MoveWindow(::GetDlgItem(dialog_, IDC_TEX_SAVE), client.right - pad - 110,
-                 client.bottom - pad - 20, 110, 20, TRUE);
+    int y = pad + previewH + dpi(4);
+    ::MoveWindow(::GetDlgItem(dialog_, IDC_TEX_INFO), previewX, y, previewW, infoH, TRUE);
+    y += infoH + pad;
 
-    ::InvalidateRect(dialog_, nullptr, TRUE);
+    const int half = (previewW - dpi(6)) / 2;
+    ::MoveWindow(::GetDlgItem(dialog_, IDC_TEX_REPLACE), previewX, y, half, button, TRUE);
+    ::MoveWindow(::GetDlgItem(dialog_, IDC_TEX_RESTORE), previewX + half + dpi(6), y, previewW - half - dpi(6),
+                 button, TRUE);
+    y += button + dpi(6);
+
+    ::MoveWindow(::GetDlgItem(dialog_, IDC_TEX_ZOOM), previewX, y, half, button, TRUE);
+    ::MoveWindow(::GetDlgItem(dialog_, IDC_TEX_SAVE), previewX + half + dpi(6), y, previewW - half - dpi(6),
+                 button, TRUE);
+
+    // The whole dialog, children included: a control that only moved is not
+    // repainted where it was, which left pieces of the old layout on screen.
+    ::RedrawWindow(dialog_, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
 }

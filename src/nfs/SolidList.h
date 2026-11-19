@@ -5,6 +5,7 @@
 #include "nfs/ChunkReader.h"
 
 #include <string>
+#include <array>
 #include <vector>
 
 namespace nfs {
@@ -51,6 +52,12 @@ struct SolidMaterial {
     // (sub_5C58A0): 0x01 WORLDBONE, 0x40 WORLDREFLECT, 0x80 CAR, else WORLD.
     u32  stripFlags   = 0;
     Aabb bounds;             // per-material bounds as stored in the file
+    // NFS World: the five texture slot bytes at +0x28 (indices into textureHashes): 0 diffuse, 1 normal
+    // map, 3 specular map; unused slots repeat the diffuse (rea-sky-road-flares.md item 3).
+    u8   slots[5] = { 0, 0, 0, 0, 0 };
+    // NFS World: the entry's first dword. The game reads bit 17 as "no fog" (cfFogEnable = 1 - bit,
+    // FUN_0063A2E0) and bits 28..31 as the cvTimeOfDayParams0.x selector (table 0xC84BD8).
+    u32  worldFlags = 0;
 };
 
 // One drawable mesh.
@@ -87,6 +94,13 @@ struct SolidObject {
     std::vector<SolidMaterial> materials;
     std::vector<SolidVertex>   vertices;
     std::vector<u16>           indices;
+    // NFS World: the second vertex colour of each vertex (WorldShader / WorldPrelitShader layouts: the
+    // baked night lights, weighted by cvTimeOfDayParams1.y), or empty when no run of the mesh has one.
+    // Same count as `vertices` otherwise; vertices of a run without it hold 0.
+    std::vector<u32>           colors1;
+    // NFS World: the SHORT4 tangent of the 44-byte layouts (normal-map effects), raw, or empty; same count
+    // as `vertices` otherwise (zero for runs without one).
+    std::vector<std::array<i16, 4>> tangents;
 
     u32 TriangleCount() const { return (u32)indices.size() / 3; }
 

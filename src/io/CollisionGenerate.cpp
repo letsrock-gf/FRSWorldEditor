@@ -38,33 +38,6 @@ u8 WallSurfaceFor(const std::string& name) {
     return nfs::kSurfaceSolidWall;
 }
 
-double Cross2(const Vec2& o, const Vec2& a, const Vec2& b) {
-    return (double)(a.x - o.x) * (b.y - o.y) - (double)(a.y - o.y) * (b.x - o.x);
-}
-
-// Andrew's monotone chain; counter-clockwise, no repeat of the first point.
-std::vector<Vec2> ConvexHull(std::vector<Vec2> points) {
-    std::sort(points.begin(), points.end(), [](const Vec2& a, const Vec2& b) {
-        return a.x != b.x ? a.x < b.x : a.y < b.y;
-    });
-    points.erase(std::unique(points.begin(), points.end(), [](const Vec2& a, const Vec2& b) {
-                     return std::fabs(a.x - b.x) < 0.05f && std::fabs(a.y - b.y) < 0.05f;
-                 }), points.end());
-    if (points.size() < 3) return points;
-    std::vector<Vec2> hull(points.size() * 2);
-    size_t k = 0;
-    for (size_t i = 0; i < points.size(); ++i) {
-        while (k >= 2 && Cross2(hull[k - 2], hull[k - 1], points[i]) <= 1e-6) --k;
-        hull[k++] = points[i];
-    }
-    for (size_t i = points.size() - 1, t = k + 1; i-- > 0;) {
-        while (k >= t && Cross2(hull[k - 2], hull[k - 1], points[i]) <= 1e-6) --k;
-        hull[k++] = points[i];
-    }
-    hull.resize(k - 1);
-    return hull;
-}
-
 } // namespace
 
 GenerateResult GenerateObjectCollision(const nfs::SolidObject& model, const Mat4& transform,
@@ -137,73 +110,35 @@ GenerateResult GenerateObjectCollision(const nfs::SolidObject& model, const Mat4
     }
     result.shape = drivable ? GeneratedShape::Drivable : GeneratedShape::Solid;
 
-    // --- ground on the upward faces ---------------------------------------------
-    const auto addGround = [&](float above) {
-        for (const Face& f : faces) {
-            if (f.nz * up <= 0.6f) continue;
-            if ((f.a.z + f.b.z + f.c.z) / 3.0f < foot + above) continue;
-            if (result.ground >= kMaxGround) { result.groundCapped = true; break; }
-            const Vec3 corners[3] = { f.a, f.b, f.c };
+    // --- collision on the mesh's own faces ----------------------------------------
+    // Every face becomes a polygon where it stands, at its own angle: the ones
+    // that look up are ground a car drives on, the rest are sides it hits. No
+    // outline is drawn round the object. Faces that look down (undersides,
+    // ceilings) are left out: stored as ground they would hold a car up from
+    // below.
+    const u8 sideSurface = WallSurfaceFor(model.name);
+    for (const Face& f : faces) {
+        const float nz = f.nz * up;
+        if (nz < -0.3f) continue;
+        if (result.ground + result.walls >= kMaxGround) { result.groundCapped = true; break; }
+        const Vec3 corners[3] = { f.a, f.b, f.c };
+        if (nz > 0.6f) {
             out.push_back(MakeGround(corners, 3, nfs::kSurfaceRoad));
             ++result.ground;
+            continue;
         }
-    };
-
-    if (drivable) {
-        addGround(-1.0f);
-        if (!result.ground) result.note = L"no face of it looks up";
-        return result;
-    }
-
-    // --- walls round the part a car can hit ---------------------------------------
-    const float band = foot + std::min(2.5f, std::max(height, 0.5f));
-    std::vector<Vec2> plan;
-    for (const Vec3& p : points)
-        if (p.z <= band && p.z >= foot - 1.0f) plan.push_back({ p.x, p.y });
-    if (plan.size() < 2)
-        for (const Vec3& p : points) plan.push_back({ p.x, p.y });
-
-    std::vector<Vec2> hull = ConvexHull(plan);
-    double area = 0.0;
-    for (size_t i = 0; i < hull.size(); ++i) {
-        const Vec2& a = hull[i];
-        const Vec2& b = hull[(i + 1) % hull.size()];
-        area += (double)a.x * b.y - (double)b.x * a.y;
-    }
-    area = std::fabs(area) * 0.5;
-
-    WallOptions options;
-    options.kind = WallKind::Vertical;
-    options.surface = WallSurfaceFor(model.name);
-    options.height = std::clamp(maxZ - foot, 0.5f, 100.0f);
-    options.sink = 0.5f;
-
-    std::vector<Vec3> outline;
-    if (hull.size() >= 3 && area > 0.02) {
-        for (const Vec2& p : hull) outline.push_back({ p.x, p.y, foot });
-        outline.push_back(outline.front());
-    } else {
-        // A thin thing -- a fence panel, a sign: one wall along its length.
-        Vec2 lo = plan.front(), hi = plan.front();
-        float best = -1.0f;
-        for (const Vec2& a : hull)
-            for (const Vec2& b : hull) {
-                const float d = (a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y);
-                if (d > best) { best = d; lo = a; hi = b; }
-            }
-        if (best < 0.04f) {
-            result.note = L"it is too small to stop a car";
-            return result;
+        nfs::CollisionPolygon side = MakeGround(corners, 3, sideSurface);
+        out.push_back(side);
+        ++result.walls;
+        // An upright face has no up side to be stored by, so it is stored
+        // both ways round and stops a car from either.
+        if (side.Vertical()) {
+            nfs::CollisionPolygon twin = side;
+            twin.corners[1] = side.corners[2];
+            twin.corners[2] = twin.corners[3] = side.corners[1];
+            out.push_back(twin);
         }
-        outline = { { lo.x, lo.y, foot }, { hi.x, hi.y, foot } };
-    }
-    const size_t before = out.size();
-    AppendWall(outline, options, out);
-    result.walls = out.size() - before;
-
-    // Roofs and tops a car may land on.
-    addGround(0.75f);
+    }    if (!result.ground && !result.walls) result.note = L"no face of it can be hit or driven on";
     return result;
 }
-
 } // namespace collision

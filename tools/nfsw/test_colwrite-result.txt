@@ -1,0 +1,103 @@
+﻿spec: 100:0,3,23,98,607,608,609,610,611;3061:0,2,4;18:0,1,2
+=== a) delete and save
+[info ] world collision self-test: 747 packs, 853 rewrites read back right (170505 polygons removed), 641 refused for lack of room, 0 WRONG
+[info ] collision: deleted 15 polygons (15 picked)
+[info ] collision test: 15 polygons asked for, 15 deleted with their copies
+[info ] NFS World save: 1 sections written, 0 removed, 0 moved, 0 added, 0 meshes, 15 collision polygons deleted, 0 restored
+  18162944 a\STREAML5RA_25000.BUN
+        60 a\frs-original\L5RA-edits.txt
+  18162944 a\frs-original\STREAML5RA_25000.BUN
+C 100 0 3 23 98 607 608 609 610 611
+C 18 0 1 2
+C 3061 0 2 4
+edit list: 3 packs, 15 polygons
+ok    the edit list names deleted collision polygons
+ok    file size unchanged (18162944)
+ok    kept copy is the shipped file
+ok    L5RA.BUN (section table) not written
+ok    chunk chain identical (798 chunks)
+ok    pack 100: header and group rows unchanged
+ok    pack 100: same rows (tags, kinds, counts)
+ok    pack 100: instances byte-identical
+ok    pack 100: 0xAA after the last body
+ok    pack 100: listed indices exist (3361 polygons shipped)
+ok    pack 100: polygons = shipped less the 9 listed (3352 left)
+ok    pack 100: only the 2 articles that lost polygons changed
+ok    pack 100 article 0: header tail kept, sizes consistent (10 strips, 0 barriers, 1600 bytes)
+ok    pack 100 article 6: header tail kept, sizes consistent (15 strips, 0 barriers, 1856 bytes)
+ok    pack 18: header and group rows unchanged
+ok    pack 18: same rows (tags, kinds, counts)
+ok    pack 18: instances byte-identical
+ok    pack 18: 0xAA after the last body
+ok    pack 18: listed indices exist (7 polygons shipped)
+ok    pack 18: polygons = shipped less the 3 listed (4 left)
+ok    pack 18: only the 1 articles that lost polygons changed
+ok    pack 18 article 0: header tail kept, sizes consistent (0 strips, 0 barriers, 64 bytes)
+ok    pack 3061: header and group rows unchanged
+ok    pack 3061: same rows (tags, kinds, counts)
+ok    pack 3061: instances byte-identical
+ok    pack 3061: 0xAA after the last body
+ok    pack 3061: listed indices exist (6 polygons shipped)
+ok    pack 3061: polygons = shipped less the 3 listed (3 left)
+ok    pack 3061: only the 1 articles that lost polygons changed
+ok    pack 3061 article 0: header tail kept, sizes consistent (0 strips, 3 barriers, 128 bytes)
+ok    every byte outside the 3 named packs is the shipped byte
+      articles left empty: 1
+      articles rewritten: 4
+      bytes +0: 1
+      bytes -128: 2
+      bytes -64: 1
+      winding unknown (2) among kept: 0
+PASSED
+=== b) open again on the saved copy
+[info ] NFS World edits: 3 applied from the list, 15 collision polygons deleted by it
+[info ] collision: 1 sections, 663742 polygons of which 101261 barriers
+[info ] NFS World save: 0 sections written, 0 removed, 0 moved, 0 added, 0 meshes, 0 collision polygons deleted, 0 restored
+edit list: 3 packs, 15 polygons
+ok    the edit list names deleted collision polygons
+ok    file size unchanged (18162944)
+ok    kept copy is the shipped file
+ok    L5RA.BUN (section table) not written
+ok    chunk chain identical (798 chunks)
+ok    pack 100: header and group rows unchanged
+ok    pack 100: same rows (tags, kinds, counts)
+ok    pack 100: instances byte-identical
+ok    pack 100: 0xAA after the last body
+ok    pack 100: listed indices exist (3361 polygons shipped)
+ok    pack 100: polygons = shipped less the 9 listed (3352 left)
+ok    pack 100: only the 2 articles that lost polygons changed
+ok    pack 100 article 0: header tail kept, sizes consistent (10 strips, 0 barriers, 1600 bytes)
+ok    pack 100 article 6: header tail kept, sizes consistent (15 strips, 0 barriers, 1856 bytes)
+ok    pack 18: header and group rows unchanged
+ok    pack 18: same rows (tags, kinds, counts)
+ok    pack 18: instances byte-identical
+ok    pack 18: 0xAA after the last body
+ok    pack 18: listed indices exist (7 polygons shipped)
+ok    pack 18: polygons = shipped less the 3 listed (4 left)
+ok    pack 18: only the 1 articles that lost polygons changed
+ok    pack 18 article 0: header tail kept, sizes consistent (0 strips, 0 barriers, 64 bytes)
+ok    pack 3061: header and group rows unchanged
+ok    pack 3061: same rows (tags, kinds, counts)
+ok    pack 3061: instances byte-identical
+ok    pack 3061: 0xAA after the last body
+ok    pack 3061: listed indices exist (6 polygons shipped)
+ok    pack 3061: polygons = shipped less the 3 listed (3 left)
+ok    pack 3061: only the 1 articles that lost polygons changed
+ok    pack 3061 article 0: header tail kept, sizes consistent (0 strips, 3 barriers, 128 bytes)
+ok    every byte outside the 3 named packs is the shipped byte
+      articles left empty: 1
+      articles rewritten: 4
+      bytes +0: 1
+      bytes -128: 2
+      bytes -64: 1
+      winding unknown (2) among kept: 0
+PASSED
+=== c) take the saved deletions back and save
+[info ] NFS World edits: 3 applied from the list, 15 collision polygons deleted by it
+[info ] collision: 3 log entries reverted, 3 packs rebuilt
+[info ] collision test: 3 of 3 saved deletions taken back
+[info ] NFS World save: 0 sections written, 0 removed, 0 moved, 0 added, 0 meshes, 0 collision polygons deleted, 1 restored
+ok    no kept copy left
+ok    no edit list left
+ok    the section file is the shipped one again
+PASSED

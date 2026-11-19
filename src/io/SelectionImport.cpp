@@ -1545,3 +1545,13 @@ bool ApplyImport(const ImportPlan& plan, const std::wstring& gameFolder,
              summary.objectsWritten, summary.modelsFolder.c_str(), summary.verticesWritten);
     return summary.objectsWritten > 0;
 }
+
+bool ReadExportManifest(const std::wstring& objPath, std::unordered_map<std::string, ManifestObject>& objects,
+                        Vec3& origin) {
+    std::vector<ObjObject> shapes;
+    std::unordered_map<std::string, ManifestEntry> entries;
+    std::wstring used;
+    if (!ReadObj(objPath, shapes) || !FindManifest(objPath, shapes, entries, origin, used)) return false;
+    for (const auto& [name, entry] : entries) objects[name] = { entry.hash, entry.transform };
+    return true;
+}

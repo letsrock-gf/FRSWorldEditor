@@ -2,6 +2,7 @@
 
 #include "core/Log.h"
 #include "nfs/EaCompress.h"
+#include "nfs/GameFormat.h"
 
 #include <algorithm>
 #include <cstring>
@@ -38,11 +39,30 @@ constexpr size_t kTexAlphaBlend    = 0x56;
 constexpr size_t kFormatEntrySize = 32;
 constexpr size_t kFormatFourCc    = 0x14;
 
+// --- NFS World texture header ------------------------------------------------
+// Measured on the STREAML5RA_0x*.BUN packs: the fixed part is 0x90 bytes and
+// the name follows it as a length byte and that many characters, so the
+// entries are not all one size. The format table keeps its 32 bytes, with the
+// FourCC at +0x0C.
+constexpr size_t kWorldTexHash          = 0x0C;
+constexpr size_t kWorldTexBaseLevelSize = 0x1C;
+constexpr size_t kWorldTexWidth         = 0x20;   // u32
+constexpr size_t kWorldTexHeight        = 0x24;   // u32
+constexpr size_t kWorldTexMipCount      = 0x31;
+constexpr size_t kWorldTexAlphaUsage    = 0x38;   // 0 none, 1 cut-out (fences, leaves), 2 opacity
+constexpr size_t kWorldTexAlphaBlend    = 0x39;   // 0 copy, 1 blend (glass), 2 additive (lit windows, neon)
+constexpr size_t kWorldTexDataSize      = 0x4C;
+constexpr size_t kWorldTexDataOffset    = 0x50;
+constexpr size_t kWorldTexNameLength    = 0x90;
+constexpr size_t kWorldFormatFourCc     = 0x0C;
+
 TextureFormat FormatFromFourCc(u32 fourCc) {
     switch (fourCc) {
         case 0x31545844: return TextureFormat::Dxt1;  // "DXT1"
         case 0x33545844: return TextureFormat::Dxt3;  // "DXT3"
         case 0x35545844: return TextureFormat::Dxt5;  // "DXT5"
+        case 0x31495441: return TextureFormat::Ati1;  // "ATI1"
+        case 0x32495441: return TextureFormat::Ati2;  // "ATI2"
         case 41:         return TextureFormat::Palettised8;  // D3DFMT_P8
         case 21:         return TextureFormat::Argb8888;     // D3DFMT_A8R8G8B8
         default:         return TextureFormat::Unknown;
@@ -94,6 +114,43 @@ bool TexturePack::ParseCompressed(const Chunk& packChunk, ByteSpan index) {
     // Index entries: hash, absolute file offset, compressed size, size, flags, 0.
     const u8* file = packChunk.data.data - packChunk.dataOffset;
     const u64 fileEnd = packChunk.dataOffset + packChunk.data.size;
+    if (IsWorld()) {
+        // NFS World (GLOBAL\SkyDomeTextures.bin, "NFS-TexEd" packs): 36-byte entries {hash, absolute offset,
+        // block size, payload size, tail size, ...}. Each block is stored, not compressed: magic 0x55441122,
+        // a header of (block size - payload size) bytes, the payload. The payload ends with `tail` bytes:
+        // the NFS World texture header (fixed 0x90 bytes, name length, name) and its 32-byte format entry.
+        constexpr size_t kWorldEntry = 36;
+        size_t failed = 0;
+        for (size_t i = 0; i + kWorldEntry <= index.size; i += kWorldEntry) {
+            const u32 offset = index.read<u32>(i + 4), blockSize = index.read<u32>(i + 8);
+            const u32 payloadSize = index.read<u32>(i + 12), tail = index.read<u32>(i + 16);
+            if (offset < packChunk.dataOffset || (u64)offset + blockSize > fileEnd || payloadSize > blockSize ||
+                tail < kWorldTexNameLength + 1 + kFormatEntrySize || tail > payloadSize) { ++failed; continue; }
+            const ByteSpan block{ file + offset, blockSize };
+            if (block.read<u32>(0) != 0x55441122u) { ++failed; continue; }   // compressed: not met in the packs read
+            const ByteSpan payload = block.sub(blockSize - payloadSize, payloadSize);
+            const ByteSpan entry = payload.sub(payloadSize - tail, tail);
+            const u8 nameLength = entry.read<u8>(kWorldTexNameLength);
+            Texture texture;
+            texture.name          = ReadFixedName(entry, kWorldTexNameLength + 1, nameLength);
+            texture.hash          = entry.read<u32>(kWorldTexHash);
+            texture.width         = (u16)entry.read<u32>(kWorldTexWidth);
+            texture.height        = (u16)entry.read<u32>(kWorldTexHeight);
+            texture.mipCount      = std::max<u8>(entry.read<u8>(kWorldTexMipCount), 1);
+            texture.baseLevelSize = entry.read<u32>(kWorldTexBaseLevelSize);
+            texture.alphaUsage    = (AlphaUsage)std::min<u8>(entry.read<u8>(kWorldTexAlphaUsage), 2);
+            texture.alphaBlend    = (AlphaBlend)std::min<u8>(entry.read<u8>(kWorldTexAlphaBlend), 2);
+            texture.fourCc        = entry.sub(tail - kFormatEntrySize, kFormatEntrySize).read<u32>(kWorldFormatFourCc);
+            texture.format        = FormatFromFourCc(texture.fourCc);
+            const u32 dataSize    = entry.read<u32>(kWorldTexDataSize);
+            if (dataSize > payloadSize - tail || texture.format == TextureFormat::Unknown) { ++failed; continue; }
+            texture.pixels = payload.sub(0, dataSize);
+            byHash_.emplace(texture.hash, textures_.size());
+            textures_.push_back(std::move(texture));
+        }
+        LOG_INFO("stored texture pack '%s': %zu textures, %zu unreadable", name_.c_str(), textures_.size(), failed);
+        return !textures_.empty();
+    }
     constexpr size_t kEntry = 24;
     constexpr size_t kTail = kTextureEntrySize + kFormatEntrySize;
     size_t failed = 0;
@@ -131,7 +188,7 @@ bool TexturePack::Parse(const Chunk& packChunk) {
             while (info.Next(part)) {
                 switch (part.id) {
                     case kChunkTpkHeader:
-                        name_ = ReadFixedName(part.data, 0x0C, 28);
+                        name_ = ReadFixedName(part.data, IsWorld() ? 0x04 : 0x0C, 28);
                         break;
                     case kChunkTpkTextureHeaders: headers = part.data; break;
                     case kChunkTpkFormatTable:    formats = part.data; break;
@@ -154,6 +211,40 @@ bool TexturePack::Parse(const Chunk& packChunk) {
         return false;
     }
 
+    if (IsWorld()) {
+        // ATI1 and ATI2 are the specular and normal maps (the game look samples them).
+        size_t at = 0;
+        for (size_t i = 0; at + kWorldTexNameLength + 1 <= headers.size; ++i) {
+            const ByteSpan entry = headers.sub(at, headers.size - at);
+            const u8 nameLength = entry.read<u8>(kWorldTexNameLength);
+
+            Texture texture;
+            texture.name          = ReadFixedName(entry, kWorldTexNameLength + 1, nameLength);
+            texture.hash          = entry.read<u32>(kWorldTexHash);
+            texture.width         = (u16)entry.read<u32>(kWorldTexWidth);
+            texture.height        = (u16)entry.read<u32>(kWorldTexHeight);
+            texture.mipCount      = entry.read<u8>(kWorldTexMipCount);
+            texture.baseLevelSize = entry.read<u32>(kWorldTexBaseLevelSize);
+            texture.alphaUsage    = (AlphaUsage)std::min<u8>(entry.read<u8>(kWorldTexAlphaUsage), 2);
+            texture.alphaBlend    = (AlphaBlend)std::min<u8>(entry.read<u8>(kWorldTexAlphaBlend), 2);
+
+            if ((i + 1) * kFormatEntrySize <= formats.size) {
+                texture.fourCc = formats.sub(i * kFormatEntrySize, kFormatEntrySize).read<u32>(kWorldFormatFourCc);
+                texture.format = FormatFromFourCc(texture.fourCc);
+            }
+
+            texture.pixels = pixels.sub(entry.read<u32>(kWorldTexDataOffset),
+                                        entry.read<u32>(kWorldTexDataSize));
+            if (texture.mipCount == 0) texture.mipCount = 1;
+
+            byHash_.emplace(texture.hash, textures_.size());
+            textures_.push_back(std::move(texture));
+
+            at += kWorldTexNameLength + 1 + nameLength;
+        }
+        return !textures_.empty();
+    }
+
     const size_t count = headers.size / kTextureEntrySize;
     textures_.reserve(count);
 
@@ -164,6 +255,7 @@ bool TexturePack::Parse(const Chunk& packChunk) {
         const ByteSpan format = (i + 1) * kFormatEntrySize <= formats.size
                                     ? formats.sub(i * kFormatEntrySize, kFormatEntrySize) : ByteSpan{};
         Texture texture = ReadHeader(entry, format);
+        if (!format.empty()) texture.fourCc = format.read<u32>(kFormatFourCc);
 
         const u32 dataOffset = entry.read<u32>(kTexDataOffset);
         const u32 dataSize   = entry.read<u32>(kTexDataSize);

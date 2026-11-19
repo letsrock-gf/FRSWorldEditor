@@ -283,6 +283,15 @@ bool DriveMode::Start() {
         Status(L"Fast test: open a region first.");
         return false;
     }
+    // NFS World: the physics port reads NFSU2's SPEED2.EXE, which a World folder has not. The fast test is
+    // the game itself: Launch Game saves, puts the car at the camera and editor-fast-test.asi skips the
+    // title and driver select.
+    const std::wstring folder = host_.gameFolder ? host_.gameFolder() : std::wstring();
+    if (!folder.empty() && ::GetFileAttributesW((folder + L"\\nfsw.exe").c_str()) != INVALID_FILE_ATTRIBUTES) {
+        ::PostMessageW(host_.window, WM_COMMAND, IDC_LAUNCH_GAME, 0);
+        if (host_.menuChecks) host_.menuChecks();
+        return true;
+    }
     std::wstring error;
     if (!EnsureGame(error)) {
         Status(L"Fast test: " + error);

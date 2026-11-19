@@ -42,6 +42,23 @@ struct NewTexture {
     bool            fromTga = false;
 };
 
+// Encodes an image for a texture slot that already exists: resampled to the
+// slot's size, in its format ('DXT1', 'DXT3' or 'DXT5'), with exactly its mip
+// levels, largest first. What replacing a texture in place needs: the bytes
+// have to fit where the old ones were. `alphaFrom`, when given, is width x
+// height pixels (or alphaWidth x alphaHeight, brought to that size) whose
+// alpha is kept in place of the image's: for a texture
+// whose alpha is not opacity, which is saved without it.
+bool EncodeForSlot(const std::wstring& path, u32 width, u32 height, u32 fourcc, u32 mipCount,
+                   std::vector<u8>& out, std::wstring& error, const std::vector<u32>* alphaFrom = nullptr,
+                   u32 alphaWidth = 0, u32 alphaHeight = 0);
+
+// Whether an image the editor can read has any pixel that is not opaque.
+bool ImageHasAlpha(const std::wstring& path);
+
+// The size of an image file the editor can read.
+bool ImageSize(const std::wstring& path, u32& width, u32& height);
+
 // The hash the game looks a texture up by.
 u32 TextureNameHash(const std::string& name);
 

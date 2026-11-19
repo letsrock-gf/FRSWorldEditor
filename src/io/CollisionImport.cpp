@@ -6,6 +6,7 @@
 #include "io/SectionEdits.h"
 #include "io/SectionSplice.h"
 #include "nfs/Collision.h"
+#include "nfs/GameFormat.h"
 #include "nfs/World.h"
 
 #include <windows.h>
@@ -446,6 +447,13 @@ bool PlanCollisionImport(const nfs::World& world, const std::wstring& objPath,
                          const std::wstring& modelsFolder, CollisionImportPlan& plan,
                          const std::map<std::string, nfs::CollisionPack>* bases) {
     std::wostringstream report;
+
+    // The encoder below writes Underground 2 packs. NFS World collision
+    // (0x3B801) is read only until its index chunk 0x3B802 is understood.
+    if (nfs::IsWorld()) {
+        plan.report = L"NFS World collision can be viewed and exported, not written back yet.\n\n";
+        return false;
+    }
 
     std::vector<ObjCollisionObject> objects;
     if (!ReadCollisionObj(objPath, objects)) {

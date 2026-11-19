@@ -418,6 +418,69 @@ void WorldAnimations::Parse(ByteSpan layout) {
              placements_.size(), decoded, failed);
 }
 
+// NFS World, read from nfsw.exe (REA; static addresses): loader 0x750B80 for
+// 0x37220 / 0x37240, tree setup 0x7503B0, per-frame update 0x74FCE0, clock
+// 0x74F520. A payload starts at (chunk + 0x17) & ~15 -- the 0x11 filler the
+// chunk reader drops plus any short of that. Measured on all files with
+// tools/nfsw/anim_stats.py: 110 headers, 400 trees of one entity each, 53
+// with frames, frame counts all equal to the 0x37240 size / 64.
+//   0x37220  u32, u32, u32 section number (25002 = the shared library, which
+//            the game keeps apart and draws nothing of), u32 tree count
+//   0x37260  u32 entity count; then each entity's 0x37250, followed by its
+//            0x37240 when it has frames; 0x37270 ends the tree
+//   0x37250  116 bytes: float4x4 @0 at rest; u8 parent @0x44 (0xFF none);
+//            u8 rate @0x45, fps = 15 * ((b & 15) / 15 + max(b >> 4, 1));
+//            u8 flags @0x46 (2: spin taken from the library entity whose
+//            hash @0x40 equals our @0x48 or @0x4C); model hashes @0x48 and
+//            @0x4C (the first non-zero is drawn); u32 frames @0x64; u32 @0x68
+//            bit 30 = back and forth
+//   0x37240  frames float4x4 each, absolute.
+// Not read: the spins (i16 @0x5C/@0x5E/@0x60, speed @0x6C, applied by
+// 0x74EF90 / 0x74F160); those parts are shown at rest.
+void WorldAnimations::AddWorldSection(const std::vector<Chunk>& chunks, int section) {
+    const auto body = [](const Chunk& chunk) {
+        const u64 start = (chunk.headerOffset + 0x17) & ~(u64)15;
+        const u64 skip = start - (chunk.headerOffset + 8);
+        return skip <= chunk.raw.size ? chunk.raw.sub((size_t)skip, chunk.raw.size - (size_t)skip) : ByteSpan{};
+    };
+    std::vector<WorldAnimationTree> trees;
+    WorldAnimationTree* tree = nullptr;
+    for (const Chunk& chunk : chunks) {
+        const ByteSpan data = body(chunk);
+        if (chunk.id == 0x37220u) {
+            if (data.size >= 16 && data.read<u32>(8) == 25002u) return;   // the library
+        } else if (chunk.id == 0x37260u) {
+            trees.emplace_back();
+            tree = &trees.back();
+        } else if (chunk.id == 0x37250u && tree && data.size >= 0x74) {
+            WorldAnimationPart part;
+            part.rest = ReadMatrix(data, 0);
+            part.name = data.read<u32>(0x40);
+            const u8 parent = data.read<u8>(0x44);
+            part.parent = parent != 0xFF && parent < tree->parts.size() ? (int)parent : -1;
+            const u8 rate = data.read<u8>(0x45);
+            part.fps = 15.0f * ((float)(rate & 15) / 15.0f + (float)std::max(rate >> 4, 1));
+            part.model = data.read<u32>(0x48) ? data.read<u32>(0x48) : data.read<u32>(0x4C);
+            part.pingPong = (data.read<u32>(0x68) & 0x40000000u) != 0;
+            tree->parts.push_back(std::move(part));
+        } else if (chunk.id == 0x37240u && tree && !tree->parts.empty()) {
+            WorldAnimationPart& part = tree->parts.back();
+            for (size_t at = 0; at + 64 <= data.size; at += 64) part.baked.push_back(ReadMatrix(data, at));
+        }
+    }
+    for (WorldAnimationTree& t : trees) {
+        if (t.parts.empty()) continue;
+        WorldAnimationPlacement placement;
+        placement.tree = trees_.size();
+        placement.section = section;
+        placement.matrix = Mat4::Identity();
+        placement.key = t.parts.front().name;
+        t.hash = t.parts.front().name;
+        trees_.push_back(std::move(t));
+        placements_.insert(placements_.begin() + (std::ptrdiff_t)shipped_++, placement);
+    }
+}
+
 void WorldAnimations::SetExtraPlacements(std::vector<WorldAnimationPlacement> extra) {
     placements_.resize(shipped_);
     for (WorldAnimationPlacement& placement : extra)
@@ -438,6 +501,19 @@ void WorldAnimations::Pose(const WorldAnimationPlacement& placement, double seco
     for (size_t i = 0; i < tree.parts.size(); ++i) {
         const WorldAnimationPart& part = tree.parts[i];
         Mat4 local = part.rest;
+        if (!part.baked.empty()) {
+            const long long n = (long long)part.baked.size();
+            long long k = std::llround(seconds * placement.speed * part.fps);
+            if (k < 0) k = -k;
+            if (part.pingPong && n > 1) {
+                k %= 2 * (n - 1);
+                if (k >= n) k = 2 * (n - 1) - k;
+            } else {
+                k %= n;
+            }
+            out[i] = part.baked[(size_t)k];
+            continue;
+        }
         if (part.frames > 0) {
             const double frame = std::min(t * part.fps, (double)(part.frames - 1));
             const int a = (int)frame;

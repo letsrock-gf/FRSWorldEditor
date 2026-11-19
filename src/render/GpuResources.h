@@ -32,6 +32,13 @@ struct GpuDraw {
     u32 minVertex      = 0;
     u32 vertexCount    = 0;
     u32 textureHash    = 0;
+    // NFS World: the material's effect id (+0x08: 0 World, 1 WorldZBias, 2 WorldNormalMap, 3 WorldRoad,
+    // 4 WorldPrelit, 5 WorldZBiasPrelit, 6 WorldBone, 7 WorldFE, 8/9 Car, A/B glass, C Tree, D UCAP, E sky,
+    // F water; nfsw.exe table 0xC84B5C) and its normal / specular maps (texture slots 1 and 3).
+    u8  effectId       = 0;
+    u32 normalHash     = 0;
+    u32 specularHash   = 0;
+    u32 materialFlags  = 0;   // SolidMaterial::worldFlags
 };
 
 // One solid object inside a section's shared buffers.
@@ -52,6 +59,10 @@ struct GpuObject {
     u8                   backdropKind = 0;
     u32                  baseVertex = 0;
     std::vector<GpuDraw> draws;
+    // NFS World: the section's second-colour stream (u32 per vertex, same order as the vertex buffer),
+    // set when this object's mesh has one (SolidObject::colors1); the game look binds it as COLOR1.
+    IDirect3DVertexBuffer9* colour1 = nullptr;
+    IDirect3DVertexBuffer9* tangent = nullptr;   // SHORT4N per vertex (SolidObject::tangents)
 };
 
 // The geometry of one streaming section, merged into a single vertex and index
@@ -76,6 +87,8 @@ public:
 private:
     IDirect3DVertexBuffer9* vertexBuffer_ = nullptr;
     IDirect3DIndexBuffer9*  indexBuffer_  = nullptr;
+    IDirect3DVertexBuffer9* colour1Buffer_ = nullptr;   // see GpuObject::colour1
+    IDirect3DVertexBuffer9* tangentBuffer_ = nullptr;   // see GpuObject::tangent
     std::vector<GpuObject>  objects_;
     Aabb                    bounds_;
     u32                     vertexCount_   = 0;

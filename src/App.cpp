@@ -1,4 +1,5 @@
 #include "core/Log.h"
+#include "ui/DarkTheme.h"
 #include "ui/MainWindow.h"
 #include "ui/SetupWizard.h"
 
@@ -34,6 +35,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCommand) {
     ::SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
+    // Before any window exists: every one made after this comes up dark.
+    dark::Init();
+
     // Started by the setup again, as administrator, only to copy the plugins.
     int installResult = 0;
     if (RunInstallCommand(installResult)) {
@@ -57,6 +61,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCommand) {
         if (::PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
             if (message.message == WM_QUIT) break;
 
+
+            // Blender's way: the wheel zooms the view the cursor is over,
+            // without a click to give it the focus first.
+            if (message.message == WM_MOUSEWHEEL) {
+                POINT cursor{ (short)LOWORD(message.lParam), (short)HIWORD(message.lParam) };
+                RECT view{};
+                ::GetWindowRect(window.ViewportHandle(), &view);
+                if (::PtInRect(&view, cursor)) message.hwnd = window.ViewportHandle();
+            }
 
             HWND browser = window.TextureDialog();
             if (browser && ::IsDialogMessageW(browser, &message)) continue;

@@ -238,6 +238,7 @@ bool ReadObjMeshes(const std::wstring& path, std::vector<ObjMesh>& out,
     current.name = "object";
     std::string currentMaterial;
     std::unordered_map<Corner, u16, CornerHash> seen;
+    size_t objectFirstPosition = 0;
 
     const auto finishGroup = [&]() {
         if (current.groups.empty()) return;
@@ -296,6 +297,7 @@ bool ReadObjMeshes(const std::wstring& path, std::vector<ObjMesh>& out,
             if (keyword == "o" || current.name.empty()) {
                 finishObject();
                 current.name = name;
+                objectFirstPosition = positions.size();
             }
 
         } else if (keyword == "usemtl") {
@@ -305,8 +307,8 @@ bool ReadObjMeshes(const std::wstring& path, std::vector<ObjMesh>& out,
             // the hash of that matches nothing in the pack.
             std::string material;
             std::getline(stream, material);
-            const size_t begin = material.find_first_not_of(" 	");
-            const size_t end   = material.find_last_not_of(" 	");
+            const size_t begin = material.find_first_not_of(" \t\r");
+            const size_t end   = material.find_last_not_of(" \t\r");
             material = begin == std::string::npos ? std::string()
                                                   : material.substr(begin, end - begin + 1);
 
@@ -346,6 +348,8 @@ bool ReadObjMeshes(const std::wstring& path, std::vector<ObjMesh>& out,
 
                 const u16 index = (u16)current.positions.size();
                 current.positions.push_back(positions[(size_t)p]);
+                current.sourcePositions.push_back((u32)((size_t)p >= objectFirstPosition ? (size_t)p - objectFirstPosition
+                                                                                        : (size_t)p));
                 current.colors.push_back((size_t)p < colors.size() ? colors[(size_t)p]
                                                                    : 0xFFFFFFFFu);
                 current.uvs.push_back(t >= 0 && (size_t)t < uvs.size() ? uvs[(size_t)t]

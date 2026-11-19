@@ -14,6 +14,7 @@ namespace io { class WorldFile; }
 #include "ui/OverlayBrowser.h"
 #include "ui/PropertiesPanel.h"
 #include "ui/TextureBrowser.h"
+#include "ui/UndoRegistry.h"
 #include "ui/Viewport.h"
 
 #include <windows.h>
@@ -26,7 +27,7 @@ namespace io { class WorldFile; }
 
 // The editor frame: menu, region picker, section list, viewport and status bar,
 // all built from native Windows controls.
-class MainWindow {
+class MainWindow : public UndoParticipant {
 public:
     bool Create(HINSTANCE instance, int showCommand);
     void Destroy();
@@ -39,6 +40,7 @@ public:
 
     // The modeless texture browser, for the same reason.
     HWND TextureDialog() const { return textures_.Handle(); }
+    HWND ViewportHandle() const { return viewport_.Handle(); }
 
     // Advances the viewport. Called from the idle part of the message loop.
     void Tick(float deltaSeconds);
@@ -94,6 +96,7 @@ private:
     bool CanSwitchWorld();              // a game folder, and the game not running
     void ShowAbout();
     void SetGameFolder(const std::wstring& folder);
+    std::wstring startFolder_;   // the stored game folder, until the window is up and it is opened
     // By value, not by reference: the first thing it does is close the region,
     // and callers naturally pass the name out of the world it is about to
     // destroy.
@@ -118,6 +121,18 @@ private:
     // The edits in force in the region, to revert one by one.
     void ShowRegionEditList();
     void RevertTickedEdits();
+    // NFS World: what Save writes into the game's files, as rows of the Edits
+    // tab. The comparison with the shipped files finds nothing there -- the
+    // editor reads the kept shipped copies -- so these come from the edits
+    // themselves. One entry per row, made again each time the rows are.
+    struct WorldEditRow {
+        enum Kind { Removed, Moved, Placed, Texture, Model } kind;
+        size_t section;     // index into World::Loaded(), for the first three
+        u32 a, b;           // scenery number and record; a placement's index; a hash
+    };
+    std::vector<WorldEditRow> worldEditRows_;
+    void WorldEditRows(std::vector<EditsPanel::ExtraRow>& rows);
+    void RevertWorldEditRows(const std::vector<size_t>& indices);
     // Fills the properties panel from the selection, and takes its edits back.
     void UpdateProperties();
     void ApplyPropertyFields(bool rehome);
@@ -179,7 +194,8 @@ private:
     // Starts the game over the viewport, the car on the ground under the
     // camera; while it runs, the button switches between the game and the map.
     void LaunchGame();
-    void WriteLaunchPose();
+    void LaunchWorldGame();
+    bool WriteLaunchPose(const std::wstring& path);
     void UpdateGameView();         // keeps the game over the viewport, notices it quit
     void RestoreFastBoot(bool onlyWhenRead = false);
 
@@ -205,6 +221,44 @@ private:
     // Ticks off objects made in the editor and takes them out of the region.
     void DeleteMyObjects();
     void CloseRegion();
+
+    // --- undo ----------------------------------------------------------------
+    // What the editor has placed and removed, section by section. A snapshot
+    // is taken whenever that changes and no drag is under way, so every way of
+    // editing -- gizmo, G and R, the properties panel, paste, delete -- is one
+    // step without each having to say so.
+    struct EditSnapshot {
+        struct Part {
+            size_t loaded = 0;
+            std::vector<nfs::LoadedSection::UserPlacement> placements;
+            std::vector<std::pair<u32, u32>> removedNatives;
+            std::vector<nfs::LoadedSection::MovedNative> movedNatives;
+            std::vector<u32> importedModels;
+            bool changed = false;
+        };
+        std::vector<Part> parts;
+        u64 hash = 0;
+    };
+    EditSnapshot TakeEditSnapshot() const;
+    void ApplyEditSnapshot(const EditSnapshot& snapshot);
+    void TrackEdits();
+    void Undo();
+    void Redo();
+    // The editor's parts share one Ctrl+Z (ui/UndoRegistry.h); these are the
+    // objects' part of it: placements, and the map's own objects removed or moved.
+    u64  LatestUndoStamp() const override;
+    bool UndoLatest() override;
+    std::vector<u64> undoStamps_;      // one per step in undo_, from undo::NextStamp()
+    std::vector<EditSnapshot> undo_, redo_;
+    EditSnapshot current_;
+    bool haveCurrent_ = false;
+
+    // View > Clip Start/End and Detail, kept in the registry.
+    // Texture browser > Replace with image / Restore original (NFS World).
+    void ReplaceTexture(u32 hash, bool restore, const std::wstring& image = std::wstring());
+
+    void EditClip();
+    void ApplyViewSettings(const float values[5], bool store);
 
     void LoadAllSections();
     void PopulateSectionTree();

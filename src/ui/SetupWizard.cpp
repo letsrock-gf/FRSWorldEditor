@@ -209,6 +209,11 @@ void GrantUsersModify(const std::wstring& path, bool folder) {
 }
 
 InstallStatus Install(const SetupChoices& choices, std::wstring& report) {
+    if (IsWorldFolder(choices.folder)) {
+        report = L"NFS World needs no plugin: nothing was installed. Save writes your edits into the map's "
+                 L"own files.\r\n";
+        return InstallStatus::Ok;
+    }
     Installer in{ choices };
     const std::wstring game = choices.folder;
     const std::wstring scripts = game + L"\\scripts";
@@ -359,6 +364,10 @@ void DescribeFolder(HWND dialog) {
     bool valid = false;
     if (folder.empty()) {
         text = L"Choose the folder that holds SPEED2.EXE.";
+    } else if (IsWorldFolder(folder) && DirectoryExists(folder + L"\\TRACKS")) {
+        valid = true;
+        text = L"Need for Speed World found. It needs no plugin: Save writes your edits into the "
+               L"map's own files, and keeps the shipped ones in TRACKS\\frs-original.";
     } else if (IsUnderground1Folder(folder)) {
         valid = true;
         text = L"Need for Speed Underground found.\r\n"
@@ -395,7 +404,7 @@ void BrowseForFolder(HWND dialog) {
     DWORD options = 0;
     picker->GetOptions(&options);
     picker->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
-    picker->SetTitle(L"The Need for Speed Underground 2 folder (SPEED2.EXE), or Underground's (speed.exe)");
+    picker->SetTitle(L"The game's folder: Underground 2 (SPEED2.EXE), Underground (speed.exe) or NFS World (nfsw.exe)");
     const std::wstring current = Trimmed(TextOf(dialog, IDC_SETUP_PATH));
     IShellItem* start = nullptr;
     if (!current.empty() &&
@@ -462,6 +471,27 @@ bool PayloadHas(const wchar_t* relative) { return FileExists(PayloadFolder() + L
 void DescribeParts(HWND dialog) {
     Wizard* wizard = WizardOf(dialog);
     const std::wstring& folder = wizard->choices.folder;
+
+    // NFS World: there is nothing to install, so the page only says so and
+    // lets the wizard go on. Without this it waited for a "game" folder of
+    // Underground 2 plugins and could never be finished.
+    if (IsWorldFolder(folder)) {
+        for (int id : { IDC_SETUP_ASILOADER, IDC_SETUP_LOADER, IDC_SETUP_FASTBOOT,
+                        IDC_SETUP_FASTBOOT_ALWAYS }) {
+            Check(dialog, id, false);
+            Enable(dialog, id, false);
+        }
+        ::ShowWindow(::GetDlgItem(dialog, IDC_SETUP_DISABLE_OLD), SW_HIDE);
+        SetText(dialog, IDC_SETUP_ASILOADER_NOTE, L"Not used with NFS World.");
+        SetText(dialog, IDC_SETUP_PARTS_NOTE,
+                L"NFS World needs none of these. Save writes objects removed, moved and placed, "
+                L"edited models, replaced textures and collision into the map's own files; the "
+                L"shipped files are kept in TRACKS\\frs-original. New objects, roads, terrain and "
+                L"markers are not written to NFS World yet.");
+        PropSheet_SetWizButtons(::GetParent(dialog), PSWIZB_BACK | PSWIZB_NEXT);
+        PropSheet_SetNextText(::GetParent(dialog), L"&Next");
+        return;
+    }
 
     const std::wstring loader = AsiLoaderIn(folder);
     const bool haveLoaderFile = PayloadHas(L"dinput8.dll");
@@ -595,9 +625,14 @@ PROPSHEETPAGEW Page(HINSTANCE instance, int templateId, DLGPROC procedure, const
 
 } // namespace
 
+bool IsWorldFolder(const std::wstring& folder) {
+    return !folder.empty() && FileExists(folder + L"\\nfsw.exe");
+}
+
 bool IsGameFolder(const std::wstring& folder) {
     return !folder.empty() && DirectoryExists(folder + L"\\TRACKS") &&
-           (FileExists(folder + L"\\SPEED2.EXE") || FileExists(folder + L"\\speed.exe"));
+           (FileExists(folder + L"\\SPEED2.EXE") || FileExists(folder + L"\\speed.exe") ||
+            IsWorldFolder(folder));
 }
 
 bool IsUnderground1Folder(const std::wstring& folder) {

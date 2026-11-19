@@ -30,6 +30,13 @@ public:
     // Adds a mouse delta in pixels. Sensitivity is radians per pixel.
     void Rotate(float deltaX, float deltaY);
 
+    // Turns the view by a mouse delta while `pivot` stays where it is on
+    // screen: the eye swings around it instead of turning on the spot.
+    void Orbit(const Vec3& pivot, float deltaX, float deltaY);
+
+    // The same swing, to given angles.
+    void OrbitTo(const Vec3& pivot, float yaw, float pitch);
+
     // Moves along the camera axes. `local` is (right, forward, up) in metres.
     void Move(const Vec3& local);
 

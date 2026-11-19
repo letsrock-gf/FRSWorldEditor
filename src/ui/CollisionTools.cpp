@@ -6,6 +6,7 @@
 #include "io/SectionSplice.h"
 #include "nfs/ChunkReader.h"
 #include "nfs/FreeRoam.h"
+#include "nfs/GameFormat.h"
 #include "nfs/World.h"
 #include "render/CollisionMesh.h"
 #include "ui/Resource.h"
@@ -34,6 +35,7 @@ enum : int {
     kIdRaceGroups    = 44008,
     kIdMove          = 44009,
     kIdGenerate      = 44010,
+    kIdFlip          = 44011,
     kIdHeightFirst   = 44020,   // + preset index
     kIdSurfaceSelect = 44100,   // + surface index
     kIdSurfaceGround = 44200,
@@ -213,6 +215,25 @@ void RunCollisionSelfTest(nfs::World& world) {
         LOG_INFO("collision selftest: save plan of %zu spans:\n%S", plan.spans.size(), plan.report.c_str());
     }
 
+    // Flip: the face normal turns round, a barrier's ends swap; twice is a no-op.
+    {
+        const auto& ref = addedGround[0];
+        const auto polygonAt = [&]() -> nfs::CollisionPolygon& {
+            return world.MutableLoaded(ref.section)->collision[ref.pack].polygons[ref.polygon];
+        };
+        const nfs::CollisionPolygon before1 = polygonAt();
+        const auto normalOf = [](const nfs::CollisionPolygon& p) {
+            return Cross(p.corners[1] - p.corners[0], p.corners[2] - p.corners[0]);
+        };
+        Check(editor.Flip({ ref }) >= 1, "flip reaches the polygon");
+        Check(Dot(normalOf(polygonAt()), normalOf(before1)) < 0.0f, "flip turns the face round");
+        editor.Flip({ ref });
+        bool back = true;
+        for (int c = 0; c < 4; ++c)
+            back = back && Length(polygonAt().corners[c] - before1.corners[c]) < 1e-4f;
+        Check(back, "flipping twice gives the face back");
+    }
+
     // Deleting a shared polygon removes it from both sections.
     if (foundShared) {
         const size_t copies = editor.CopiesOf(shared).size();
@@ -242,8 +263,9 @@ void RunCollisionSelfTest(nfs::World& world) {
                      result.shape == collision::GeneratedShape::Solid ? "solid" : "drivable",
                      result.walls, result.ground);
             Check(result.shape == collision::GeneratedShape::Solid && result.walls >= 6 &&
-                  generated.front().Vertical() && generated.front().surface == 23,
-                  "a street light gets POST walls round its pole");
+                  std::any_of(generated.begin(), generated.end(),
+                              [](const nfs::CollisionPolygon& p) { return p.surface == 23; }),
+                  "a street light gets POST sides on the faces of its pole");
             const auto added = editor.Add(generated, L"street light");
             const auto again = editor.Add(generated, L"street light again");
             Check(!added.empty() && again.empty(), "making it twice adds nothing the second time");
@@ -307,6 +329,7 @@ void CollisionTools::BuildMenu() {
     ::AppendMenuW(popup_, MF_STRING, kIdAlwaysPresent, L"Make Selection &Always Present");
     ::AppendMenuW(popup_, MF_STRING, kIdCopies, L"Select &Copies in Other Sections");
     ::AppendMenuW(popup_, MF_STRING, kIdMove, L"&Move Selection\tG");
+    ::AppendMenuW(popup_, MF_STRING, kIdFlip, L"&Flip Side of Selection (red <-> blue)\tI");
     ::AppendMenuW(popup_, MF_STRING, kIdDelete, L"&Delete Selection\tDel");
     ::AppendMenuW(popup_, MF_SEPARATOR, 0, nullptr);
     ::AppendMenuW(popup_, MF_STRING, kIdGenerate, L"Make Collision for Selected &Objects\tCtrl+Shift+K");
@@ -365,6 +388,134 @@ void CollisionTools::OnRegionLoaded() {
             editor_.SetLog(std::move(log));
         }
     }
+    // NFS World keeps deleted collision in the map's own edit list
+    // (io/WorldWrite.h): one entry per pack it took polygons out of, so each
+    // shows in the Edits tab and can be put back.
+    if (World() && nfs::IsWorld()) {
+        std::vector<collision::LogEntry> log;
+        for (const auto& section : World()->Loaded()) {
+            if (!section->info) continue;
+            for (const auto& [pack, polygons] : section->savedCollisionCuts) {
+                if (pack >= section->collision.size() || polygons.empty()) continue;
+                collision::LogEntry entry;
+                entry.label = L"Deleted, collision section " +
+                              std::to_wstring(section->collision[pack].sectionNumber);
+                entry.packs.push_back({ section->info->name, pack, polygons, {} });
+                log.push_back(std::move(entry));
+            }
+        }
+        for (const auto& section : World()->Loaded()) {
+            if (!section->info) continue;
+            for (const auto& [pack, polygons] : section->savedCollisionAdds) {
+                if (pack >= section->collision.size() || polygons.empty()) continue;
+                collision::LogEntry entry;
+                entry.label = L"Added, collision section " +
+                              std::to_wstring(section->collision[pack].sectionNumber);
+                entry.packs.push_back({ section->info->name, pack, {}, polygons });
+                log.push_back(std::move(entry));
+            }
+        }
+        const size_t savedEntries = log.size();
+        if (!log.empty()) editor_.SetLog(std::move(log));
+
+        // FRS_TEST_COLLISION_RESTORE=1 takes every saved deletion back the way
+        // the Edits tab does, for scripted checks of the save that follows.
+        if (savedEntries && std::getenv("FRS_TEST_COLLISION_RESTORE")) {
+            std::vector<size_t> entries(savedEntries);
+            for (size_t i = 0; i < savedEntries; ++i) entries[i] = i;
+            std::wstring summary;
+            const size_t reverted = editor_.RevertLog(entries, summary);
+            for (const auto& [section, pack] : editor_.TakeTouched()) Renderer().RefreshCollisionPack(section, pack);
+            LOG_INFO("collision test: %zu of %zu saved deletions taken back", reverted, savedEntries);
+        }
+
+        // FRS_TEST_COLLISION_ADD=<collision section>: over that pack's first
+        // ground triangle, a copy 2 units up, a barrier along one edge and a
+        // copy far away (which no collision box holds), and its second ground
+        // triangle moved up by half a unit -- for scripted checks of the save.
+        if (const char* spec = std::getenv("FRS_TEST_COLLISION_ADD")) {
+            const u32 number = (u32)std::strtoul(spec, nullptr, 10);
+            const auto& loaded = World()->Loaded();
+            for (u32 s = 0; s < (u32)loaded.size(); ++s)
+                for (u32 p = 0; p < (u32)loaded[s]->collision.size(); ++p) {
+                    const nfs::CollisionPack& pack = loaded[s]->collision[p];
+                    if (pack.sectionNumber != number) continue;
+                    std::vector<u32> ground;
+                    for (u32 i = 0; i < (u32)pack.polygons.size() && ground.size() < 2; ++i)
+                        if (!pack.polygons[i].barrier) ground.push_back(i);
+                    if (ground.size() < 2) continue;
+                    const nfs::CollisionPolygon first = pack.polygons[ground[0]];
+                    Vec3 up[3], away[3];
+                    for (int c = 0; c < 3; ++c) {
+                        up[c]  = first.corners[c] + Vec3{ 0.0f, 0.0f, 2.0f };
+                        away[c] = first.corners[c] + Vec3{ 3000.0f, 3000.0f, 0.0f };
+                    }
+                    const auto added = editor_.Add({ collision::MakeGround(up, 3, nfs::kSurfaceRoad),
+                                                     collision::MakeGround(away, 3, nfs::kSurfaceRoad),
+                                                     collision::MakeBarrier(first.corners[0], first.corners[1],
+                                                                            nfs::kSurfaceSolidWall),
+                                                     // A wall of the Wall tool (vertical quad, 3 up) along
+                                                     // another edge, and an upright triangle like the
+                                                     // Make Collision sides.
+                                                     collision::MakeVerticalWall(first.corners[1], first.corners[2],
+                                                                                 3.0f, nfs::kSurfaceSolidWall),
+                                                     [&] {
+                                                         const Vec3 side[3] = {
+                                                             first.corners[2], first.corners[0],
+                                                             first.corners[0] + Vec3{ 0.0f, 0.0f, 2.5f } };
+                                                         return collision::MakeGround(side, 3, nfs::kSurfaceSolidWall);
+                                                     }() },
+                                                   L"test add");
+                    const bool moving = editor_.BeginMove({ { s, p, ground[1] } });
+                    editor_.UpdateMove({ 0.0f, 0.0f, 0.5f });
+                    editor_.EndMove(true);
+                    LOG_INFO("collision test: %zu polygons added to section %u, one moved (%d)", added.size(),
+                             number, moving ? 1 : 0);
+                }
+            for (const auto& [section, pack] : editor_.TakeTouched()) Renderer().RefreshCollisionPack(section, pack);
+        }
+
+        // FRS_TEST_COLLISION_CUT=<collision section>:<index>,<index>;<section>:...
+        // deletes those polygons (their place in the shipped pack) the way the
+        // Delete key does, for scripted checks of the save.
+        if (const char* spec = std::getenv("FRS_TEST_COLLISION_CUT")) {
+            std::vector<collision::PolygonRef> refs;
+            for (const char* at = spec; *at;) {
+                char* end = nullptr;
+                const u32 number = (u32)std::strtoul(at, &end, 10);
+                if (end == at || *end != ':') break;
+                at = end + 1;
+                for (;;) {
+                    const u32 source = (u32)std::strtoul(at, &end, 10);
+                    if (end == at) break;
+                    const auto& loaded = World()->Loaded();
+                    for (u32 s = 0; s < (u32)loaded.size(); ++s)
+                        for (u32 p = 0; p < (u32)loaded[s]->collision.size(); ++p) {
+                            const nfs::CollisionPack& pack = loaded[s]->collision[p];
+                            if (pack.sectionNumber != number) continue;
+                            for (u32 i = 0; i < (u32)pack.polygons.size(); ++i)
+                                if (pack.polygons[i].source == source) refs.push_back({ s, p, i });
+                        }
+                    at = end;
+                    if (*at != ',') break;
+                    ++at;
+                }
+                if (*at == ';') ++at;
+            }
+            const DWORD t0 = ::GetTickCount();
+            const size_t removed = editor_.Remove(refs);
+            const DWORD t1 = ::GetTickCount();
+            for (const auto& [section, pack] : editor_.TakeTouched()) Renderer().RefreshCollisionPack(section, pack);
+            const DWORD t2 = ::GetTickCount();
+            // What it would cost to draw the whole section again, as every edit used to.
+            for (u32 s = 0; s < (u32)World()->Loaded().size(); ++s)
+                if (!World()->Loaded()[s]->collision.empty()) Renderer().RefreshCollision(s);
+            LOG_INFO("collision test: %zu polygons asked for, %zu deleted with their copies; edit %lu ms, "
+                     "redraw of the touched packs %lu ms, of every pack %lu ms",
+                     refs.size(), removed, t1 - t0, t2 - t1, ::GetTickCount() - t2);
+        }
+    }
+
     // A check of the whole edit path, run on the loaded region without
     // writing anything: set FRS_COLLISION_TOOLS_SELFTEST=1 before starting.
     static const bool selfTest = std::getenv("FRS_COLLISION_TOOLS_SELFTEST") != nullptr;
@@ -441,7 +592,7 @@ void CollisionTools::OnRegionClosed() {
 }
 
 void CollisionTools::RefreshAfterEdit() {
-    for (u32 section : editor_.TakeTouchedSections()) Renderer().RefreshCollision(section);
+    for (const auto& [section, pack] : editor_.TakeTouched()) Renderer().RefreshCollisionPack(section, pack);
 }
 
 // ---------------------------------------------------------------------------
@@ -481,6 +632,7 @@ bool CollisionTools::OnCommand(int id) {
         case kIdAlwaysPresent: ClearSelectionRaceGroup(); return true;
         case kIdCopies:  SelectCopies(); return true;
         case kIdMove:    BeginMove(); return true;
+        case kIdFlip:    FlipSelection(); return true;
         case kIdGenerate:
         case IDC_PROP_COLLISION:
             GenerateForSelection();
@@ -524,6 +676,14 @@ void CollisionTools::ClearSelectionRaceGroup() {
     const size_t changed = editor_.SetRaceGroup(refs, 0);
     RefreshAfterEdit();
     Status(Format(L"%zu polygons now exist in free roam as well as in races (not written yet).", changed));
+}
+
+void CollisionTools::FlipSelection() {
+    const auto refs = SelectionRefs();
+    if (refs.empty()) { Status(L"Select collision polygons first (Ctrl+K shows them)."); return; }
+    const size_t changed = editor_.Flip(refs);
+    RefreshAfterEdit();
+    Status(Format(L"%zu polygons flipped: red and blue sides swapped (copies included; not written yet).", changed));
 }
 
 void CollisionTools::SelectCopies() {
@@ -657,6 +817,11 @@ void CollisionTools::WatchHistory() {
         for (size_t i = history_.size(); i-- > 0;)
             if (history_[i].kind == StepKind::Collision) { history_.erase(history_.begin() + (ptrdiff_t)i); break; }
     }
+
+    // The objects' steps are kept by the main window (MainWindow::TrackEdits),
+    // which also knows the map's own objects moved where they stand in NFS
+    // World and can redo. Two parts recording one change would take Ctrl+Z twice.
+    if (host_.viewport) return;
 
     // Placements: one step each time they come to rest in a new state. While
     // something is being dragged they are not at rest.
@@ -1098,6 +1263,12 @@ bool CollisionTools::KeyDown(WPARAM key, bool repeat) {
     if (!repeat && key == 'G' && ::GetKeyState(VK_CONTROL) >= 0 && Renderer().CollisionVisible() &&
         !Renderer().CollisionSelection().empty())
         return BeginMove();
+    // I: flip the selection's side (a single key no other viewport tool uses).
+    if (!repeat && key == 'I' && ::GetKeyState(VK_CONTROL) >= 0 && ::GetKeyState(VK_SHIFT) >= 0 &&
+        ::GetKeyState(VK_MENU) >= 0 && Renderer().CollisionVisible() && !Renderer().CollisionSelection().empty()) {
+        FlipSelection();
+        return true;
+    }
     return false;
 }
 
@@ -1177,6 +1348,8 @@ bool CollisionTools::FillProperties(PropertiesPanel::View& view) {
                      : Format(L"%zu collision polygons", selection.size());
     view.moveLabel.clear();
     view.removeLabel = L"Delete";
+    view.actions.push_back({ L"Flip side", kIdFlip, L"Collision",
+                             L"Swap the side that holds cars (red) with the one that does not (blue). Key: I." });
 
     add(L"Collision", L"Polygons", std::to_wstring(selection.size()), L"How many are selected.");
     add(L"Collision", L"Kind",

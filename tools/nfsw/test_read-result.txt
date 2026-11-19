@@ -1,0 +1,16 @@
+[info ] preculler: 1051 zones, 907 visibility lists
+[info ] sky textures: 1 packs from SkyDomeTextures.bin
+[info ] sky: model SKYDOME_1_SUNSET from GlobalB.lzc
+[info ] sky: model SKYDOME_1_DAWN from GlobalB.lzc
+[info ] sky: model SKYDOME_1_DUSK from GlobalB.lzc
+[info ] sky: model SKYDOME_1_NOON from GlobalB.lzc
+[info ] sky: model SKYDOME_1_LATEAFTERNOON from GlobalB.lzc
+[info ] sky: model SKYDOME_1_NIGHT from GlobalB.lzc
+[info ] sky: GlobalB.lzc 28335824 bytes, 865 blocks unpacked, 0 failed, 1 solid lists with a dome
+[info ] NFS World animations: 352 trees, 352 placements, 53 parts with frames; visibility: 1051 zones
+[info ] sky: SKYDOME_1_NOON, radius 7723, drawn at scale 0.350 round the camera
+[info ] sky texture 1641EC04: SKY_1NOOND
+[info ] sky texture 1641EC01: SKY_1NOONA
+[info ] sky texture 1641EC02: SKY_1NOONB
+[info ] sky texture 1641EC03: SKY_1NOONC
+[info ] object animations: 352 of 352 placements in view, 351 parts drawn, 1 models not found

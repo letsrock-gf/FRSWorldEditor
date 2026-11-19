@@ -1,0 +1,10 @@
+5789 files; headers {False: 109, True: 1} (True = library 25002)
+trees 400, entities 400, with frame chunk 53, frame count != chunk/64: 0
+parent set: {False: 400}  rate byte: {16: 350, 1: 2, 64: 43, 32: 5}  flags@0x46: {0: 126, 2: 226, 1: 48}  @0x68>>28: {8: 398, 12: 2}
+model hash @0x48 in some 0x134003 list: 396 of 400
+   STREAML5RA_1830.BUN frames 1700 rest pos [6248.9, 2866.3, 267.7] frame0 pos [6248.9, 2866.3, 267.7]
+   STREAML5RA_25000.BUN frames 1501 rest pos [4971.9, 2860.7, 130.1] frame0 pos [4971.9, 2860.7, 130.1]
+   STREAML5RA_25000.BUN frames 1501 rest pos [4975.7, 2860.9, 130.1] frame0 pos [4975.7, 2860.9, 130.1]
+   STREAML5RA_25000.BUN frames 5001 rest pos [4231.1, -7271.3, 0.0] frame0 pos [4231.1, -7271.3, 0.0]
+   STREAML5RA_25000.BUN frames 1500 rest pos [4696.7, -391.5, 149.4] frame0 pos [4696.7, -391.5, 149.4]
+   STREAML5RA_25000.BUN frames 4001 rest pos [-3152.6, -1207.9, 512.1] frame0 pos [-3152.6, -1207.9, 512.1]

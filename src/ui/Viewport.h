@@ -64,6 +64,18 @@ public:
     void FrameBounds(const Aabb& bounds);
     void FrameWorld();
 
+    // Brings the selection into view without turning the camera; the whole
+    // world when nothing is selected.
+    void FrameSelection();
+
+    // One of the Camera menu's view commands (ID_VIEW_FRONT and the rest):
+    // Blender's numpad, swinging around the selection or the last pivot.
+    void View(int command);
+
+    // How much of the way to the point under the cursor one wheel notch goes.
+    void  SetZoomStep(float fraction) { zoomStep_ = fraction; }
+    float ZoomStep() const { return zoomStep_; }
+
     // Flies the camera to a viewpoint over `seconds` rather than cutting to
     // it, so the jump across the city reads as one. Moving or looking takes
     // the camera back at once.
@@ -89,6 +101,12 @@ public:
     bool SelectedPlacement(u32& loadedSection, int& placement) const;
     // Every editor placement in the selection.
     std::vector<std::pair<u32, int>> SelectedPlacements() const;
+
+    // Everything in the selection that can be moved: the editor's placements
+    // and the map's own scenery. The number beside the section is a handle --
+    // a placement's index, or for the map's own, NativeHandle(scenery index).
+    std::vector<std::pair<u32, int>> SelectedMovables() const;
+    bool MovableTransform(u32 loadedSection, int handle, Mat4& transform) const;
 
     // Starts dragging the selected placement across its own height (G) or
     // turning it about the vertical (R). The mouse drives it; a left click
@@ -139,7 +157,8 @@ public:
     bool GroundBelow(const Vec3& point, u32 loadedSection, int placement, float& height);
 
     // The ray through a client-area pixel, and the one through the centre.
-    Ray RayAt(int x, int y) const;
+    Ray RayAt(int x, int y) const { return RayThrough((float)x, (float)y); }
+    Ray RayThrough(float x, float y) const;     // the same, between pixels
 
     // The panels drawn over the view (ui/ImGuiLayer.h): `draw` lays them out
     // once a frame, between the scene and the present.
@@ -174,8 +193,24 @@ private:
     void UpdateCamera(float deltaSeconds);
     void UpdateTransform(int x, int y);
     void EndTransform(bool keep);
-    void BeginLook();
+    // What dragging does while the cursor is pinned: turn on the spot, swing
+    // around a point, or slide across the view.
+    enum class LookMode { Free, Orbit, Pan, Zoom };
+    void BeginLook(LookMode mode = LookMode::Free);
+    // A press of the right or middle button: which drag it starts.
+    void BeginNavigate(WPARAM buttons, int x, int y);
+    void Pan(float pixelsX, float pixelsY);
+    float zoomStep_ = 0.2f;
+    float pivotDistance_ = 50.0f;   // how far the last pivot was, for a press on the sky
     void EndLook();
+    LookMode lookMode_ = LookMode::Free;
+    Vec3     lookPivot_;
+
+    // The middle of what is selected. False when nothing is.
+    bool SelectionCentre(Vec3& centre) const;
+    // The point to swing around or zoom on: the selection when asked for and
+    // there is one, else what is under the pixel, else a point ahead.
+    Vec3 PivotAt(int x, int y);
 
     HWND         window_ = nullptr;
     D3D9Context  context_;
@@ -198,7 +233,7 @@ private:
     Mat4  gizmoNow_;                    // a point's transform as the drag left it
     GizmoView CurrentGizmoView() const;
     bool BeginGizmoDrag(int x, int y);
-    void UpdateGizmoDrag(int x, int y);
+    void UpdateGizmoDrag(int x, int y, bool fine);
     void EndGizmoDrag(bool keep);
     GizmoMode gizmoMode_ = GizmoMode::Move;
     int   gizmoHot_ = kGizmoNone;
@@ -207,6 +242,8 @@ private:
     int   gizmoPlacement_ = -1;
     Mat4  gizmoStart_;
     Vec2  gizmoMouseStart_;
+    Vec2  gizmoMouseLast_;              // where the mouse was at the last update
+    Vec2  gizmoPointer_;                // the pointer the object follows: slower than the mouse under Shift
     float gizmoAxisStart_ = 0.0f;       // where along the axis the grab began
     Vec3  gizmoPlaneStart_;             // where on the ground plane it began
     bool  flying_ = false;

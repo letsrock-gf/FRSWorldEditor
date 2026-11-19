@@ -148,6 +148,17 @@ void CollisionPack::GroundHeightsAt(const Vec3& point, float reach, std::vector<
 void CollisionPack::BarrierQuad(const CollisionPolygon& barrier, Vec3 out[4]) const {
     const Vec3& a = barrier.corners[0];
     const Vec3& b = barrier.corners[2];
+    if (barrier.wall) {
+        // NFS World walls start about a metre under the road and mostly rise
+        // 64 units, which would bury the view; only their foot is shown.
+        const float bottom = std::min(a.z, b.z);
+        const float top    = std::min(std::max(a.z, b.z), bottom + kWallShown);
+        out[0] = { a.x, a.y, bottom };
+        out[1] = { a.x, a.y, top };
+        out[2] = { b.x, b.y, top };
+        out[3] = { b.x, b.y, bottom };
+        return;
+    }
     float za = 0.0f, zb = 0.0f;
     const ptrdiff_t index = &barrier - polygons.data();
     if (barrierFor_ == polygons.data() && barrierSize_ == polygons.size() && index >= 0 &&

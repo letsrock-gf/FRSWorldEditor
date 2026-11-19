@@ -129,6 +129,9 @@ public:
     size_t Remove(const std::vector<PolygonRef>& refs);
     size_t SetSurface(const std::vector<PolygonRef>& refs, u8 surface);
     size_t SetRaceGroup(const std::vector<PolygonRef>& refs, u8 group);
+    // Turns the side that holds cars round: a barrier's ends swap, a face's
+    // corners go the other way round.
+    size_t Flip(const std::vector<PolygonRef>& refs);
 
     // Moving a selection: Begin records it (copies included), Update places
     // it `offset` away from where it started, End keeps or puts it back.
@@ -171,7 +174,8 @@ public:
 
     // The loaded sections whose collision changed since the last call, so the
     // caller can redraw them.
-    std::vector<u32> TakeTouchedSections();
+    // (loaded section, pack) pairs: only those packs need drawing again.
+    std::vector<std::pair<u32, u32>> TakeTouched();
 
 private:
     struct PackState {
@@ -199,7 +203,11 @@ private:
     nfs::World* world_ = nullptr;
     std::vector<Step> undo_;
     u64 recorded_ = 0, undone_ = 0;
-    std::vector<u32> touched_;
+    std::vector<std::pair<u32, u32>> touched_;
+    void Touch(u32 section, u32 pack) {
+        for (const auto& t : touched_) if (t.first == section && t.second == pack) return;
+        touched_.push_back({ section, pack });
+    }
 
     bool moving_ = false;
     std::vector<PolygonRef> moveRefs_;

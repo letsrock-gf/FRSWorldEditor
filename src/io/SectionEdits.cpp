@@ -5,6 +5,7 @@
 #include "io/SectionRebuild.h"
 #include "nfs/ChunkReader.h"
 #include "nfs/Collision.h"
+#include "nfs/GameFormat.h"
 #include "nfs/TexturePack.h"
 #include "nfs/World.h"
 
@@ -533,8 +534,13 @@ bool ShippedCollisionPacks(const nfs::World& world, const nfs::Section& section,
     if (section.originalStreamOffset + (u64)section.originalStreamSize > stream.size) return false;
     const ByteSpan original = stream.sub(section.originalStreamOffset, section.originalStreamSize);
     for (const TopChunk& top : TopChunks(original, section.originalStreamOffset)) {
-        if (top.id != nfs::kChunkCollisionPack) continue;
         nfs::CollisionPack pack;
+        // NFS World: the stream holds the kept copy of the shipped file.
+        if (top.id == nfs::kChunkWorldCollisionPack && nfs::IsWorld()) {
+            if (nfs::ParseWorldCollision(top.chunk, pack)) packs.push_back(std::move(pack));
+            continue;
+        }
+        if (top.id != nfs::kChunkCollisionPack) continue;
         if (nfs::ParseCollision(top.chunk, pack)) packs.push_back(std::move(pack));
     }
     return true;

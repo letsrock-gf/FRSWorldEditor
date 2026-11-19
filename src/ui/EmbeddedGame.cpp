@@ -28,6 +28,8 @@ BOOL CALLBACK FindGameWindow(HWND window, LPARAM parameter) {
 bool EmbeddedGame::Launch(const std::wstring& gameFolder, HWND owner) {
     Release();
     const std::wstring executable = gameFolder + L"\\SPEED2.EXE";
+    // Only Underground 2 is started from here; an NFS World folder has no SPEED2.EXE.
+    if (::GetFileAttributesW(executable.c_str()) == INVALID_FILE_ATTRIBUTES) return false;
     SHELLEXECUTEINFOW info{};
     info.cbSize = sizeof(info);
     info.fMask = SEE_MASK_NOCLOSEPROCESS;

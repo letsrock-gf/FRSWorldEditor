@@ -1,6 +1,7 @@
 #include "nfs/SolidList.h"
 
 #include "core/Log.h"
+#include "nfs/GameFormat.h"
 
 #include <cstring>
 
@@ -44,6 +45,58 @@ constexpr u32 kStridePositionNormalColorUv = 36;  // pos, normal, color, uv
 // Underground 1's crowd: the 36-byte layout, then bone weights and indices.
 constexpr u32 kStrideSkinned               = 60;
 
+// --- NFS World ---------------------------------------------------------------
+// Measured over all 28 324 objects of TRACKS (L5RA). The header keeps the
+// Underground 2 fields and moves the name; a material is 116 bytes; and the
+// mesh holds one vertex buffer per run of materials that share an effect, each
+// with the layout of that effect. Indices count from the start of their own
+// buffer. No object reaches 65 536 vertices in total, so the buffers are
+// joined into the one the editor draws from.
+constexpr size_t kWorldHdrName = 0xA0;
+
+constexpr size_t kWorldMaterialEntrySize = 116;
+constexpr size_t kWorldMatEffect       = 0x08;
+constexpr size_t kWorldMatBoundsMin    = 0x10;
+constexpr size_t kWorldMatBoundsMax    = 0x1C;
+constexpr size_t kWorldMatTextureIndex = 0x28;   // u8: the diffuse slot of five
+constexpr size_t kWorldMatVertexCount  = 0x40;
+constexpr size_t kWorldMatIndexCount   = 0x44;
+constexpr size_t kWorldMatFirstIndex   = 0x4C;
+
+// Where a layout keeps what the editor draws with; -1 when it has none.
+struct WorldLayout {
+    u32 stride;
+    int normal;   // i16[4], 32767 = 1.0
+    int color;    // D3DCOLOR
+    int uv;       // float[2]
+    int color1 = -1;   // D3DCOLOR, the second colour (nfsw.exe effect table 0xC83018 vertex layouts)
+    int tangent = -1;  // i16[4]
+};
+
+// Effects 8 and 9 (32 bytes, 296 buffers) pack their positions as integers
+// and are left out until that packing is read.
+bool WorldLayoutFor(u32 effect, u32 stride, WorldLayout& out) {
+    switch (effect) {
+        // WorldShader: position, SHORT4 normal, uv, colour, colour 1.
+        case 0x0: case 0x1: case 0xA: case 0xC: case 0xF:
+            out = { 36, 12, 28, 20, 32 }; break;
+        // The same followed by a SHORT4 tangent (WorldRoad / WorldNormalMap).
+        case 0x2: case 0x3: case 0x7: case 0xB:
+            out = { 44, 12, 28, 20, 32, 36 }; break;
+        // WorldPrelitShader: position, colour, colour 1, uv.
+        case 0x4:
+            out = { 28, -1, 12, 20, 16 }; break;
+        case 0x5:
+            out = { 36, 12, 20, 28 }; break;
+        // skyshader: position, SHORT4 normal, uv, uv 1, colour (the SKYDOME_1_* models of GlobalB).
+        case 0xE:
+            out = { 40, 12, 36, 20 }; break;
+        default:
+            return false;
+    }
+    return out.stride == stride;
+}
+
 Vec3 ReadVec3(ByteSpan span, size_t offset) {
     return { span.read<float>(offset),
              span.read<float>(offset + 4),
@@ -72,7 +125,8 @@ void ParseHeader(ByteSpan data, SolidObject& out) {
     out.bounds.min = ReadVec3(data, kHdrBoundsMin);
     out.bounds.max = ReadVec3(data, kHdrBoundsMax);
     out.transform  = ReadMat4(data, kHdrTransform);
-    out.name       = ReadName(data, (out.version & 0xFFFFu) <= kHdrVersionU1 ? kHdrNameU1 : kHdrName);
+    out.name       = ReadName(data, IsWorld() ? kWorldHdrName
+                                    : (out.version & 0xFFFFu) <= kHdrVersionU1 ? kHdrNameU1 : kHdrName);
     out.kind       = ClassifyObject(out.name);
 }
 
@@ -157,6 +211,134 @@ void ParseIndices(ByteSpan data, u32 triangleCount, SolidObject& out) {
 
 } // namespace
 
+namespace {
+
+bool ParseWorldObject(const Chunk& objectChunk, SolidObject& out) {
+    ChunkReader reader = ChunkReader::Children(objectChunk);
+    Chunk child;
+
+    std::vector<Chunk> buffers;
+    ByteSpan indexData, materialData;
+
+    while (reader.Next(child)) {
+        if (child.id == kChunkSolidObjectHeader)       ParseHeader(child.data, out);
+        else if (child.id == kChunkSolidObjectTexRefs) ParseTextureRefs(child.data, out);
+        else if (child.id == kChunkMeshContainer) {
+            ChunkReader mesh = ChunkReader::Children(child);
+            Chunk part;
+            while (mesh.Next(part)) {
+                if (part.id == kChunkMeshVertices)       buffers.push_back(part);
+                else if (part.id == kChunkMeshIndices)   indexData    = part.data;
+                else if (part.id == kChunkMeshMaterials) materialData = part.data;
+            }
+        }
+    }
+
+    const size_t materialCount = materialData.size / kWorldMaterialEntrySize;
+    const size_t indexTotal    = indexData.size / 2;
+    auto entryAt = [&](size_t i) {
+        return materialData.sub(i * kWorldMaterialEntrySize, kWorldMaterialEntrySize);
+    };
+
+    size_t bufferIndex = 0;
+    for (size_t first = 0; first < materialCount; ++bufferIndex) {
+        // The run: every following material with the same effect.
+        const u32 effect = entryAt(first).read<u32>(kWorldMatEffect);
+        size_t end = first;
+        u32 runVertices = 0;
+        while (end < materialCount && entryAt(end).read<u32>(kWorldMatEffect) == effect)
+            runVertices += entryAt(end++).read<u32>(kWorldMatVertexCount);
+
+        const size_t runFirst = first;
+        first = end;
+        if (bufferIndex >= buffers.size() || runVertices == 0) continue;
+
+        const ByteSpan data = buffers[bufferIndex].data;
+        WorldLayout layout{};
+        if (data.size % runVertices != 0 ||
+            !WorldLayoutFor(effect, (u32)(data.size / runVertices), layout)) {
+            LOG_WARN("object '%s': effect %u with %zu bytes for %u vertices is not read yet",
+                     out.name.c_str(), effect, data.size, runVertices);
+            continue;
+        }
+
+        const size_t base = out.vertices.size();
+        if (base + runVertices > 65536) {
+            LOG_WARN("object '%s': more than 65536 vertices, the rest is left out", out.name.c_str());
+            break;
+        }
+
+        if (base == 0) {
+            out.vertexFileOffset = buffers[bufferIndex].dataOffset;
+            out.vertexStride     = layout.stride;
+            out.hasNormals       = layout.normal >= 0;
+        }
+
+        out.vertices.resize(base + runVertices);
+        for (u32 i = 0; i < runVertices; ++i) {
+            const ByteSpan source = data.sub((size_t)i * layout.stride, layout.stride);
+            SolidVertex& vertex = out.vertices[base + i];
+
+            vertex.position = ReadVec3(source, 0);
+            vertex.normal   = { 0.0f, 0.0f, 1.0f };
+            if (layout.normal >= 0) {
+                const float scale = 1.0f / 32767.0f;
+                vertex.normal = { (float)source.read<i16>((size_t)layout.normal) * scale,
+                                  (float)source.read<i16>((size_t)layout.normal + 2) * scale,
+                                  (float)source.read<i16>((size_t)layout.normal + 4) * scale };
+            }
+            vertex.color = source.read<u32>((size_t)layout.color);
+            vertex.uv    = { source.read<float>((size_t)layout.uv),
+                             source.read<float>((size_t)layout.uv + 4) };
+        }
+        if (layout.color1 >= 0) {
+            out.colors1.resize(out.vertices.size(), 0u);
+            for (u32 i = 0; i < runVertices; ++i)
+                out.colors1[base + i] = data.sub((size_t)i * layout.stride, layout.stride).read<u32>((size_t)layout.color1);
+        } else if (!out.colors1.empty()) {
+            out.colors1.resize(out.vertices.size(), 0u);
+        }
+        if (layout.tangent >= 0) {
+            out.tangents.resize(out.vertices.size(), std::array<i16, 4>{});
+            for (u32 i = 0; i < runVertices; ++i) {
+                const ByteSpan source = data.sub((size_t)i * layout.stride, layout.stride);
+                for (int k = 0; k < 4; ++k) out.tangents[base + i][k] = source.read<i16>((size_t)layout.tangent + 2 * k);
+            }
+        } else if (!out.tangents.empty()) {
+            out.tangents.resize(out.vertices.size(), std::array<i16, 4>{});
+        }
+
+        for (size_t m = runFirst; m < end; ++m) {
+            const ByteSpan entry = entryAt(m);
+            const u32 firstIndex = entry.read<u32>(kWorldMatFirstIndex);
+            u32 indexCount       = entry.read<u32>(kWorldMatIndexCount);
+            if (firstIndex >= indexTotal) continue;
+            if (firstIndex + indexCount > indexTotal) indexCount = (u32)(indexTotal - firstIndex);
+
+            SolidMaterial material;
+            material.firstIndex   = (u32)out.indices.size();
+            material.indexCount   = indexCount - indexCount % 3;
+            material.textureIndex = entry.read<u8>(kWorldMatTextureIndex);
+            for (int k = 0; k < 5; ++k) material.slots[k] = entry.read<u8>(kWorldMatTextureIndex + k);
+            material.worldFlags   = entry.read<u32>(0);
+            material.flags        = effect;
+            material.bounds.min   = ReadVec3(entry, kWorldMatBoundsMin);
+            material.bounds.max   = ReadVec3(entry, kWorldMatBoundsMax);
+
+            // Indices count from the start of their own buffer.
+            for (u32 i = 0; i < material.indexCount; ++i) {
+                const u32 index = indexData.read<u16>(((size_t)firstIndex + i) * 2);
+                out.indices.push_back((u16)(index < runVertices ? base + index : base));
+            }
+            out.materials.push_back(material);
+        }
+    }
+
+    return !out.vertices.empty() && !out.indices.empty();
+}
+
+} // namespace
+
 ObjectKind ClassifyObject(const std::string& name) {
     if (name.rfind("PAN_", 0) == 0)    return ObjectKind::Backdrop;  // panorama pieces
     if (name.rfind("SKYDOME", 0) == 0) return ObjectKind::Backdrop;
@@ -165,6 +347,8 @@ ObjectKind ClassifyObject(const std::string& name) {
 }
 
 bool ParseSolidObject(const Chunk& objectChunk, SolidObject& out) {
+    if (IsWorld()) return ParseWorldObject(objectChunk, out);
+
     ChunkReader reader = ChunkReader::Children(objectChunk);
     Chunk child;
 

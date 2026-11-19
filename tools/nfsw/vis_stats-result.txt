@@ -1,0 +1,11 @@
+children: {'0x34151': 3080, '0x34152': 116528, '0x34156': 1480, '0x34155': 10792, '0x34153': 889448, '0x34157': 76224}
+0x34151 words: (400, 749, 131073, 262147, 393221, 524295, 655369, 786443)
+outlines 1051, lists 907, bad lists 0
+outline slack bytes after ring (top): [(0, 1051)]  12 zero bytes: {True: 1046, False: 5}  ring inside box: {True: 1051}
+list (u16@8 - count, u16@10 == count): [((6, True), 473), ((7, True), 434)]
+zones with outline and list 902
+list entries 429778, sizes min/max 2/995, numbers not in table 15962
+zone ids that are table numbers 268; their outline holds that section's centre: 262
+section table centres x -852..13386 y -4014..4732
+outline extent x -8018..16868 y -10956..8500
+sample zone 3103 box (5855.90234375, -102.36741638183594) (6054.26025390625, 198.87013244628906) points 5 list (3103, 3503)

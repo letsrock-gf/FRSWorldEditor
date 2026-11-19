@@ -1,6 +1,7 @@
 #include "nfs/Preculler.h"
 
 #include "core/Log.h"
+#include "nfs/GameFormat.h"
 
 #include <algorithm>
 #include <cmath>
@@ -83,6 +84,43 @@ bool Preculler::Parse(ByteSpan bunFile, bool underground1) {
             }
             if (child.id == kChunkZonePolygons) child.id = kChunkZoneVisibility;   // the lists
             else continue;
+        }
+        // NFS World (L5RA.BUN, measured with tools/nfsw/vis_stats.py on all
+        // 1051 outlines and 907 lists): the same chunks and markers, other
+        // bodies. Outline: u16 id, u8 point count, u8 flag, 12 bytes (zero in
+        // 1046 of them), min @16, max @24, middle @32, ring @40 -- every ring
+        // ends its record exactly and lies inside its box. List: u32 0, u16 id
+        // @4, u16 count @6, two words, u16 section numbers from +12.
+        if (IsWorld() && !underground1) {
+            if (child.id == kChunkZonePolygons) {
+                for (const auto& [offset, length] : RecordBodies(child.data)) {
+                    const ByteSpan body = child.data.sub(offset, length);
+                    if (body.size < 40) continue;
+                    const u32 points = body.read<u8>(2);
+                    if (points < 3 || 40 + (size_t)points * 8 > body.size) continue;
+                    Zone zone;
+                    zone.id = body.read<u16>(0);
+                    zone.boundsMin = { body.read<float>(16), body.read<float>(20), 0.0f };
+                    zone.boundsMax = { body.read<float>(24), body.read<float>(28), 0.0f };
+                    for (u32 i = 0; i < points; ++i)
+                        zone.ring.push_back({ body.read<float>(40 + i * 8), body.read<float>(44 + i * 8), 0.0f });
+                    zone.recordOffset = (u64)(child.data.data - bunFile.data) + offset;
+                    zone.recordLength = (u32)length;
+                    zones_.push_back(std::move(zone));
+                }
+            } else if (child.id == kChunkZoneVisibility) {
+                for (const auto& [offset, length] : RecordBodies(child.data)) {
+                    const ByteSpan body = child.data.sub(offset, length);
+                    if (body.size < 12) continue;
+                    const u32 id = body.read<u16>(4), count = body.read<u16>(6);
+                    if (count == 0 || 12 + (size_t)count * 2 > body.size) continue;
+                    std::vector<u32> sections(count);
+                    for (u32 i = 0; i < count; ++i) sections[i] = body.read<u16>(12 + i * 2);
+                    visible_[id] = std::move(sections);
+                    records_[id] = { (u64)(child.data.data - bunFile.data) + offset, (u32)length };
+                }
+            }
+            continue;
         }
         if (child.id == kChunkVisibilityHeader && child.data.size >= 4) {
             const u32 base = child.data.read<u32>(0);

@@ -54,6 +54,9 @@
 #define IDC_TEX_INFO           2103
 #define IDC_TEX_SAVE           2104
 #define IDC_TEX_ZOOM           2105
+#define IDC_TEX_REPLACE        2106
+#define IDC_TEX_RESTORE        2107
+#define IDC_TEX_SEARCH         2108
 
 // Child controls
 #define IDC_VIEWPORT           1001
@@ -96,6 +99,7 @@
 #define ID_GIZMO_MOVE          40416
 #define ID_GIZMO_ROTATE        40417
 #define ID_GIZMO_SCALE         40418
+#define ID_OBJECT_SELECT_SAME  40419
 // Camera > Travel To: districts from here, zones from ID_TRAVEL_ZONE.
 #define ID_TRAVEL_DISTRICT     46000
 #define ID_TRAVEL_ZONE         46100
@@ -165,6 +169,27 @@
 #define IDC_SETUP_LINK         2712
 
 // Worlds (sets of edits)
+#define ID_EDIT_UNDO           40420
+#define ID_EDIT_REDO           40421
+#define ID_VIEW_CLIP           40422
+#define ID_CAMERA_FRAME_SEL    40423
+#define ID_VIEW_FRONT          40430
+#define ID_VIEW_BACK           40431
+#define ID_VIEW_RIGHT          40432
+#define ID_VIEW_LEFT           40433
+#define ID_VIEW_TOP            40434
+#define ID_VIEW_BOTTOM         40435
+#define ID_VIEW_OPPOSITE       40436
+#define ID_VIEW_ORBIT_LEFT     40437
+#define ID_VIEW_ORBIT_RIGHT    40438
+#define ID_VIEW_ORBIT_UP       40439
+#define ID_VIEW_ORBIT_DOWN     40440
+#define IDC_CLIP_SENSITIVITY   2814
+#define IDC_CLIP_ZOOM          2815
+#define IDD_CLIP               290   // 272 is upstream's IDD_PUBLISH_WORLD since 0.2.1
+#define IDC_CLIP_START         2811
+#define IDC_CLIP_END           2812
+#define IDC_CLIP_DETAIL        2813
 #define IDD_NEW_WORLD          270
 #define IDD_OPEN_WORLD         271
 #define IDC_WORLD_NAME         2801

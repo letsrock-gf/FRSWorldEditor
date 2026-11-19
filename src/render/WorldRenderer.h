@@ -4,6 +4,7 @@
 #include "render/CollisionMesh.h"
 #include "render/D3D9Context.h"
 #include "render/GameLook.h"
+#include "render/GameLookAttributes.h"
 #include "render/Gizmo.h"
 #include "render/GpuResources.h"
 // MINIMAP PREVIEW (temporary)
@@ -11,6 +12,7 @@
 
 class RenderExtension;
 
+#include <array>
 #include <functional>
 #include <memory>
 #include <string>
@@ -51,6 +53,14 @@ struct RenderStats {
 // Picking is how a person reports a problem without having to describe it: they
 // click the thing that looks wrong and the editor names it, says where it came
 // from and how it was placed.
+// Where a placement's index is expected, one of the map's own objects goes by a
+// handle: its scenery index counted down from here. -2 to -15 are left for
+// other marks (the gizmo's: a road node, a tool's selection, a detached object).
+constexpr int kNativeHandleBase = 16;
+inline int  NativeHandle(int native)   { return -(native + kNativeHandleBase); }
+inline bool IsNativeHandle(int handle) { return handle <= -kNativeHandleBase; }
+inline int  NativeOfHandle(int handle) { return -(handle + kNativeHandleBase); }
+
 struct PickResult {
     const nfs::SolidObject* object = nullptr;
     Mat4        transform;
@@ -143,8 +153,13 @@ public:
     // or removed. Cheap: nothing is uploaded.
     void RebuildInstances(const nfs::World& world);
 
+    // Uploads these loaded sections again, after their models changed shape.
+    void ReuploadSections(const nfs::World& world, const std::vector<size_t>& loaded);
+
     // Moves one placement on screen without rebuilding anything, for dragging.
     void UpdatePlacement(u32 loadedSection, int placement, const Mat4& transform);
+    // The same for one of the map's own scenery instances, by its index.
+    void UpdateNative(u32 loadedSection, int native, const Mat4& transform);
 
     // Makes one placement the whole selection. False when it is not drawn.
     bool SelectPlacement(u32 loadedSection, int placement);
@@ -201,6 +216,11 @@ public:
     // freeway posts in a row -- and builds the city from scenery instances that
     // reference them. Drawing the library puts a depot of unrelated objects in
     // the middle of the map, so it is off unless someone wants to inspect it.
+    // Scenery smaller than this many pixels on screen is not drawn (0 draws
+    // everything). Most of a frame's draw calls are far lamp posts and signs.
+    void  SetDetailPixels(float pixels) { detailPixels_ = pixels; }
+    float DetailPixels() const { return detailPixels_; }
+
     bool LibraryVisible() const { return showLibrary_; }
     void SetLibraryVisible(bool visible) { showLibrary_ = visible; }
 
@@ -273,6 +293,8 @@ public:
 
     // Rebuilds the drawn collision of one loaded section after it was edited.
     void RefreshCollision(size_t loadedSection);
+    // One pack of it: what an edit costs, however many packs the section has.
+    void RefreshCollisionPack(size_t loadedSection, size_t pack);
 
     // Lines and triangles an editing tool draws over the world -- a wall
     // being drawn, the point under the cursor. In world space, with their
@@ -317,6 +339,11 @@ public:
     // Adds the hit, or removes it when the same placement is already in.
     // Returns true when it was added.
     bool ToggleSelection(const PickResult& selection);
+
+    // Selects every object of the map drawn with a model named as the first
+    // selected one is, in all the sections that are loaded. Returns how many
+    // that is; 0, and the selection as it was, when nothing is selected.
+    size_t SelectSameModel();
 
     void ClearSelection() {
         selection_.clear(); collisionSelection_.clear();
@@ -457,6 +484,10 @@ public:
     Aabb Bounds() const { return bounds_; }
 
     size_t ResidentTextures() const { return textures_.ResidentCount(); }
+
+    // Pixels changed under the uploaded textures: they are made again as they
+    // are next drawn. The selection and everything else stays.
+    void ReloadTextures() { textures_.Clear(); }
     size_t UnresolvedInstances() const { return unresolvedInstances_; }
     size_t DuplicateInstances() const { return duplicateInstances_; }
 
@@ -526,7 +557,8 @@ private:
     void DrawSelection(IDirect3DDevice9* device);
 
     // Draws the collision of the sections that passed this frame's culling.
-    void DrawCollision(IDirect3DDevice9* device, const std::vector<size_t>& visible);
+    void DrawCollision(IDirect3DDevice9* device, const std::vector<size_t>& visible,
+                       const Frustum* frustum);
     void DrawCollisionSelection(IDirect3DDevice9* device);
 
     void DrawGizmo(IDirect3DDevice9* device, const Camera& camera);
@@ -565,6 +597,7 @@ private:
     bool       showBackdrop_ = false;
     bool       showScenery_ = true;
     bool       showLibrary_ = false;
+    float      detailPixels_ = 0.0f;
     bool       showAlternate_ = false;
     bool       showCollision_ = false;
     bool       showRaceGroups_ = false;
@@ -637,6 +670,57 @@ private:
     Mat4        glView_, glProjection_;
     float       glFogValue_[4] = { 0, 0, 0, 0 };
     std::unordered_map<u32, u32> glSkyRemap_;   // sub_60F880 without time of day: sunrise -> night
+    // NFS World: the game's own effects from nfsw.exe, one per material effect id (GpuDraw::effectId),
+    // technique A (sun shadow map) and its unshadowed sibling, fed by name (GameLook.h GameEffect).
+    enum NfswFx : int { kFxWorld, kFxZBias, kFxNormal, kFxRoad, kFxPrelit, kFxZBiasPrelit, kFxGlass, kFxGlassNm,
+                        kFxTree, kFxSky, kFxWater, kFxCaster, kFxCount };
+    struct NfswShader {
+        gamelook::GameEffect fx;
+        IDirect3DVertexShader9* vs = nullptr;
+        IDirect3DPixelShader9*  ps = nullptr;
+        bool shadowed = false;   // samples shadow_sampler
+    };
+    std::array<NfswShader, kFxCount * 2> glFx_{};   // [fx * 2] unshadowed, [fx * 2 + 1] shadowed
+    std::unordered_map<std::string, std::array<float, 16>> glParams_;   // parameter values by name
+    bool        glNfsw_ = false;
+    IDirect3DVertexDeclaration9* glNfswDecl_ = nullptr;   // SolidVertex + COLOR1 (stream 1) + TANGENT (stream 2)
+    IDirect3DTexture9*           glBlack_ = nullptr;      // samplers with no source (spotlight off, MISCMAP1)
+    IDirect3DCubeTexture9*       glBlackCube_ = nullptr;  // ENVIROMAP_SAMPLER (no source found)
+    IDirect3DTexture9*           glFlatNormal_ = nullptr; // NORMALMAP_SAMPLER when the map is not found
+    int glDrawsById_[16] = {}, glDrawsCounted_ = 0, glMapCount_[2][2] = {};   // diagnostics, logged once
+    int glNoFogDraws_ = 0, glSelectorDraws_[16] = {}, glNoFogById_[16] = {};
+    std::vector<u32> glFlagSamples_;
+    IDirect3DVertexBuffer9*      glZeroColour_ = nullptr; // COLOR1 / TANGENT = 0 for meshes without them
+    gamelook::NfswLight glNfswLight_;
+    int  NfswEffectFor(const GpuObject& object, const GpuDraw& draw) const;
+    void SetNfswParam(const char* name, const float* value, int count);
+    void ApplyNfswShader(IDirect3DDevice9* device, const NfswShader& shader);
+    // NFS World sun shadow map (world_A): the depth texture shadow_sampler compares against.
+    IDirect3DTexture9*      glShadowDepth_ = nullptr;   // D24X8 depth texture
+    IDirect3DSurface9*      glShadowColour_ = nullptr;  // colour target of the same size (writes off)
+    Mat4        glShadowViewProj_;
+    bool        glShadowValid_ = false;     // drawn this frame
+    bool        glShadowFailed_ = false;
+    bool        glDrawingShadow_ = false;
+    void RenderShadowMapNfsw(IDirect3DDevice9* device, const Camera& camera);
+    // NFS World time of day: the eight-stage cycle of attributes.bin (timeofdaylighting / sunandsky,
+    // GameLookAttributes.h), a position 0..8 along it (stage floor(p) blended into the next by frac(p),
+    // as FUN_006EAC10 blends +0x4CC into the next with +0x4C4), and the sky dome its sunandsky names.
+    std::vector<gamelook::LightingStage> glStages_;
+    std::vector<gamelook::SunAndSkyStage> glSuns_;
+    float       glTimeOfDay_ = 2.5f;
+    bool        glShadowsOn_ = true;
+    bool        glFogOn_ = true;
+    u32         glNfswSkyHash_ = 0;
+    float       glSkyRotation_ = 0.0f;   // degrees
+    std::string glLightSource_;
+    void UpdateNfswLight();
+    void FillNfswParams();
+    void DrawGameLookControls();
+    Vec3        glEye_{};
+    bool EnsureGameLookNfsw(IDirect3DDevice9* device);
+    bool DrawObjectGameLookNfsw(IDirect3DDevice9* device, const GpuObject& object, RenderStats& stats, DrawPass pass);
+    void DrawGameLookMessage() const;
     bool EnsureGameLook(IDirect3DDevice9* device);
     void ReleaseGameLook();
     void BeginGameLook(IDirect3DDevice9* device, const Mat4& view, const Mat4& projection, bool mainView,

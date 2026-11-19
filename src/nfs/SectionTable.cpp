@@ -3,6 +3,7 @@
 #include <cstring>
 
 #include "core/Log.h"
+#include "nfs/GameFormat.h"
 
 #include <algorithm>
 
@@ -30,6 +31,16 @@ constexpr size_t kOffHash         = 0x30;
 // the editor shows the whole region.
 constexpr u32    kChunkSectionTableU1  = 0x00034107;
 constexpr size_t kSectionEntrySizeU1   = 56;
+
+// --- NFS World: 208 bytes per entry (measured on L5RA.BUN, 5789 entries) ------
+// The tag is up to eight characters; numbered sections (A..G, Z) are the file
+// STREAML5RA_<number>.BUN and the shared assets (U..Y) STREAML5RA_0x<hash>.BUN.
+constexpr size_t kWorldEntrySize   = 208;
+constexpr size_t kWorldOffNumber   = 0x08;
+constexpr size_t kWorldOffFileHash = 0x1C;
+constexpr size_t kWorldOffPosition = 0x28;
+constexpr size_t kWorldOffParts    = 0x5C;
+constexpr size_t kWorldOffSize     = 0x60;
 
 std::string DecodeName(u32 packed) {
     char text[5] = {};
@@ -64,6 +75,37 @@ bool SectionTable::Parse(ByteSpan bunFile) {
     if (table.empty()) {
         LOG_ERROR("section table (chunk %08X) not found", (unsigned)kChunkSectionTable);
         return false;
+    }
+
+    if (IsWorld()) {
+        const size_t worldCount = table.size / kWorldEntrySize;
+        sections_.reserve(worldCount);
+        for (size_t i = 0; i < worldCount; ++i) {
+            const ByteSpan entry = table.sub(i * kWorldEntrySize, kWorldEntrySize);
+
+            Section section;
+            section.tableEntryOffset = chunkDataOffset + i * kWorldEntrySize;
+            section.id         = entry.read<u32>(kOffName);
+            section.name       = std::string((const char*)entry.data,
+                                             ::strnlen((const char*)entry.data, 8));
+            section.number     = entry.read<u32>(kWorldOffNumber);
+            section.hash       = entry.read<u32>(kWorldOffFileHash);
+            section.streamSize = entry.read<u32>(kWorldOffSize);
+            section.streamParts = entry.read<u32>(kWorldOffParts);
+            section.geometrySize = section.streamSize;
+            section.position   = { entry.read<float>(kWorldOffPosition),
+                                   entry.read<float>(kWorldOffPosition + 4),
+                                   entry.read<float>(kWorldOffPosition + 8) };
+
+            wchar_t file[64];
+            if (section.hash) ::swprintf_s(file, L"STREAML5RA_0x%08X.BUN", section.hash);
+            else              ::swprintf_s(file, L"STREAML5RA_%u.BUN", section.number);
+            section.fileName = file;
+
+            sections_.push_back(std::move(section));
+        }
+        LOG_INFO("section table: %zu sections (NFS World)", sections_.size());
+        return !sections_.empty();
     }
 
     if (underground1) {
@@ -129,6 +171,7 @@ void SectionTable::SetPosition(size_t index, const Vec3& position) {
 }
 
 void SectionTable::ApplyBytes(u64 fileOffset, const u8* data, size_t size) {
+    if (IsWorld()) return;   // NFS World sections are files; nothing is repointed
     for (Section& section : sections_) {
         if (!section.tableEntryOffset) continue;
 

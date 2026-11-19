@@ -16,6 +16,8 @@ D3DFORMAT ToD3DFormat(nfs::TextureFormat format) {
         case nfs::TextureFormat::Dxt1:        return D3DFMT_DXT1;
         case nfs::TextureFormat::Dxt3:        return D3DFMT_DXT3;
         case nfs::TextureFormat::Dxt5:        return D3DFMT_DXT5;
+        case nfs::TextureFormat::Ati1:        return (D3DFORMAT)MAKEFOURCC('A', 'T', 'I', '1');
+        case nfs::TextureFormat::Ati2:        return (D3DFORMAT)MAKEFOURCC('A', 'T', 'I', '2');
         case nfs::TextureFormat::Palettised8: return D3DFMT_A8R8G8B8;
         case nfs::TextureFormat::Argb8888:    return D3DFMT_A8R8G8B8;
         default:                              return D3DFMT_UNKNOWN;
@@ -44,7 +46,7 @@ LevelLayout SourceLayout(nfs::TextureFormat format, u32 width, u32 height) {
         return layout;
     }
 
-    const u32 blockBytes = (format == nfs::TextureFormat::Dxt1) ? 8u : 16u;
+    const u32 blockBytes = (format == nfs::TextureFormat::Dxt1 || format == nfs::TextureFormat::Ati1) ? 8u : 16u;
     layout.rowBytes = std::max(1u, (width  + 3) / 4) * blockBytes;
     layout.rowCount = std::max(1u, (height + 3) / 4);
     return layout;
@@ -82,6 +84,8 @@ GpuSection::~GpuSection() {
 void GpuSection::Release() {
     if (vertexBuffer_) { vertexBuffer_->Release(); vertexBuffer_ = nullptr; }
     if (indexBuffer_)  { indexBuffer_->Release();  indexBuffer_  = nullptr; }
+    if (colour1Buffer_) { colour1Buffer_->Release(); colour1Buffer_ = nullptr; }
+    if (tangentBuffer_) { tangentBuffer_->Release(); tangentBuffer_ = nullptr; }
     objects_.clear();
     bounds_ = {};
     vertexCount_ = triangleCount_ = 0;
@@ -199,6 +203,13 @@ bool GpuSection::Upload(IDirect3DDevice9* device, const nfs::LoadedSection& sect
                 draw.textureHash    = material.textureIndex < object.textureHashes.size()
                                           ? object.textureHashes[material.textureIndex]
                                           : 0;
+                draw.effectId       = (u8)(material.flags & 0xFF);
+                auto slotHash = [&](int k) {
+                    return material.slots[k] < object.textureHashes.size() ? object.textureHashes[material.slots[k]] : 0u;
+                };
+                draw.normalHash     = slotHash(1);
+                draw.specularHash   = slotHash(3);
+                draw.materialFlags  = material.worldFlags;
                 gpuObject.draws.push_back(draw);
             }
 
@@ -215,6 +226,60 @@ bool GpuSection::Upload(IDirect3DDevice9* device, const nfs::LoadedSection& sect
     indexBuffer_->Unlock();
 
     vertexCount_ = vertexCursor;
+
+    // The second colours, when any mesh of the section has them (NFS World).
+    bool anyColour1 = false;
+    for (const GpuObject& object : objects_)
+        anyColour1 |= object.source && !object.source->colors1.empty() &&
+                      object.source->colors1.size() == object.source->vertices.size();
+    void* colourData = nullptr;
+    if (anyColour1 &&
+        SUCCEEDED(device->CreateVertexBuffer(vertexCursor * 4, D3DUSAGE_WRITEONLY, 0, D3DPOOL_MANAGED,
+                                             &colour1Buffer_, nullptr)) &&
+        SUCCEEDED(colour1Buffer_->Lock(0, 0, &colourData, 0))) {
+        auto* colours = (u32*)colourData;
+        for (GpuObject& object : objects_) {
+            const auto& source = object.source->colors1;
+            const size_t count = object.source->vertices.size();
+            if (source.size() == count) {
+                std::memcpy(colours + object.baseVertex, source.data(), count * 4);
+                object.colour1 = colour1Buffer_;
+            } else {
+                std::memset(colours + object.baseVertex, 0, count * 4);
+            }
+        }
+        colour1Buffer_->Unlock();
+    } else if (colour1Buffer_) {
+        colour1Buffer_->Release();
+        colour1Buffer_ = nullptr;
+    }
+
+    // The tangents of the normal-map meshes (NFS World), 8 bytes per vertex.
+    bool anyTangent = false;
+    for (const GpuObject& object : objects_)
+        anyTangent |= object.source && !object.source->tangents.empty() &&
+                      object.source->tangents.size() == object.source->vertices.size();
+    void* tangentData = nullptr;
+    if (anyTangent &&
+        SUCCEEDED(device->CreateVertexBuffer(vertexCursor * 8, D3DUSAGE_WRITEONLY, 0, D3DPOOL_MANAGED,
+                                             &tangentBuffer_, nullptr)) &&
+        SUCCEEDED(tangentBuffer_->Lock(0, 0, &tangentData, 0))) {
+        auto* tangents = (u8*)tangentData;
+        for (GpuObject& object : objects_) {
+            const auto& source = object.source->tangents;
+            const size_t count = object.source->vertices.size();
+            if (source.size() == count) {
+                std::memcpy(tangents + (size_t)object.baseVertex * 8, source.data(), count * 8);
+                object.tangent = tangentBuffer_;
+            } else {
+                std::memset(tangents + (size_t)object.baseVertex * 8, 0, count * 8);
+            }
+        }
+        tangentBuffer_->Unlock();
+    } else if (tangentBuffer_) {
+        tangentBuffer_->Release();
+        tangentBuffer_ = nullptr;
+    }
     return true;
 }
 
@@ -255,6 +320,13 @@ const CachedTexture& TextureCache::Get(IDirect3DDevice9* device, u32 hash) {
 
     CachedTexture created;
     const nfs::Texture* source = world_->FindDisplayTexture(hash);
+    // NFS World keeps a texture's larger levels apart from its pack, whose
+    // copy is small (128 pixels as a rule): the view draws the whole chain,
+    // so a texture looks as it does in the game from close by -- and a
+    // replaced one at the size of its image.
+    nfs::Texture full;
+    std::vector<u8> chain;
+    if (source && world_->FullTexture(hash, full, chain)) source = &full;
     if (!source && extra_) source = extra_(hash);
     if (source) {
         created.texture = Create(device, *source);

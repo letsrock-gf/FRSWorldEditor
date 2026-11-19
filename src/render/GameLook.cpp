@@ -1,4 +1,5 @@
 #include "render/GameLook.h"
+#include "render/GameLookAttributes.h"
 
 #include <windows.h>
 
@@ -6,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 
 namespace gamelook {
 
@@ -65,7 +67,7 @@ bool HasInstruction(const std::vector<uint32_t>& tokens, uint32_t opcode) {
 
 // Every vs_1_1 / ps_1_1 the effect resource holds (each stored after a dword with its byte count).
 bool ShadersOf(HMODULE module, const wchar_t* resource, std::vector<std::vector<uint32_t>>& vertex,
-               std::vector<std::vector<uint32_t>>& pixel) {
+               std::vector<std::vector<uint32_t>>& pixel, uint32_t vsVersion = kVs11, uint32_t psVersion = kPs11) {
     HRSRC info = ::FindResourceW(module, resource, MAKEINTRESOURCEW(10) /* RT_RCDATA */);
     if (!info) return false;
     const DWORD size = ::SizeofResource(module, info);
@@ -75,10 +77,10 @@ bool ShadersOf(HMODULE module, const wchar_t* resource, std::vector<std::vector<
     std::vector<uint32_t> tokens(size / 4);
     std::memcpy(tokens.data(), data, tokens.size() * 4);
     for (size_t i = 1; i < tokens.size(); ++i) {
-        if (tokens[i] != kVs11 && tokens[i] != kPs11) continue;
+        if (tokens[i] != vsVersion && tokens[i] != psVersion) continue;
         const size_t n = ShaderLength(tokens.data(), tokens.size(), i);
         if (n == 0 || tokens[i - 1] != n * 4) continue;
-        (tokens[i] == kVs11 ? vertex : pixel)
+        (tokens[i] == vsVersion ? vertex : pixel)
             .emplace_back(tokens.begin() + (std::ptrdiff_t)i, tokens.begin() + (std::ptrdiff_t)(i + n));
         i += n - 1;
     }
@@ -225,6 +227,299 @@ bool ExtractWorldEffects(const std::wstring& exePath, WorldEffects& out, std::st
     }
     ::FreeLibrary(module);
     return ok;
+}
+
+namespace {
+
+constexpr uint32_t kVs20 = 0xFFFE0200u;
+constexpr uint32_t kPs20 = 0xFFFF0200u;
+
+// Float and sampler registers by name from the shader's top-level CTAB comment (D3DXSHADER_CONSTANTTABLE,
+// D3DXSHADER_CONSTANTINFO entries of 20 bytes, offsets from the table start). The preshader's own CTAB
+// sits inside its PRES comment and is not read.
+std::unordered_map<std::string, int> ConstantTable(const std::vector<uint32_t>& tokens) {
+    std::unordered_map<std::string, int> out;
+    size_t i = 1;
+    while (i < tokens.size()) {
+        const uint32_t token = tokens[i];
+        if ((token & 0xFFFFu) != 0xFFFEu) break;   // comments come before the first instruction
+        const size_t words = token >> 16;
+        if (words >= 7 && i + 1 + words <= tokens.size() && tokens[i + 1] == 0x42415443u /* CTAB */) {
+            const uint8_t* table = reinterpret_cast<const uint8_t*>(&tokens[i + 2]);
+            const size_t size = (words - 1) * 4;
+            auto u32 = [&](size_t o) { uint32_t v = 0; if (o + 4 <= size) std::memcpy(&v, table + o, 4); return v; };
+            auto u16 = [&](size_t o) { uint16_t v = 0; if (o + 2 <= size) std::memcpy(&v, table + o, 2); return v; };
+            const uint32_t count = u32(12), info = u32(16);
+            for (uint32_t k = 0; k < count && k < 1024; ++k) {
+                const size_t entry = (size_t)info + k * 20;
+                if (entry + 20 > size) break;
+                const size_t name = u32(entry);
+                if (name >= size) continue;
+                const size_t end = ::strnlen(reinterpret_cast<const char*>(table + name), size - name);
+                const uint16_t set = u16(entry + 4);
+                if (set == 2 || set == 3)   // D3DXRS_FLOAT4, D3DXRS_SAMPLER
+                    out.emplace(std::string(reinterpret_cast<const char*>(table + name), end), (int)u16(entry + 6));
+            }
+            break;
+        }
+        i += 1 + words;
+    }
+    return out;
+}
+
+bool HasAll(const std::unordered_map<std::string, int>& table, std::initializer_list<const char*> names) {
+    for (const char* name : names)
+        if (!table.count(name)) return false;
+    return true;
+}
+
+} // namespace
+
+namespace {
+
+// A D3DXSHADER_CONSTANTTABLE body (after its fourcc): name -> register, count; float4 and sampler sets.
+void ReadConstantTable(const uint8_t* table, size_t size, std::unordered_map<std::string, ShaderProgram::Slot>& out) {
+    auto u32 = [&](size_t o) { uint32_t v = 0; if (o + 4 <= size) std::memcpy(&v, table + o, 4); return v; };
+    auto u16 = [&](size_t o) { uint16_t v = 0; if (o + 2 <= size) std::memcpy(&v, table + o, 2); return v; };
+    const uint32_t count = u32(12), info = u32(16);
+    for (uint32_t k = 0; k < count && k < 1024; ++k) {
+        const size_t entry = (size_t)info + k * 20;
+        if (entry + 20 > size) break;
+        const size_t name = u32(entry);
+        if (name >= size) continue;
+        const size_t end = ::strnlen(reinterpret_cast<const char*>(table + name), size - name);
+        const uint16_t set = u16(entry + 4);
+        if (set != 2 && set != 3) continue;   // D3DXRS_FLOAT4, D3DXRS_SAMPLER
+        ShaderProgram::Slot slot;
+        slot.reg = u16(entry + 6);
+        slot.count = (std::max)(1, (int)u16(entry + 8));
+        slot.sampler = set == 3;
+        out.emplace(std::string(reinterpret_cast<const char*>(table + name), end), slot);
+    }
+}
+
+} // namespace
+
+bool LoadShaderProgram(const std::vector<uint32_t>& code, ShaderProgram& out) {
+    out = ShaderProgram{};
+    out.code = code;
+    size_t i = 1;
+    while (i < code.size() && (code[i] & 0xFFFFu) == 0xFFFEu) {
+        const size_t words = code[i] >> 16;
+        if (i + 1 + words > code.size()) break;
+        const uint32_t* body = &code[i + 1];
+        if (words >= 1 && body[0] == 0x42415443u /* CTAB */) {
+            ReadConstantTable(reinterpret_cast<const uint8_t*>(body + 1), (words - 1) * 4, out.table);
+        } else if (words >= 2 && body[0] == 0x53455250u /* PRES */) {
+            size_t m = 2;
+            while (m < words) {
+                if ((body[m] & 0xFFFFu) != 0xFFFEu) { ++m; continue; }
+                const size_t n = body[m] >> 16;
+                if (m + 1 + n > words || n == 0) break;
+                const uint32_t* inner = body + m + 1;
+                const uint32_t tag = inner[0];
+                if (tag == 0x42415443u) {   // CTAB: the preshader's inputs
+                    std::unordered_map<std::string, ShaderProgram::Slot> inputs;
+                    ReadConstantTable(reinterpret_cast<const uint8_t*>(inner + 1), (n - 1) * 4, inputs);
+                    out.presInputs.assign(inputs.begin(), inputs.end());
+                } else if (tag == 0x54494C43u && n >= 2) {   // CLIT: count, doubles
+                    const size_t count = (std::min)((size_t)inner[1], (n - 2) / 2);
+                    out.presLiterals.resize(count);
+                    std::memcpy(out.presLiterals.data(), inner + 2, count * 8);
+                } else if (tag == 0x434C5846u && n >= 2) {   // FXLC: count, then instructions
+                    const uint32_t* p = inner + 2;
+                    const uint32_t* end = inner + n;
+                    for (uint32_t k = 0; k < inner[1] && p + 2 <= end; ++k) {
+                        ShaderProgram::Op op;
+                        op.opcode = (p[0] >> 20) & 0x7FFu;
+                        op.comps = p[0] & 0xFFFFu;
+                        op.scalar = (p[0] & 0x80000000u) != 0;
+                        const uint32_t args = p[1];
+                        p += 2;
+                        for (uint32_t a = 0; a <= args && p + 3 <= end; ++a) {
+                            if (p[0] != 0) { out.presValid = false; break; }   // relative addressing
+                            ShaderProgram::Arg arg{ p[1], p[2] };
+                            p += 3;
+                            (a < args ? op.in.push_back(arg), op.in.back() : op.out) = arg;
+                        }
+                        switch (op.opcode) {
+                            case 0x100: case 0x101: case 0x103: case 0x107: case 0x200: case 0x201: case 0x204:
+                            case 0x205: case 0x500: break;
+                            default: out.presValid = false; break;
+                        }
+                        out.presOps.push_back(std::move(op));
+                    }
+                }
+                m += 1 + n;
+            }
+        }
+        i += 1 + words;
+    }
+    return !out.code.empty();
+}
+
+namespace {
+
+// fx_2_0 (Wine d3dx9 effect.c): tag 0xFEFF0901, offset; the parameter section at 8 + offset holds
+// parameter count, technique count, a dword, object count, then per parameter {typedef offset, value
+// offset, flags, annotation count} and annotation pairs; offsets count from byte 8. A typedef starts
+// {type, class, name offset, semantic offset, elements} and, for scalar / vector / matrix classes,
+// {columns, rows}. Strings are {length, characters}.
+void ReadEffectDefaults(const uint8_t* data, size_t size, std::unordered_map<std::string, std::vector<float>>& out) {
+    auto u32 = [&](size_t o) { uint32_t v = 0; if (o + 4 <= size) std::memcpy(&v, data + o, 4); return v; };
+    if (size < 24 || u32(0) != 0xFEFF0901u) return;
+    const size_t base = 8;
+    size_t p = base + u32(4);
+    const uint32_t count = u32(p);
+    p += 16;
+    auto text = [&](uint32_t at) -> std::string {
+        const size_t o = base + at;
+        const uint32_t n = u32(o);
+        if (!at || o + 4 + n > size) return {};
+        return std::string(reinterpret_cast<const char*>(data + o + 4), ::strnlen(reinterpret_cast<const char*>(data + o + 4), n));
+    };
+    for (uint32_t i = 0; i < count && i < 1024 && p + 16 <= size; ++i) {
+        const uint32_t typedefAt = u32(p), valueAt = u32(p + 4), annotations = u32(p + 12);
+        p += 16 + 8ull * annotations;
+        const size_t t = base + typedefAt;
+        const uint32_t type = u32(t), cls = u32(t + 4), elements = u32(t + 16);
+        if (type != 3 || cls > 3) continue;   // floats: scalar, vector, matrix rows / columns
+        const uint32_t n = u32(t + 20) * u32(t + 24) * (std::max)(1u, elements);
+        if (n == 0 || n > 1024 || base + valueAt + 4ull * n > size) continue;
+        std::vector<float> values(n);
+        std::memcpy(values.data(), data + base + valueAt, 4ull * n);
+        out[text(u32(t + 8))] = std::move(values);
+    }
+}
+
+} // namespace
+
+bool ExtractGameEffect(const std::wstring& exePath, const wchar_t* resource, size_t vsDwords, size_t psDwords,
+                       const char* name, GameEffect& out, std::string& error) {
+    out = GameEffect{};
+    out.name = name;
+    HMODULE module = ::LoadLibraryExW(exePath.c_str(), nullptr, LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+    if (!module) { error = "cannot open nfsw.exe"; return false; }
+    std::vector<std::vector<uint32_t>> vs, ps;
+    bool found = ShadersOf(module, resource, vs, ps, kVs20, kPs20);
+    found |= ShadersOf(module, resource, vs, ps, 0xFFFE0300u, 0xFFFF0300u);   // vs_3_0 / ps_3_0 (road_3_0_A)
+    if (HRSRC info = ::FindResourceW(module, resource, MAKEINTRESOURCEW(10))) {
+        HGLOBAL handle = ::LoadResource(module, info);
+        if (const void* bytes = handle ? ::LockResource(handle) : nullptr)
+            ReadEffectDefaults(static_cast<const uint8_t*>(bytes), ::SizeofResource(module, info), out.defaults);
+    }
+    ::FreeLibrary(module);
+    std::vector<uint32_t> v, p;
+    if (!found || !Pick(vs, [&](const std::vector<uint32_t>& s) { return s.size() == vsDwords; }, v) ||
+        !Pick(ps, [&](const std::vector<uint32_t>& s) { return s.size() == psDwords; }, p)) {
+        error = std::string(name) + ": no vs " + std::to_string(vsDwords) + " / ps " + std::to_string(psDwords) +
+                " dwords in its resource";
+        return false;
+    }
+    LoadShaderProgram(v, out.vs);
+    LoadShaderProgram(p, out.ps);
+    if (!out.vs.presValid || !out.ps.presValid) {
+        error = std::string(name) + ": preshader with an op this reader does not run";
+        out = GameEffect{};
+        return false;
+    }
+    return true;
+}
+
+NfswLight ComputeNfswLight(const LightingStage& from, const LightingStage& to, float t, const SunAndSkyStage* sunFrom,
+                           const SunAndSkyStage* sunTo, std::string& source) {
+    // rea-lighting-fog.md: FUN_006D40A0 loads timeofdaylighting, FUN_006E3D50 sunandsky, FUN_006E30E0 lerps
+    // every field linearly, FUN_007A2EF0 / FUN_0063AD40 / FUN_007AF370 set the world constants.
+    NfswLight light;
+    auto lerp = [t](float a, float b) { return a + (b - a) * t; };
+    auto field = [&](const LightingStage& stage, u32 hash, size_t i = 0) {
+        const auto it = stage.fields.find(hash);
+        return it != stage.fields.end() && i < it->second.size() ? it->second[i] : 0.0f;
+    };
+    auto both = [&](u32 hash, size_t i = 0) { return lerp(field(from, hash, i), field(to, hash, i)); };
+    for (int k = 0; k < 4; ++k) {
+        light.diffuse[k] = 2.0f * lerp(from.diffuse[k], to.diffuse[k]);   // L+0x00 = 2 x DiffuseColour
+        light.ambient[k] = k < 3 ? lerp(from.ambient[k], to.ambient[k]) : 4.0f;   // L+0x10, w = 4
+        light.specular[k] = lerp(from.specular[k], to.specular[k]);
+        light.specular2[k] = both(VltHash("SpecularColour2"), (size_t)k);
+        light.light2Dir[k] = both(0x707F1B6Cu, (size_t)k);
+    }
+    light.specularPower = both(VltHash("SpecularPower"));
+    light.specularPower2 = both(VltHash("SpecularPower2"));
+    light.todSelector7 = both(0x507AFAFCu);
+    light.todSelector8 = both(VltHash("ChristmasLights"));
+    // Sun: (cos A sin Z, sin A sin Z, cos Z), A = 0xD4496F5F, Z = 0x78E76168 degrees; lerped, normalised.
+    auto sunDirection = [](const SunAndSkyStage* sun, float out[3]) {
+        if (!sun) return false;
+        const auto az = sun->angles.find(0xD4496F5Fu), ze = sun->angles.find(0x78E76168u);
+        if (az == sun->angles.end() || ze == sun->angles.end()) return false;
+        const float d2r = 3.14159265f / 180.0f;
+        out[0] = std::cos(az->second * d2r) * std::sin(ze->second * d2r);
+        out[1] = std::sin(az->second * d2r) * std::sin(ze->second * d2r);
+        out[2] = std::cos(ze->second * d2r);
+        return true;
+    };
+    // The shadow map's light, the second vector (L+0x120): same formula with 0xACB78DC4 / 0xA480C321.
+    auto vectorOf = [](const SunAndSkyStage* stage, u32 azimuth, u32 zenith, float out[3]) {
+        if (!stage) return false;
+        const auto az = stage->angles.find(azimuth), ze = stage->angles.find(zenith);
+        if (az == stage->angles.end() || ze == stage->angles.end()) return false;
+        const float d2r = 3.14159265f / 180.0f;
+        out[0] = std::cos(az->second * d2r) * std::sin(ze->second * d2r);
+        out[1] = std::sin(az->second * d2r) * std::sin(ze->second * d2r);
+        out[2] = std::cos(ze->second * d2r);
+        return true;
+    };
+    float sa[3], sb[3];
+    if (vectorOf(sunFrom, 0xACB78DC4u, 0xA480C321u, sa) && vectorOf(sunTo, 0xACB78DC4u, 0xA480C321u, sb)) {
+        float n = 0.0f;
+        for (int k = 0; k < 3; ++k) { light.shadowVec[k] = lerp(sa[k], sb[k]); n += light.shadowVec[k] * light.shadowVec[k]; }
+        n = std::sqrt(n);
+        if (n > 1e-6f)
+            for (int k = 0; k < 3; ++k) light.shadowVec[k] /= n;
+    }
+    float a[3], b[3];
+    const bool sun = sunDirection(sunFrom, a) && sunDirection(sunTo, b);
+    if (sun) {
+        for (int k = 0; k < 3; ++k) light.lightVec[k] = lerp(a[k], b[k]);
+        const float length = std::sqrt(light.lightVec[0] * light.lightVec[0] + light.lightVec[1] * light.lightVec[1] +
+                                       light.lightVec[2] * light.lightVec[2]);
+        if (length > 1e-6f)
+            for (int k = 0; k < 3; ++k) light.lightVec[k] /= length;
+        light.lightVec[3] = 0.0f;
+    }
+    // cvTimeOfDayParams0 = (1 for the world selectors 0..6, 0x76E6BE76, 0xCCF24433 headlights, 0x13208780);
+    // cvTimeOfDayParams1 = (0xDD4C2632, 2 x 0x4454FC3B) with the ramp k ([0xC84F48]) at 0.
+    light.timeOfDay0[0] = 1.0f;
+    light.timeOfDay0[1] = both(0x76E6BE76u);
+    light.timeOfDay0[2] = both(0xCCF24433u);
+    light.timeOfDay0[3] = both(0x13208780u);
+    light.timeOfDay1[0] = both(0xDD4C2632u);
+    light.timeOfDay1[1] = 2.0f * both(0x4454FC3Bu);
+    light.timeOfDay1[2] = light.timeOfDay1[3] = 0.0f;
+    // Scattering fog (FUN_007AF370).
+    const float skyScale = lerp(from.fogSkyScale, to.fogSkyScale), hazeScale = lerp(from.fogHazeScale, to.fogHazeScale);
+    const float sR = skyScale * 0.01f * 0.0099f + 1e-4f;
+    const float sM = hazeScale > 0.0f ? hazeScale * 0.01f * 0.0099f + 1e-4f : 0.0f;
+    const float pi = 3.14159265f;
+    for (int k = 0; k < 3; ++k) {
+        const float br = lerp(from.fogSky[k], to.fogSky[k]) * sR;
+        const float bm = (1.0f - lerp(from.fogHaze[k], to.fogHaze[k])) * sM;
+        light.fogBrPlusBm[k] = br + bm;
+        light.fogOneOverBrBm[k] = br + bm > 0.0f ? 1.0f / (br + bm) : 0.0f;
+        light.fogConst1[k] = br * 3.0f / (16.0f * pi);
+        light.fogConst2[k] = bm / (4.0f * pi);
+    }
+    const float g = lerp(from.fogSunFalloff, to.fogSunFalloff);
+    light.fogConst3[0] = (1.0f - g) * (1.0f - g);
+    light.fogConst3[1] = 1.0f + g * g;
+    light.fogConst3[2] = -2.0f * g;
+    light.fogConst3[3] = lerp(from.fogInLightScatter, to.fogInLightScatter);
+    light.fogValueMW[0] = lerp(from.fogDistanceScale, to.fogDistanceScale);
+    light.fogEnable[0] = 1.0f;   // the captured frame's cfFogEnable; its writer is not found
+    light.shadowStrength = lerp(from.shadowStrength, to.shadowStrength);
+    source = std::string("attributes.bin ") + from.name + " -> " + to.name + (sun ? "" : " (no sunandsky angles)");
+    return light;
 }
 
 std::vector<std::string> Disassemble(const std::vector<uint32_t>& tokens) {
