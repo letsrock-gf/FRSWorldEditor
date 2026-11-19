@@ -94,8 +94,10 @@ section against the section table of `L5RA.BUN`.
 ## What was checked where
 
 - **Scripted checks.** Each kind of edit above has a `test_*.ps1` /
-  `verify_*.py` pair. On 17 Nov 2026 a real edit list was replayed (2473 edits,
-  466 sections written) and `verify_table.py` passed for all 466.
+  `verify_*.py` pair. After the merge of 0.2.7 (19 Nov 2026) a real edit list
+  was replayed: 1877 edits, 469 sections written. Every one of the 470 files
+  came out byte for byte as the build before the merge had written them, and
+  `verify_table.py` found an entry for all 469 sections.
 - **In game.** Reported by the user who drives the tests: ground collision
   added in the editor (a speed bump) is driven over without bouncing.
 - **Not confirmed in game, item by item:** placed objects and their physics,
@@ -125,8 +127,11 @@ size of the entry, and `verify_table.py` checks it.
   that the polygon is left out of the save and the status bar counts it.
 - **Culling tree:** the game walks it with a 64-entry stack. A save that would
   pass it is refused, and the message names the section and the object.
-- **Fast test** relies on `editor-fast-test.asi` to skip the title and the
-  driver select. That ASI is not in this repository.
+- **Fast test** needs `editor-fast-test.asi` in the game's `scripts` folder:
+  it passes the title and the driver select by code and puts the car at the
+  editor's camera. The editor leaves it a request file on every launch. That
+  ASI is not in this repository, and without it the game starts the usual way.
+  The game's own loading screens are never skipped.
 - **Game look and sky** on NFS World were not compared with the game.
 - **Underground and Underground 2** were not run after the port's changes or
   after the merge of 0.2.7: there was no copy of those games on the machine.

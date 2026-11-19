@@ -360,7 +360,7 @@ IDD_SETUP_FOLDER DIALOGEX 0, 0, 300, 170
 STYLE DS_SETFONT | WS_CHILD | WS_DISABLED | WS_CAPTION
 FONT 9, "Segoe UI", 400, 0, 1
 BEGIN
-    LTEXT           "FRS World Editor works with these Need for Speed games. Show it where yours are: each one is optional. Only Need for Speed World has its map files written by Save; the shipped ones are kept.",
+    LTEXT           "Show the editor where your Need for Speed games are: each one is optional. Nothing in a game is changed, except Need for Speed World's map files when you save.",
                     -1, 0, 0, 300, 18
     LTEXT           "Need for Speed &Underground 2", -1, 0, 19, 236, 9
     EDITTEXT        IDC_SETUP_PATH, 0, 29, 236, 14, ES_AUTOHSCROLL

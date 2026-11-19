@@ -75,7 +75,8 @@ def check(ok, text):
     print(("ok   " if ok else "FAIL ") + text)
 
 
-check(len(new) == len(old), "table keeps its size")
+# The file grows by the ids of the physical props placed (chunk 0x34108, io/WorldPlace.h); it never shrinks.
+check(len(new) >= len(old), "table file is not smaller than the shipped one (+%d bytes)" % (len(new) - len(old)))
 start, count = table(old)
 written = {n.upper() for n in os.listdir(out) if n.upper().startswith("STREAML5RA_")}
 seen = 0

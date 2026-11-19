@@ -2081,9 +2081,9 @@ bool MainWindow::WriteLaunchPose(const std::wstring& path) {
 // NFS World: no plugin to switch on and no embedded window. The edits are
 // saved into the game's files, the pose goes where editor-fast-test.asi reads
 // it once the car is in free roam, and the game starts through the project's
-// offline launcher (scripts\launch-offline.cjs beside the game folder).
-// ponytail: the menus (title, persona) are not skipped; the car moves once the
-// player reaches free roam.
+// offline launcher (scripts\launch-offline.cjs beside the game folder). The
+// ASI passes the title and the driver select by code whenever the request
+// file is there, so one is always left: the pose, or "menus" without it.
 void MainWindow::LaunchWorldGame() {
     const std::wstring posePath = gameFolder_ + L"\\scripts\\editor-fast-test.txt";
 
@@ -2133,6 +2133,17 @@ void MainWindow::LaunchWorldGame() {
 
     SaveWorld();
     const bool posed = WriteLaunchPose(posePath);
+    if (!posed) {
+        // No ground under the camera. Without a request the ASI hooks nothing and
+        // the game starts as it always does, title and driver select included.
+        ::CreateDirectoryW((gameFolder_ + L"\\scripts").c_str(), nullptr);
+        FILE* file = nullptr;
+        if (::_wfopen_s(&file, posePath.c_str(), L"wt") == 0 && file) {
+            std::fputs("menus\n", file);
+            std::fclose(file);
+            LOG_INFO("launch: no pose, menus-only request -> %S", posePath.c_str());
+        }
+    }
 
     // Its own console, minimised: the launcher keeps the offline server up
     // while the game runs and prints why when it cannot start it.
