@@ -7,6 +7,13 @@
 
 # FRS World Editor
 
+> **This is a fork: the Need for Speed World port** of
+> [chrystianfarias/FRSWorldEditor](https://github.com/chrystianfarias/FRSWorldEditor),
+> on the branch `nfsw-port`, based on upstream 0.2.1. It opens Palmont and writes
+> edits into NFS World's own map files. What changed, what was tested and what
+> does not work yet: **[NFSW-PORT.md](NFSW-PORT.md)**. The rest of this page is
+> upstream's.
+
 An open-source world editor for the **Black Box Need for Speed games** --
 Underground, Underground 2, Most Wanted, Carbon and ProStreet
 
