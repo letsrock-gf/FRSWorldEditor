@@ -65,6 +65,14 @@ void PlanSectionSpans(const nfs::World& world, const nfs::Section& section,
                       std::vector<u8> bytes, const std::vector<SpanOverlayInfo>& existing,
                       const std::string& label, SectionSpanPlan& out);
 
+// Spans of the stream that share bytes -- written before PlanSectionSpans
+// tested whole ranges, a section that grew in place could run into the home
+// of a neighbour that came back to it later -- each moved past the end of
+// everything, with its section's table entry corrected. The game crashes
+// reading such a section. Returns how many spans moved; the region must be
+// opened again for the editor to see them where they now are.
+size_t RepairOverlappingSpans(const nfs::World& world, const std::wstring& modelsFolder);
+
 // Writes the spans, then removes the ones they supersede -- in that order, so
 // a failure part way leaves the old edit in force rather than none. Returns
 // how many were written.

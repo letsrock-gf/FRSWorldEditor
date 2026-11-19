@@ -553,6 +553,37 @@ void BuildStretch(const RoadProfile& p, const std::vector<Station>& stations, si
             }
             // A guardrail ends where the wall has mostly lowered away.
             if (taper.WallClosed(side, s0.distance) > 0.5f || taper.WallClosed(side, s1.distance) > 0.5f) continue;
+            if (p.wallStyle == 3) {
+                // The game's highway wall (TRN_CS_PROPSA/PROPSB_..._CHOP_R11):
+                // a concrete jersey barrier at the road's edge and a wavy panel
+                // standing on it, 1 m deep, capped by a beam. The profile is the
+                // game's own, measured from its mesh: across (outwards from the
+                // road's edge) and up from the road or sidewalk, with its
+                // texture u at each point; the textures run 39.6 m a repeat
+                // along the wall, as there.
+                struct Face { float x0, h0, u0, x1, h1, u1; const char* texture; };
+                static const Face faces[] = {
+                    { 0.00f, 0.00f, 0.0f, 0.13f, 0.99f, 1.0f, "ARC_BARRIERTYPEFWY_WH" },   // barrier, road side
+                    { 0.13f, 0.99f, 0.0f, 0.49f, 0.94f, 1.0f, "ARC_BARRIERTYPEFWY_WH" },   // barrier top
+                    { 0.49f, 0.94f, 2.0f, 0.56f, 3.91f, 3.0f, "ARC_FWY_WALL_A" },          // panel, road side
+                    { 0.56f, 3.91f, 2.0f, 1.55f, 3.89f, 1.0f, "ARC_A_CROSSBEAM_GR" },      // the cap
+                    { 1.55f, 3.89f, 1.0f, 1.49f, -0.30f, -0.42f, "ARC_FWY_WALL_A" },       // panel, outside, into the ground
+                };
+                const float w0 = s0.distance / 39.6f, w1 = s1.distance / 39.6f;
+                const Vec3 outward0 = s0.right * (float)side, outward1 = s1.right * (float)side;
+                for (const Face& f : faces) {
+                    MeshGroup& fg = piece.Group(f.texture);
+                    const float dx = f.x1 - f.x0, dh = f.h1 - f.h0;
+                    const float len = std::max(1e-4f, std::sqrt(dx * dx + dh * dh));
+                    const Vec3 n0 = (outward0 * -dh + up * dx) * (1.0f / len);
+                    const Vec3 n1 = (outward1 * -dh + up * dx) * (1.0f / len);
+                    AddQuad(fg, Vertex(at(s0, x + f.x0 * side, base0 + f.h0), n0, f.u0, w0, color),
+                            Vertex(at(s0, x + f.x1 * side, base0 + f.h1), n0, f.u1, w0, color),
+                            Vertex(at(s1, x + f.x1 * side, base1 + f.h1), n1, f.u1, w1, color),
+                            Vertex(at(s1, x + f.x0 * side, base1 + f.h0), n1, f.u0, w1, color), n0);
+                }
+                continue;
+            }
             (void)base;
             // A guardrail: a W-shaped steel beam, its profile scaled to the
             // wall height, on posts every two units.
@@ -601,11 +632,27 @@ void BuildStretch(const RoadProfile& p, const std::vector<Station>& stations, si
         for (size_t i : picks) line.push_back(at(stations[i], lateral, height));
         return line;
     };
-    CollisionStrip road;
-    road.left = edge(-half, 0.0f);
-    road.right = edge(half, 0.0f);
-    road.surface = kSurfaceRoad;
-    piece.strips.push_back(road);
+    // The road, split along its lane lines (shoulders, lanes, median) as the
+    // game's own road collision is, so no polygon spans the whole width.
+    {
+        std::vector<float> lines{ -half };
+        const auto add = [&](float x) {
+            if (x > lines.back() + 0.25f && x < half - 0.25f) lines.push_back(x);
+        };
+        float x = -half + p.ShoulderAt(-1);
+        add(x);
+        for (int k = 0; k < p.lanesBackward; ++k) add(x += lane);
+        if (median > 0.01f) add(x += median);
+        for (int k = 0; k < p.lanesForward; ++k) add(x += lane);
+        lines.push_back(half);
+        for (size_t k = 0; k + 1 < lines.size(); ++k) {
+            CollisionStrip road;
+            road.left = edge(lines[k], 0.0f);
+            road.right = edge(lines[k + 1], 0.0f);
+            road.surface = kSurfaceRoad;
+            piece.strips.push_back(road);
+        }
+    }
     for (int side = -1; side <= 1; side += 2) {
         if (!p.Walk(side)) continue;
         // Its height where it sinks away towards a road without one.
@@ -638,9 +685,13 @@ void BuildStretch(const RoadProfile& p, const std::vector<Station>& stations, si
     }
     for (int side = -1; side <= 1; side += 2) {
         if (!p.Wall(side) || p.wallHeight < 0.05f) continue;
-        // In runs, leaving out where the wall is (see StretchTaper).
+        // In runs, leaving out where the wall is (see StretchTaper). A solid
+        // wall of the wall's own height that follows the road up and down, as
+        // the game's guardrails are -- not a barrier, which has no height and
+        // throws a car back onto the road instead of stopping it.
         CollisionWall wall;
-        wall.barrier = true;
+        wall.barrier = false;
+        wall.height = p.wallStyle == 3 ? 3.9f : std::max(1.0f, p.wallHeight);
         for (size_t i : picks) {
             const float d = stations[i].distance;
             if (!taper.WallAt(side, d, d) || taper.WallClosed(side, d) > 0.6f) {
@@ -676,12 +727,22 @@ void BuildStretch(const RoadProfile& p, const std::vector<Station>& stations, si
             };
             const float h = p.medianType == 4 ? std::max(0.3f, p.medianHeight) : p.medianHeight;
             if (p.medianType == 4) {
+                // Solid walls that follow the road's rise and fall, a metre
+                // above the barrier's top: one only as tall as the barrier is
+                // climbed by the game's cars. Its top is ground, for a car
+                // that lands on it.
                 for (float x : { medianLeft, medianLeft + median }) {
                     CollisionWall barrier;
                     barrier.points = line(x, 0.0f);
-                    barrier.barrier = true;
+                    barrier.barrier = false;
+                    barrier.height = h + 1.0f;
                     piece.walls.push_back(barrier);
                 }
+                CollisionStrip top;
+                top.left = line(medianLeft, h);
+                top.right = line(medianLeft + median, h);
+                top.surface = kSurfaceSidewalk;
+                piece.strips.push_back(top);
                 continue;
             }
             CollisionStrip top;
@@ -1301,6 +1362,206 @@ void PlaceCatsEyes(const RoadProfile& p, const std::vector<Station>& stations, c
     }
 }
 
+// The cross-section of a tunnel, left to right over the road: (lateral,
+// height) points of its inside, with how far round from the left foot each
+// is and whether the stretch up to it is wall (else roof).
+struct TunnelRing {
+    std::vector<Vec2> points;      // x lateral, y height over the road
+    std::vector<float> around;
+    std::vector<bool> wall;
+};
+
+TunnelRing TunnelSection(const RoadProfile& p, float half) {
+    TunnelRing ring;
+    const float height = std::max(3.0f, p.tunnelHeight);
+    if (p.tunnelShape == 1) {
+        ring.points = { { -half, -0.2f }, { -half, height }, { half, height }, { half, -0.2f } };
+        ring.wall = { false, true, false, true };
+    } else {
+        // Straight walls up to the springing, then a half ellipse.
+        const float spring = std::min(height * 0.55f, height - 1.0f);
+        ring.points.push_back({ -half, -0.2f });
+        ring.wall.push_back(false);
+        ring.points.push_back({ -half, spring });
+        ring.wall.push_back(true);
+        const int arc = 10;
+        for (int k = 1; k < arc; ++k) {
+            const float a = 3.14159265f * (1.0f - (float)k / arc);
+            ring.points.push_back({ half * std::cos(a), spring + (height - spring) * std::sin(a) });
+            ring.wall.push_back(false);
+        }
+        ring.points.push_back({ half, spring });
+        ring.wall.push_back(false);
+        ring.points.push_back({ half, -0.2f });
+        ring.wall.push_back(true);
+    }
+    ring.around.push_back(0.0f);
+    for (size_t k = 1; k < ring.points.size(); ++k) {
+        const Vec2 d{ ring.points[k].x - ring.points[k - 1].x, ring.points[k].y - ring.points[k - 1].y };
+        ring.around.push_back(ring.around.back() + std::sqrt(d.x * d.x + d.y * d.y));
+    }
+    return ring;
+}
+
+// A tunnel round a road: its walls and roof seen from inside, a portal of
+// concrete at each open end, and lights along the roof (street lights with no
+// post: they light the road and the walls, and get a flare at the bake).
+void BuildTunnel(const Segment& s, const std::vector<Station>& stations, bool portalA, bool portalB,
+                 MeshPiece& piece, std::vector<Pole>& poles) {
+    const RoadProfile& p = s.profile;
+    if (stations.size() < 2) return;
+    const float half = std::max(p.Edge(-1), p.Edge(1)) + std::max(0.3f, p.wallThickness);
+    const TunnelRing ring = TunnelSection(p, half);
+    const size_t n = ring.points.size();
+    const float height = std::max(3.0f, p.tunnelHeight);
+    // By name each time: a new group can move the others (a vector).
+    const std::string textures[2] = { p.tunnelWall.empty() ? "ARC_CONCRETE_LIGHT2" : p.tunnelWall,
+                                      p.tunnelRoof.empty() ? "ARC_CONCRETEA_VK" : p.tunnelRoof };
+    // The wall's texture runs once from its top (the lit panel) to its foot.
+    float wallTop = height;
+    for (size_t k = 1; k < n; ++k)
+        if (ring.wall[k]) wallTop = std::max(ring.points[k].y, ring.points[k - 1].y);
+    const float wallSpan = std::max(1.0f, wallTop + 0.2f);
+    const float centreLine = s.Offset();
+    (void)centreLine;
+    // Each stretch of the ring a strip of its own texture along the road.
+    for (size_t k = 1; k < n; ++k) {
+        MeshGroup& g = piece.Group(textures[ring.wall[k] ? 0 : 1]);
+        const u32 base = (u32)g.vertices.size();
+        const Vec2 a = ring.points[k - 1], b = ring.points[k];
+        for (const Station& st : stations) {
+            const Vec3 pa = st.At(a.x, a.y), pb = st.At(b.x, b.y);
+            // Inwards: towards the road's middle at mid height.
+            const Vec3 mid = st.At(0.0f, height * 0.5f);
+            Vec3 normal = Normalize(mid - (pa + pb) * 0.5f);
+            for (int e = 0; e < 2; ++e) {
+                MeshVertex v;
+                v.position = e ? pb : pa;
+                v.normal = normal;
+                if (ring.wall[k]) {
+                    const float y = e ? b.y : a.y;
+                    v.uv = { st.distance / (wallSpan * 0.5f), (wallTop - y) / wallSpan };
+                } else {
+                    v.uv = { st.distance / 8.0f, -(e ? ring.around[k] : ring.around[k - 1]) / 8.0f };
+                }
+                g.vertices.push_back(v);
+            }
+        }
+        for (size_t i = 0; i + 1 < stations.size(); ++i) {
+            const u32 a0 = base + (u32)i * 2, b0 = a0 + 1, a1 = a0 + 2, b1 = a0 + 3;
+            // Seen from inside: the side facing the middle.
+            const Vec3 face = Cross(g.vertices[b0].position - g.vertices[a0].position,
+                                    g.vertices[a1].position - g.vertices[a0].position);
+            if (Dot(face, g.vertices[a0].normal) >= 0.0f) g.indices.insert(g.indices.end(), { a0, b0, a1, b0, b1, a1 });
+            else g.indices.insert(g.indices.end(), { a0, a1, b0, b0, a1, b1 });
+        }
+    }
+
+    // The outside: the same ring grown by the wall's thickness, facing out,
+    // for where the tunnel stands clear of the hill.
+    {
+        // As big as the portal's border: the portal is the shell's end.
+        const float kShell = std::max(0.6f, p.tunnelPortalSize);
+        MeshGroup& shell = piece.Group(p.tunnelPortal.empty() ? "ARC_A51CONCRETE2" : p.tunnelPortal);
+        std::vector<Vec2> grown;
+        for (const Vec2& q : ring.points)
+            grown.push_back({ q.x * (half + kShell) / half, q.y <= 0.0f ? q.y - 1.5f : q.y * (height + kShell) / height });
+        for (size_t k = 1; k < n; ++k) {
+            const u32 base = (u32)shell.vertices.size();
+            const Vec2 a = grown[k - 1], b = grown[k];
+            for (const Station& st : stations) {
+                const Vec3 pa = st.At(a.x, a.y), pb = st.At(b.x, b.y);
+                const Vec3 mid = st.At(0.0f, height * 0.5f);
+                const Vec3 normal = Normalize((pa + pb) * 0.5f - mid);
+                for (int e = 0; e < 2; ++e) {
+                    MeshVertex v;
+                    v.position = e ? pb : pa;
+                    v.normal = normal;
+                    v.uv = { st.distance / 8.0f, -(e ? ring.around[k] : ring.around[k - 1]) / 8.0f };
+                    shell.vertices.push_back(v);
+                }
+            }
+            for (size_t i = 0; i + 1 < stations.size(); ++i) {
+                const u32 a0 = base + (u32)i * 2, b0 = a0 + 1, a1 = a0 + 2, b1 = a0 + 3;
+                const Vec3 face = Cross(shell.vertices[b0].position - shell.vertices[a0].position,
+                                        shell.vertices[a1].position - shell.vertices[a0].position);
+                if (Dot(face, shell.vertices[a0].normal) >= 0.0f)
+                    shell.indices.insert(shell.indices.end(), { a0, b0, a1, b0, b1, a1 });
+                else shell.indices.insert(shell.indices.end(), { a0, a1, b0, b0, a1, b1 });
+            }
+        }
+    }
+
+    // Portals: a face of concrete round each open end, the opening's ring
+    // pushed outwards, facing out of the tunnel.
+    MeshGroup& portal = piece.Group(p.tunnelPortal.empty() ? "ARC_A51CONCRETE2" : p.tunnelPortal);
+    for (int end = 0; end < 2; ++end) {
+        if (!(end ? portalB : portalA)) continue;
+        const Station& st = end ? stations.back() : stations.front();
+        const Vec3 out = end ? st.forward : st.forward * -1.0f;
+        const float grow = std::max(0.6f, p.tunnelPortalSize);
+        const u32 base = (u32)portal.vertices.size();
+        for (size_t k = 0; k < n; ++k) {
+            const Vec2 q = ring.points[k];
+            const float sx = (half + grow) / half, sy = (height + grow) / height;
+            const Vec2 o{ q.x * sx, q.y <= 0.0f ? q.y - 1.5f : q.y * sy };
+            for (int e = 0; e < 2; ++e) {
+                const Vec2 c = e ? o : Vec2{ q.x, q.y <= 0.0f ? q.y - 1.5f : q.y };
+                MeshVertex v;
+                v.position = st.At(c.x, c.y) + out * 0.05f;
+                v.normal = out;
+                v.uv = { c.x / 6.0f, -c.y / 6.0f };
+                portal.vertices.push_back(v);
+            }
+        }
+        for (size_t k = 0; k + 1 < n; ++k) {
+            const u32 a0 = base + (u32)k * 2, b0 = a0 + 1, a1 = a0 + 2, b1 = a0 + 3;
+            const Vec3 face = Cross(portal.vertices[b0].position - portal.vertices[a0].position,
+                                    portal.vertices[a1].position - portal.vertices[a0].position);
+            if (Dot(face, out) >= 0.0f) portal.indices.insert(portal.indices.end(), { a0, b0, a1, b0, b1, a1 });
+            else portal.indices.insert(portal.indices.end(), { a0, a1, b0, b0, a1, b1 });
+        }
+    }
+
+    // Lights along the roof: a strip of the game's tunnel light, and the lamp.
+    if (p.tunnelLightSpacing > 0.5f) {
+        MeshGroup& strip = piece.Group("OBJ_TUNNELLIGHT");
+        const float total = stations.back().distance;
+        for (float d = p.tunnelLightSpacing * 0.5f; d < total; d += p.tunnelLightSpacing) {
+            size_t i = 1;
+            while (i + 1 < stations.size() && stations[i].distance < d) ++i;
+            const Station& st = stations[i];
+            const float roof = p.tunnelShape == 1 ? height : height;
+            const Vec3 c = st.At(0.0f, roof - 0.15f);
+            const Vec3 along = st.forward * 1.5f, across = st.right * 0.35f;
+            const u32 base = (u32)strip.vertices.size();
+            const Vec3 corners[4] = { c - along - across, c - along + across, c + along - across, c + along + across };
+            const Vec2 uvs[4] = { { 0, 0 }, { 0, 1 }, { 1, 0 }, { 1, 1 } };
+            for (int k = 0; k < 4; ++k) {
+                MeshVertex v;
+                v.position = corners[k];
+                v.normal = { 0.0f, 0.0f, -1.0f };
+                v.uv = uvs[k];
+                strip.vertices.push_back(v);
+            }
+            // Seen from below.
+            strip.indices.insert(strip.indices.end(), { base, base + 2, base + 1, base + 1, base + 2, base + 3,
+                                                         base, base + 1, base + 2, base + 1, base + 3, base + 2 });
+            Pole lamp;
+            lamp.position = c;
+            lamp.lamp = c - Vec3{ 0.0f, 0.0f, 0.3f };
+            lamp.color = p.tunnelLightColor;
+            lamp.radius = std::max(8.0f, half * 2.5f);
+            lamp.strength = 1.3f;
+            lamp.segment = s.id;
+            lamp.underRoof = true;
+            lamp.along = st.forward;
+            lamp.across = half + 0.2f;
+            poles.push_back(lamp);
+        }
+    }
+}
+
 void PlacePoles(const Segment& segment, const std::vector<Station>& stations, std::vector<Pole>& out) {
     const RoadProfile& p = segment.profile;
     if (p.poleModel.empty() || p.poleSpacing < 2.0f || stations.size() < 2) return;
@@ -1400,6 +1661,13 @@ void LightPieces(std::vector<MeshPiece>& pieces, const std::vector<Pole>& poles,
                 // colour: under one the road reaches about 0xB0 as the game's
                 // do, and overlapping pools do not burn out to white.
                 for (const Pole* pole : lights) {
+                    if (pole->underRoof) {
+                        if (v.position.z > pole->lamp.z + 0.3f) continue;
+                        const Vec3 d{ v.position.x - pole->lamp.x, v.position.y - pole->lamp.y, 0.0f };
+                        const float on = d.x * pole->along.x + d.y * pole->along.y;
+                        const float sx = d.x - pole->along.x * on, sy = d.y - pole->along.y * on;
+                        if (sx * sx + sy * sy > pole->across * pole->across) continue;
+                    }
                     const float dx = v.position.x - pole->lamp.x, dy = v.position.y - pole->lamp.y;
                     const float d2 = (dx * dx + dy * dy) / (pole->radius * pole->radius);
                     if (d2 >= 1.0f) continue;
@@ -2437,8 +2705,103 @@ bool Network::BuildFaceJunctionPiece(const FaceJunction& j, MeshPiece& piece) co
     return true;
 }
 
+// The ground pieces (beside roads, between them, round junction corners)
+// without what stands in a tunnel's portal: its triangles and its collision.
+void Network::OpenTunnelPortals(std::vector<MeshPiece>& pieces) const {
+    const std::vector<GameCut> cuts = TunnelCuts();
+    if (cuts.empty()) return;
+    const auto inside = [&](const Vec3& p) {
+        for (const GameCut& cut : cuts)
+            if (cut.InHeight(p.z) && cut.Inside(p)) return true;
+        return false;
+    };
+    for (MeshPiece& piece : pieces) {
+        if (piece.name.rfind("ROAD_G", 0) != 0 && piece.name.rfind("ROAD_F", 0) != 0) continue;
+        for (MeshGroup& group : piece.groups) {
+            std::vector<u32> kept;
+            for (size_t k = 0; k + 2 < group.indices.size(); k += 3) {
+                const Vec3 c = (group.vertices[group.indices[k]].position + group.vertices[group.indices[k + 1]].position +
+                                group.vertices[group.indices[k + 2]].position) * (1.0f / 3.0f);
+                if (inside(c)) continue;
+                kept.insert(kept.end(), { group.indices[k], group.indices[k + 1], group.indices[k + 2] });
+            }
+            group.indices = std::move(kept);
+        }
+        piece.areas.erase(std::remove_if(piece.areas.begin(), piece.areas.end(),
+                                         [&](const CollisionArea& a) {
+                                             if (a.outline.empty()) return false;
+                                             Vec3 c{};
+                                             for (const Vec3& q : a.outline) c = c + q;
+                                             return inside(c * (1.0f / (float)a.outline.size()));
+                                         }),
+                          piece.areas.end());
+        // Strips broken where they cross a portal.
+        std::vector<CollisionStrip> strips;
+        for (const CollisionStrip& strip : piece.strips) {
+            CollisionStrip part;
+            part.surface = strip.surface;
+            const size_t count = std::min(strip.left.size(), strip.right.size());
+            for (size_t k = 0; k < count; ++k) {
+                const Vec3 mid = (strip.left[k] + strip.right[k]) * 0.5f;
+                if (inside(mid)) {
+                    if (part.left.size() >= 2) strips.push_back(part);
+                    part.left.clear();
+                    part.right.clear();
+                    continue;
+                }
+                part.left.push_back(strip.left[k]);
+                part.right.push_back(strip.right[k]);
+            }
+            if (part.left.size() >= 2) strips.push_back(std::move(part));
+        }
+        piece.strips = std::move(strips);
+    }
+}
+
+std::vector<GameCut> Network::TunnelCuts() const {
+    std::vector<GameCut> out;
+    // Inside a tunnel, from the road up to its roof, nothing of the ground
+    // stays: boxes along it, every few metres, and a few metres on out of
+    // each portal. The ground over the roof is left as it is.
+    for (const Segment& s : segments_) {
+        if (!s.profile.tunnel) continue;
+        const Curve curve = CurveOf(s);
+        const auto portalAt = [&](u32 nodeId) {
+            const std::vector<u32> around = SegmentsAt(nodeId);
+            if (around.size() < 2) return true;
+            for (u32 id : around)
+                if (const Segment* o = FindSegment(id); o && o->id != s.id && !o->profile.tunnel) return true;
+            return false;
+        };
+        const bool portalA = portalAt(s.a), portalB = portalAt(s.b);
+        const float half = std::max(s.profile.Edge(-1), s.profile.Edge(1)) + std::max(0.3f, s.profile.wallThickness) + 0.8f;
+        const float height = std::max(3.0f, s.profile.tunnelHeight);
+        const float length = Length(curve.p1 - curve.p0) + Length(curve.p2 - curve.p1) + Length(curve.p3 - curve.p2);
+        const int steps = std::clamp((int)std::ceil(length / 6.0f), 1, 400);
+        for (int k = 0; k < steps; ++k) {
+            const float t0 = (float)k / steps, t1 = (float)(k + 1) / steps;
+            Vec3 a = curve.At(t0), b = curve.At(t1);
+            const Vec3 forward = HorizontalDirection(b - a);
+            const Vec3 right{ forward.y, -forward.x, 0.0f };
+            // On out of a portal at either end.
+            if (k == 0 && portalA) a = a - forward * 3.0f;
+            if (k == steps - 1 && portalB) b = b + forward * 3.0f;
+            GameCut cut;
+            cut.forward = forward;
+            cut.centre = (a + b) * 0.5f + right * s.Offset();
+            cut.halfLength = Length(Vec3{ b.x - a.x, b.y - a.y, 0.0f }) * 0.5f + 0.5f;
+            cut.halfWidth = half;
+            cut.zMin = std::min(a.z, b.z) - 1.0f;
+            cut.zMax = std::max(a.z, b.z) + height + 0.6f;
+            out.push_back(cut);
+        }
+    }
+    return out;
+}
+
 std::vector<GameCut> Network::Cuts() const {
     std::vector<GameCut> out = cuts_;
+    for (GameCut& c : TunnelCuts()) out.push_back(std::move(c));
     for (const FaceJunction& j : faceJunctions_) {
         if (!FindNode(j.node)) continue;
         for (GameCut& c : j.Cuts()) out.push_back(std::move(c));
@@ -2872,6 +3235,23 @@ std::vector<MeshPiece> Network::BuildMesh(std::vector<Pole>* polesOut) const {
             if (!posts.walls.empty()) pieces.push_back(std::move(posts));
         }
         PlaceWallModels(s, stations, poles);
+        if (s.profile.tunnel) {
+            // An end is a portal when the road leaves the tunnel there.
+            const auto portalAt = [&](u32 nodeId) {
+                const std::vector<u32> around = SegmentsAt(nodeId);
+                if (around.size() < 2) return true;
+                for (u32 id : around)
+                    if (const Segment* o = FindSegment(id); o && o->id != s.id && !o->profile.tunnel) return true;
+                return false;
+            };
+            MeshPiece tube;
+            char tubeName[64];
+            std::snprintf(tubeName, sizeof(tubeName), "ROAD_N%u", s.id);
+            tube.name = tubeName;
+            tube.segment = s.id;
+            BuildTunnel(s, stations, portalAt(s.a), portalAt(s.b), tube, poles);
+            if (tube.VertexCount()) pieces.push_back(std::move(tube));
+        }
         if (s.profile.bridge) {
             MeshPiece pillars;
             char pillarName[64];
@@ -3110,7 +3490,7 @@ std::vector<MeshPiece> Network::BuildMesh(std::vector<Pole>* polesOut) const {
         const int count = std::max(1, (int)std::ceil(total / kPieceLength));
         size_t first = 0;
         PlaceCatsEyes(s.profile, stations, taper, poles);
-        if (!s.profile.bridge && (s.profile.Terrain(-1) || s.profile.Terrain(1))) {
+        if (!s.profile.OffGround() && (s.profile.Terrain(-1) || s.profile.Terrain(1))) {
             MeshPiece side;
             char sideName[64];
             std::snprintf(sideName, sizeof(sideName), "ROAD_G%u", s.id);
@@ -3124,7 +3504,7 @@ std::vector<MeshPiece> Network::BuildMesh(std::vector<Pole>* polesOut) const {
                 const std::vector<u32> around = SegmentsAt(nodeId);
                 if (around.size() != 2) continue;
                 const Segment* o = FindSegment(around[0] == s.id ? around[1] : around[0]);
-                if (!o || o->profile.bridge) continue;
+                if (!o || o->profile.OffGround()) continue;
                 // Its sides as this road's: swapped when it runs the other way.
                 const bool sameWay = (s.a == nodeId) != (o->a == nodeId);
                 for (int si = 0; si < 2; ++si) {
@@ -3406,7 +3786,11 @@ std::vector<MeshPiece> Network::BuildMesh(std::vector<Pole>* polesOut) const {
             if (c0.wallLeft && c1.wallRight) {
                 CollisionWall wall;
                 for (const Vec3& point : outer) wall.points.push_back(point + Vec3{ 0.0f, 0.0f, height });
-                wall.barrier = true;
+                // A wall of real height, as along the roads: a barrier (flags
+                // 0x16) stands +/-127 m and walls off any road above or below
+                // the junction -- the game keeps those for ground-level edges.
+                wall.barrier = false;
+                wall.height = std::max(1.0f, c0.profile->wallHeight);
                 piece.walls.push_back(wall);
 
                 const RoadProfile& p = *c0.profile;
@@ -3459,6 +3843,8 @@ std::vector<MeshPiece> Network::BuildMesh(std::vector<Pole>* polesOut) const {
         pieces.push_back(std::move(piece));
     }
     BuildFills(pieces);
+    BuildWaters(pieces);
+    OpenTunnelPortals(pieces);
     // The lights placed by hand, as street lights: they light what is built,
     // and their posts are placed with the rest.
     for (const Light& light : lights_) {
@@ -3525,6 +3911,7 @@ bool Network::Save(const std::wstring& path) const {
     if (!out) return false;
     out << "FRSROADS 2\n";
     if (fillBetween_) out << "fill 1\n";
+    if (terrainCollision_) out << "terraincollision 1\n";
     out << "# node <id> <x> <y> <z> <hasHeading> <heading> <crosswalks>\n";
     out << "# segment <id> <a> <b> <lanesForward> <lanesBackward> <laneWidth> <textureLength> <laneCentre> "
            "<laneInner> <sidewalkWidth> <sidewalkHeight> <sidewalkTexture> <wallLeft> <wallRight> "
@@ -3575,6 +3962,17 @@ bool Network::Save(const std::wstring& path) const {
         for (const RoadProfile::SideTerrain& t : p.terrain)
             out << " " << (t.rock ? 1 : 0) << " " << t.rockAngle << " " << t.rockHeight << " " << (t.meetGround ? 1 : 0);
         out << " " << (p.catsEyes ? 1 : 0) << " " << p.catsEyeSpacing << " " << Token(p.catsEyeModel);
+        out << " " << (p.tunnel ? 1 : 0) << " " << p.tunnelHeight << " " << p.tunnelShape << " "
+            << p.tunnelLightSpacing << " " << p.tunnelLightColor << " " << p.tunnelPortalSize << " "
+            << p.tunnelPortalDepth << " " << Token(p.tunnelWall) << " " << Token(p.tunnelRoof) << " "
+            << Token(p.tunnelPortal);
+        out << "\n";
+    }
+    for (const Water& w : waters_) {
+        out << "water " << w.id << " " << w.kind << " " << w.level << " " << w.depth << " " << w.width << " "
+            << w.shore << " " << w.fallHeight << " " << (w.foam ? 1 : 0) << " " << (w.deep ? 1 : 0) << " "
+            << (w.carve ? 1 : 0) << " " << Token(w.texture) << " " << w.points.size();
+        for (const Vec3& q : w.points) out << " " << q.x << " " << q.y << " " << q.z;
         out << "\n";
     }
     for (const Prop& p : props_)
@@ -3648,7 +4046,26 @@ bool Network::Load(const std::wstring& path) {
         std::istringstream line(text);
         std::string kind;
         line >> kind;
-        if (kind == "prop") {
+        if (kind == "water") {
+            Water w;
+            int foam = 1, deep = 0, carve = 1;
+            size_t count = 0;
+            std::string texture;
+            if (line >> w.id >> w.kind >> w.level >> w.depth >> w.width >> w.shore >> w.fallHeight >> foam >> deep >>
+                carve >> texture >> count) {
+                w.kind = std::clamp(w.kind, 0, 1);
+                w.foam = foam != 0;
+                w.deep = deep != 0;
+                w.carve = carve != 0;
+                w.texture = Untoken(texture);
+                for (size_t k = 0; k < count && k < 4096; ++k) {
+                    Vec3 q;
+                    if (!(line >> q.x >> q.y >> q.z)) break;
+                    w.points.push_back(q);
+                }
+                if (w.points.size() >= 2) waters_.push_back(std::move(w));
+            }
+        } else if (kind == "prop") {
             Prop p;
             std::string model;
             int tree = 0;
@@ -3668,6 +4085,9 @@ bool Network::Load(const std::wstring& path) {
         } else if (kind == "fill") {
             int on = 0;
             if (line >> on) fillBetween_ = on != 0;
+        } else if (kind == "terraincollision") {
+            int on = 0;
+            if (line >> on) terrainCollision_ = on != 0;
         } else if (kind == "node") {
             Node n;
             int heading = 0;
@@ -3781,7 +4201,7 @@ bool Network::Load(const std::wstring& path) {
                         p.medianTexture = Untoken(medianTexture);
                         p.sidewalkLeft = walkLeft != 0;
                         p.sidewalkRight = walkRight != 0;
-                        p.wallStyle = std::clamp(p.wallStyle, 0, 2);
+                        p.wallStyle = std::clamp(p.wallStyle, 0, 3);
                         p.wallModel = Untoken(wallModel);
                         int traffic = 1, gps = 1;
                         if (line >> traffic >> gps >> p.speedLimit) {
@@ -3876,6 +4296,23 @@ bool Network::Load(const std::wstring& path) {
                                                             p.catsEyes = eyes != 0;
                                                             p.catsEyeSpacing = std::clamp(spacing, 1.0f, 200.0f);
                                                             p.catsEyeModel = Untoken(model);
+                                                            int tunnel = 0, shape = 0;
+                                                            float th = 6.5f, ts = 12.0f, tps = 3.0f, tpd = 8.0f;
+                                                            u32 tc = 0xFFE6B4;
+                                                            std::string tw, tr, tp;
+                                                            if (line >> tunnel >> th >> shape >> ts >> tc >> tps >> tpd >> tw >>
+                                                                tr >> tp) {
+                                                                p.tunnel = tunnel != 0;
+                                                                p.tunnelHeight = std::clamp(th, 3.0f, 40.0f);
+                                                                p.tunnelShape = std::clamp(shape, 0, 1);
+                                                                p.tunnelLightSpacing = std::clamp(ts, 0.0f, 200.0f);
+                                                                p.tunnelLightColor = tc & 0xFFFFFF;
+                                                                p.tunnelPortalSize = std::clamp(tps, 0.0f, 20.0f);
+                                                                p.tunnelPortalDepth = std::clamp(tpd, 2.0f, 60.0f);
+                                                                p.tunnelWall = Untoken(tw);
+                                                                p.tunnelRoof = Untoken(tr);
+                                                                p.tunnelPortal = Untoken(tp);
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -3913,6 +4350,7 @@ bool Network::Load(const std::wstring& path) {
                     segments_.end());
     for (const Light& l : lights_) highest = std::max(highest, l.id);
     for (const Prop& p : props_) highest = std::max(highest, p.id);
+    for (const Water& w : waters_) highest = std::max(highest, w.id);
     nextId_ = highest + 1;
     dirty_ = true;
     LOG_INFO("roads: %zu nodes, %zu segments read from %S", nodes_.size(), segments_.size(), path.c_str());
@@ -3971,7 +4409,18 @@ void RoadField::Build(const Network& network, const std::function<bool(const Seg
         if (!counted) continue;
         samples_.push_back({ node.position, node.position, half * 1.4f });
     }
+    Index();
+}
+
+void RoadField::Index() {
+    cells_.clear();
     if (samples_.empty()) return;
+    Aabb box;
+    for (const Sample& sample : samples_) {
+        box.Add(sample.a);
+        box.Add(sample.b);
+        widest_ = std::max(widest_, sample.half);
+    }
     minX_ = box.min.x - 1.0f;
     minY_ = box.min.y - 1.0f;
     columns_ = std::max(1, (int)std::ceil((box.max.x - minX_ + 1.0f) / cellSize_));

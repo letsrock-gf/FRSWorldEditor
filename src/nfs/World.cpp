@@ -1,6 +1,8 @@
 #include "nfs/World.h"
 
 #include "nfs/GameFormat.h"
+#include "nfs/ForeignModels.h"
+#include "nfs/CustomRegions.h"
 
 #include "io/MeshOverlay.h"
 #include "nfs/Jdlz.h"
@@ -94,6 +96,13 @@ std::vector<std::wstring> World::AvailableRegions(const std::wstring& tracksDire
     } while (::FindNextFileW(handle, &find));
 
     ::FindClose(handle);
+    // The regions the editor made (nfs/CustomRegions.h), read through their source's files.
+    const size_t slash = tracksDirectory.find_last_of(L"\\/");
+    if (slash != std::wstring::npos)
+        for (const CustomRegion& custom : ReadCustomRegions(tracksDirectory.substr(0, slash)))
+            if (std::find(regions.begin(), regions.end(), custom.name) == regions.end() &&
+                std::find(regions.begin(), regions.end(), custom.source) != regions.end())
+                regions.push_back(custom.name);
     std::sort(regions.begin(), regions.end());
     return regions;
 }
@@ -101,15 +110,27 @@ std::vector<std::wstring> World::AvailableRegions(const std::wstring& tracksDire
 bool World::Open(const std::wstring& tracksDirectory, const std::wstring& region) {
     Close();
 
+    // A region the editor made reads the files of the region it copies; its
+    // edits keep its own name (nfs/CustomRegions.h).
+    const size_t slash = tracksDirectory.find_last_of(L"\\/");
+    const std::wstring files =
+        slash == std::wstring::npos ? region : SourceRegion(tracksDirectory.substr(0, slash), region);
+    emptyCity_ = false;
+    if (files != region) {
+        CustomRegion custom;
+        emptyCity_ = FindCustomRegion(tracksDirectory.substr(0, slash), region, custom) && custom.empty;
+        LOG_INFO("region %S: a copy of %S%s", region.c_str(), files.c_str(), emptyCity_ ? ", empty" : "");
+    }
+
     // No layout file named after the region: Underground 1.
-    if (::GetFileAttributesW((tracksDirectory + L"\\" + region + L".BUN").c_str()) == INVALID_FILE_ATTRIBUTES)
+    if (::GetFileAttributesW((tracksDirectory + L"\\" + files + L".BUN").c_str()) == INVALID_FILE_ATTRIBUTES)
         return OpenUnderground1(tracksDirectory, region);
 
-    if (!layout_.Open(tracksDirectory + L"\\" + region + L".BUN"))
+    if (!layout_.Open(tracksDirectory + L"\\" + files + L".BUN"))
         return false;
 
     // NFS World's regions are L5Rx; everything else is read as Underground 2.
-    ActiveGame() = region.rfind(L"L5R", 0) == 0 ? Game::World : Game::Underground2;
+    ActiveGame() = files.rfind(L"L5R", 0) == 0 ? Game::World : Game::Underground2;
     tracksDirectory_ = tracksDirectory;
 
     if (IsWorld()) {
@@ -127,7 +148,7 @@ bool World::Open(const std::wstring& tracksDirectory, const std::wstring& region
         return true;
     }
 
-    if (!stream_.Open(tracksDirectory + L"\\STREAM" + region + L".BUN")) {
+    if (!stream_.Open(tracksDirectory + L"\\STREAM" + files + L".BUN")) {
         layout_.Close();
         return false;
     }
@@ -150,10 +171,25 @@ bool World::Open(const std::wstring& tracksDirectory, const std::wstring& region
                  overlayFolder_.c_str(), loaded, spans);
     }
 
-    if (!table_.Parse(layout_.Span())) {
+    // Whole regions brought into this one (io/RegionImport.h) live only in the
+    // region file the game is served: its table carries their entries and its
+    // visibility their zones, beside everything the shipped file has at the
+    // same offsets.
+    std::vector<u8> served;
+    if (!overlayFolder_.empty() &&
+        ::GetFileAttributesW((overlayFolder_ + L"\\imports-" + region + L".txt").c_str()) != INVALID_FILE_ATTRIBUTES) {
+        FileMap copy;
+        if (copy.Open(overlayFolder_ + L"\\files\\TRACKS\\" + region + L".BUN")) {
+            const ByteSpan bytes = copy.Span();
+            served.assign(bytes.data, bytes.data + bytes.size);
+            LOG_INFO("region %S: its table and zones read from the served copy (imports)", region.c_str());
+        }
+    }
+    if (!table_.Parse(served.empty() ? layout_.Span() : ByteSpan{ served.data(), served.size() })) {
         Close();
         return false;
     }
+    if (!served.empty()) preculler_.Parse(ByteSpan{ served.data(), served.size() });
 
     // The table corrections come after it is parsed, so a section that moved is
     // looked for where its bytes now are.
@@ -165,7 +201,7 @@ bool World::Open(const std::wstring& tracksDirectory, const std::wstring& region
         }
     // Edited visibility lists (ui/ZoneTools.h) are spans of the layout file
     // too: the zones are read again from the file as the game will see it.
-    if (layoutEdited) {
+    if (layoutEdited && served.empty()) {   // the served copy has the lists folded in
         const ByteSpan original = layout_.Span();
         std::vector<u8> patched(original.data, original.data + original.size);
         for (const SpanOverlay& span : spans_)
@@ -176,7 +212,10 @@ bool World::Open(const std::wstring& tracksDirectory, const std::wstring& region
 
     OpenGlobalPacks(tracksDirectory);
     ReadRaceBarrierGroups();
-    objectAnimations_.Parse(layout_.Span());
+    // An empty region has none of its source's moving objects (planes, trams,
+    // doors): the region file the game reads has them taken out too
+    // (io/RegionCreate.h, ApplyEmptyRegionLists).
+    if (!emptyCity_) objectAnimations_.Parse(layout_.Span());
 
     region_ = region;
     sectionToLoaded_.assign(table_.Sections().size(), -1);
@@ -364,6 +403,45 @@ void World::Close() {
     instanceCount_ = 0;
     textureUsage_.clear();
     bounds_ = {};
+}
+
+// Whether a section's object lists are broken the way the editor up to 0.2.1
+// wrote them: copying a model into a list whose first hash starts with the
+// byte 0x11 (0x0E3EB411 in E25) dropped that byte as filler, so the hash
+// table no longer holds one (hash, 0) pair per object. The game reads the
+// table from the first byte of the chunk, takes hash bytes for model
+// pointers, and crashes the next time a texture pack loads (SPEED2 0x493832).
+// Read raw, without the reader's 0x11 filler removal that caused it.
+static bool BrokenObjectTable(ByteSpan section) {
+    const auto read = [](const u8* at) { u32 v; std::memcpy(&v, at, 4); return v; };
+    const auto walk = [&](const u8* data, size_t size, auto&& each) {
+        for (size_t at = 0; at + 8 <= size;) {
+            const u32 id = read(data + at), length = read(data + at + 4);
+            if (at + 8 + (size_t)length > size) return;
+            each(id, data + at + 8, (size_t)length);
+            at += 8 + (size_t)length;
+        }
+    };
+    bool broken = false;
+    walk(section.data, section.size, [&](u32 id, const u8* pack, size_t packSize) {
+        if (id != kChunkSolidListPack) return;
+        walk(pack, packSize, [&](u32 childId, const u8* header, size_t headerSize) {
+            if (childId != 0x80134001u) return;
+            u32 count = 0;
+            bool haveCount = false, haveTable = false;
+            size_t tableSize = 0;
+            const u8* table = nullptr;
+            walk(header, headerSize, [&](u32 partId, const u8* part, size_t partSize) {
+                if (partId == 0x134002u && partSize >= 0x10) { count = read(part + 0x0C); haveCount = true; }
+                if (partId == 0x134003u) { table = part; tableSize = partSize; haveTable = true; }
+            });
+            if (!haveCount || !haveTable) return;
+            if (tableSize % 8 != 0 || tableSize / 8 != count) { broken = true; return; }
+            for (size_t k = 0; k < count; ++k)
+                if (read(table + k * 8 + 4) != 0) { broken = true; return; }
+        });
+    });
+    return broken;
 }
 
 const LoadedSection* World::LoadSection(const Section& section) {
@@ -580,9 +658,72 @@ const LoadedSection* World::LoadSection(const Section& section) {
 
     if (!animationChunks.empty()) objectAnimations_.AddWorldSection(animationChunks, (int)section.number);
 
+    // Written by an older editor with a broken object list: rebuilt from the
+    // shipped bytes and its edits at the next save, which lists the objects
+    // again the way the game reads them.
+    if (fromSpan && BrokenObjectTable(buffer)) {
+        loadedSection->placementsChanged = true;
+        loadedSection->brokenObjectList = true;
+        LOG_WARN("section %s: its object list was written broken by an older version "
+                 "(the game crashes at 0x493832); it is rebuilt at the next save", section.name.c_str());
+    }
+
     if (IsUnderground1()) {
         const auto found = trackCollision_.find(section.number);
         if (found != trackCollision_.end()) loadedSection->collision.push_back(found->second);
+    }
+
+    // An empty region (nfs/CustomRegions.h): none of the source's city. Every
+    // shipped object of a positioned section counts as removed -- hidden here,
+    // and written with its matrix zeroed whenever the section is saved -- and
+    // the shipped collision of a section the editor has not written yet starts
+    // empty; one it wrote holds its own collision already. The libraries (X, Y,
+    // Z: models with no place of their own) stay as they are.
+    // In the libraries, what the game hides until a scenery group or an
+    // animation shows it (instance flag 0x10: the jumbo planes in Z0, shown
+    // only by their animation, which an empty region does not have).
+    if (emptyCity_ && section.number >= 2400 && section.number < 2700)
+        for (const SceneryInstance& instance : loadedSection->scenery.instances) {
+            if (instance.flags & 0x10) {
+                loadedSection->removedNatives.push_back({ instance.sceneryNumber, instance.record });
+                continue;
+            }
+            const SolidObject* model = FindModel(loadedSection->scenery.ModelHash(instance));
+            LOG_INFO("empty region: %s keeps %s (flags %04X): always loaded", section.name.c_str(),
+                     model ? model->name.c_str() : "?", instance.flags);
+        }
+    if (emptyCity_ && !(section.number >= 2400 && section.number < 2700)) {
+        for (const SceneryInstance& instance : loadedSection->scenery.instances) {
+            loadedSection->removedNatives.push_back({ instance.sceneryNumber, instance.record });
+            // A written section whose shipped objects are still in it (an
+            // import rebuilt it from its bytes) still has the city: pending.
+            const Mat4& m = instance.transform;
+            bool zeroed = true;
+            for (int r = 0; r < 3; ++r)
+                for (int c = 0; c < 3; ++c) zeroed = zeroed && m.m[r][c] == 0.0f;
+            if (fromSpan && !zeroed) loadedSection->emptyPending = true;
+        }
+        // The shipped collision starts empty. A written section keeps the
+        // packs the editor wrote and loses the ones still as shipped.
+        std::vector<u32> shippedPacks;
+        if (fromSpan && section.originalStreamOffset + (u64)section.originalStreamSize <= stream_.Size()) {
+            ChunkReader shipped(stream_.Span().sub(section.originalStreamOffset, section.originalStreamSize),
+                                section.originalStreamOffset);
+            Chunk chunk;
+            while (shipped.Next(chunk)) {
+                if (chunk.id != kChunkCollisionPack) continue;
+                CollisionPack pack;
+                if (ParseCollision(chunk, pack)) shippedPacks.push_back(CollisionFingerprint(pack));
+            }
+        }
+        for (size_t k = 0; k < loadedSection->collision.size(); ++k) {
+            CollisionPack& pack = loadedSection->collision[k];
+            const bool asShipped = !fromSpan || (k < shippedPacks.size() && CollisionFingerprint(pack) == shippedPacks[k]);
+            if (!asShipped || pack.polygons.empty()) continue;
+            pack.polygons.clear();
+            pack.gridRank.clear();
+            if (fromSpan) loadedSection->emptyPending = true;
+        }
     }
 
     if (loadedSection->solidLists.empty() && loadedSection->texturePacks.empty() &&
@@ -721,6 +862,18 @@ bool World::IsLibrary(const LoadedSection& section) const {
            (section.info->position.x == 0.0f && section.info->position.y == 0.0f);
 }
 
+// A new model is built by rebuilding one of the section's own objects around
+// the new mesh (SelectionImport's BuildAddedModel): a section without one -- the
+// sky's, or one that only holds collision or placements -- cannot take it.
+static bool HasModelToBuildFrom(const LoadedSection& section) {
+    for (const SolidList& list : section.solidLists)
+        for (const SolidObject& model : list.objects)
+            if (model.vertexStride && !model.vertices.empty() &&
+                model.name.find("SKY") == std::string::npos && model.name.find("PAN_") == std::string::npos)
+                return true;
+    return false;
+}
+
 size_t World::SectionForPlacement(const Vec3& point) const {
     size_t best = SIZE_MAX, nearest = SIZE_MAX;
     float bestDistance = 1e30f, nearestDistance = 1e30f;
@@ -728,6 +881,7 @@ size_t World::SectionForPlacement(const Vec3& point) const {
     for (size_t i = 0; i < loaded_.size(); ++i) {
         const LoadedSection& candidate = *loaded_[i];
         if (!candidate.info || IsLibrary(candidate) || IsUnusedAlternate(*candidate.info)) continue;
+        if (!HasModelToBuildFrom(candidate)) continue;
         if (std::find(candidate.sceneryNumbers.begin(), candidate.sceneryNumbers.end(),
                       candidate.info->number) == candidate.sceneryNumbers.end())
             continue;
@@ -759,6 +913,7 @@ size_t World::SectionForPlacementAlong(const std::vector<Vec3>& points) const {
     for (size_t i : SectionsLoadedThroughout(points)) {
         const LoadedSection& candidate = *loaded_[i];
         if (!candidate.info || IsLibrary(candidate) || IsUnusedAlternate(*candidate.info)) continue;
+        if (!HasModelToBuildFrom(candidate)) continue;
         if (std::find(candidate.sceneryNumbers.begin(), candidate.sceneryNumbers.end(), candidate.info->number) ==
             candidate.sceneryNumbers.end())
             continue;
@@ -809,7 +964,8 @@ void World::RemoveModel(u32 hash) {
 
 const SolidObject* World::FindModel(u32 hash) const {
     const auto it = modelsByHash_.find(hash);
-    return it == modelsByHash_.end() ? nullptr : it->second;
+    if (it != modelsByHash_.end()) return it->second;
+    return foreignLookup_ ? FindForeignModel(hash) : nullptr;
 }
 
 std::vector<const Texture*> World::AllTextures() const {
@@ -836,7 +992,7 @@ const Texture* World::FindTexture(u32 hash) const {
     for (const auto& section : loaded_)
         for (const auto& pack : section->texturePacks)
             if (const Texture* texture = pack->Find(hash)) return texture;
-    return nullptr;
+    return foreignLookup_ ? FindForeignTexture(hash) : nullptr;
 }
 
 bool World::LargestTexture(u32 hash, Texture& out) const {

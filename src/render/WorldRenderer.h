@@ -273,6 +273,8 @@ public:
         gameLookTried_ = false;
         fogRegion_.clear();
     }
+    // The fog maps read again at the next frame (they were just rewritten).
+    void ReloadFogMaps() { fogRegion_.clear(); }
     // What the game look is using, for the status bar and the log.
     const std::string& GameLookStatus() const { return gameLookStatus_; }
     // Default-pool objects (the reflection target): the owner of the device
@@ -427,6 +429,19 @@ public:
     // their procedural description instead -- left out of drawing and picking.
     void SetHiddenModels(std::function<bool(const nfs::SolidObject&)> hidden) { hiddenModels_ = std::move(hidden); }
 
+    // Whole imported regions seen somewhere they are not baked (ui/ImportTools):
+    // the sections numbered [first, last) drawn with `delta` after their own
+    // placement, and never culled while it lasts. One per import.
+    struct SectionPreview { u32 first = 0, last = 0; Mat4 delta = Mat4::Identity(); };
+    void SetSectionPreviews(std::vector<SectionPreview> previews) { previews_ = std::move(previews); }
+    void ClearSectionPreview() { previews_.clear(); }
+    // The preview a section is drawn with, or null.
+    const SectionPreview* Previewed(u32 number) const {
+        for (const SectionPreview& p : previews_)
+            if (number >= p.first && number < p.last) return &p;
+        return nullptr;
+    }
+
     // What the game itself would draw (drive/world/GameStreaming): when set, a
     // section is drawn only if `section(number)` says so, and a placed model only
     // if `model(hash)` says a loaded section holds it. Empty functions: no filter.
@@ -440,6 +455,21 @@ public:
     // it and its index there -- and is empty for what is not a placement.
     void SetHiddenInstances(std::set<std::string> keys) { hiddenKeys_ = std::move(keys); ++hiddenVersion_; }
     std::string HiddenKey(const PickResult& picked) const;
+
+    // View > Show Only Edited: the world drawn and picked as what the user
+    // changed alone -- placements the editor made (moved map objects among
+    // them), models whose mesh or textures were edited, shipped records
+    // altered -- everything else left out. Extensions (roads, markers,
+    // reference images) still draw. `models` and `textures` are hashes,
+    // `natives` keys of HiddenKey's "N <section> <index>" form.
+    void SetEditedOnly(bool on) { editedOnly_ = on; ++hiddenVersion_; }
+    bool EditedOnly() const { return editedOnly_; }
+    void SetEditedContent(std::set<u32> models, std::set<u32> textures, std::set<std::string> natives) {
+        editedModels_ = std::move(models);
+        editedTextures_ = std::move(textures);
+        editedNatives_ = std::move(natives);
+        ++hiddenVersion_;
+    }
     // Textures the region does not hold, for an extension's models.
     void SetExtraTextureLookup(TextureCache::ExtraLookup lookup) { textures_.SetExtraLookup(std::move(lookup)); }
 
@@ -492,6 +522,8 @@ public:
     size_t DuplicateInstances() const { return duplicateInstances_; }
 
 private:
+    std::vector<SectionPreview> previews_;
+
     // Everything the renderer needs for one streaming section: its own geometry,
     // and the instances it places. Sections with scenery but no geometry of their
     // own are common, so the GPU buffers may be absent.
@@ -519,6 +551,10 @@ private:
 
     std::set<std::string> hiddenKeys_;
     u64 hiddenVersion_ = 0;
+    bool editedOnly_ = false;
+    std::set<u32> editedModels_, editedTextures_;
+    std::set<std::string> editedNatives_;
+    bool InstanceEdited(const SectionRender& section, const GpuInstance& instance) const;
     static std::string InstanceKey(const std::string& section, int native, int placement);
     const std::vector<char>& HiddenFlags(size_t section) const;
 
@@ -587,6 +623,18 @@ private:
     u32                thumbSize_     = 0;
 
     std::vector<SectionRender> sections_;
+    // Models from outside the region (nfs/ForeignModels.h: another game's,
+    // shown by an extension's GPU copy): an instance placing one names
+    // kForeignSection + its slot here instead of a section of the region.
+    static constexpr u32 kForeignSection = 0x40000000u;
+    std::vector<const GpuSection*> foreignGpu_;
+    const GpuSection* GpuOf(u32 section) const {
+        if (section >= kForeignSection) {
+            const size_t slot = section - kForeignSection;
+            return slot < foreignGpu_.size() ? foreignGpu_[slot] : nullptr;
+        }
+        return section < sections_.size() ? sections_[section].gpu.get() : nullptr;
+    }
     size_t       uploadedSections_ = 0;
     TextureCache textures_;
     std::vector<TranslucentObject> translucent_;

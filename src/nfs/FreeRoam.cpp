@@ -1,4 +1,5 @@
 #include "nfs/FreeRoam.h"
+#include "nfs/CustomRegions.h"
 
 #include "core/Log.h"
 #include "nfs/World.h"
@@ -93,7 +94,7 @@ bool ReadFreeRoamZones(const std::wstring& gameFolder, const std::wstring& regio
                        std::vector<FreeRoamZone>& out) {
     out.clear();
     const std::vector<u8> bytes =
-        ReadWholeFile(gameFolder + L"\\TRACKS\\ROUTES" + region + L"\\PathsFreeRoam.bin");
+        ReadWholeFile(ShippedTrackFile(gameFolder, region, L"ROUTES" + region + L"\\PathsFreeRoam.bin"));
     if (bytes.empty()) return false;
 
     for (const Span& root : Chunks(bytes, 0, bytes.size())) {

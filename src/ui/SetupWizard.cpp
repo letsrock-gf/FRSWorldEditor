@@ -356,47 +356,95 @@ Wizard* WizardOf(HWND dialog) { return (Wizard*)::GetWindowLongPtrW(dialog, DWLP
 
 void Stay(HWND dialog) { ::SetWindowLongPtrW(dialog, DWLP_MSGRESULT, -1); }
 
-// ---- page 1: the game folder
+// ---- page 1: the games
 
-void DescribeFolder(HWND dialog) {
-    const std::wstring folder = Trimmed(TextOf(dialog, IDC_SETUP_PATH));
-    std::wstring text;
-    bool valid = false;
-    if (folder.empty()) {
-        text = L"Choose the folder that holds SPEED2.EXE.";
-    } else if (IsWorldFolder(folder) && DirectoryExists(folder + L"\\TRACKS")) {
-        valid = true;
-        text = L"Need for Speed World found. It needs no plugin: Save writes your edits into the "
-               L"map's own files, and keeps the shipped ones in TRACKS\\frs-original.";
-    } else if (IsUnderground1Folder(folder)) {
-        valid = true;
-        text = L"Need for Speed Underground found.\r\n"
-               L"The editor opens its tracks to look at and export. The plugins are written for "
-               L"Underground 2, so nothing is installed here, and edits cannot be saved for this "
-               L"game yet.";
-    } else if (!FileExists(folder + L"\\SPEED2.EXE")) {
-        text = L"There is no SPEED2.EXE in this folder.";
-    } else if (!DirectoryExists(folder + L"\\TRACKS")) {
-        text = L"SPEED2.EXE is here, but the TRACKS folder is not: the game looks incomplete.";
-    } else {
-        valid = true;
-        text = L"Need for Speed Underground 2 found.\r\n";
-        text += SupportedExecutable(folder)
-                    ? L"SPEED2.EXE is v1.2, the version the plugins are written for.\r\n"
-                    : L"SPEED2.EXE is not v1.2: the editor opens its files, but the plugins leave "
-                      L"this game alone (they are written for v1.2).\r\n";
-        std::vector<std::wstring> present;
-        const std::wstring loader = AsiLoaderIn(folder);
-        if (!loader.empty()) present.push_back(L"an ASI loader (" + loader + L")");
-        if (WorldLoaderInstalled(folder)) present.push_back(L"FRS World Loader");
-        if (FastBootInstalled(folder)) present.push_back(L"FRSFastTest");
-        if (!present.empty()) text += L"Already installed: " + Joined(present) + L".";
+// The games the editor knows, one row each on the page.
+enum GameRow { kRowUnderground2, kRowUnderground1, kRowMostWanted, kRowWorld, kRows };
+
+struct RowControls { int path, browse, status; const wchar_t* name; const wchar_t* browseTitle; };
+const RowControls kRowControls[kRows] = {
+    { IDC_SETUP_PATH, IDC_SETUP_BROWSE, IDC_SETUP_FOLDER_STATUS, L"Need for Speed Underground 2",
+      L"Need for Speed Underground 2's folder (SPEED2.EXE)" },
+    { IDC_SETUP_U1_PATH, IDC_SETUP_U1_BROWSE, IDC_SETUP_U1_STATUS, L"Need for Speed Underground",
+      L"Need for Speed Underground's folder (speed.exe)" },
+    { IDC_SETUP_MW_PATH, IDC_SETUP_MW_BROWSE, IDC_SETUP_MW_STATUS, L"Need for Speed Most Wanted",
+      L"Need for Speed Most Wanted's folder (speed.exe)" },
+    { IDC_SETUP_NFSW_PATH, IDC_SETUP_NFSW_BROWSE, IDC_SETUP_NFSW_STATUS, L"Need for Speed World",
+      L"Need for Speed World's folder (nfsw.exe)" },
+};
+
+bool RowValid(int row, const std::wstring& folder) {
+    switch (row) {
+        case kRowUnderground2: return IsGameFolder(folder) && FileExists(folder + L"\\SPEED2.EXE");
+        case kRowUnderground1: return IsUnderground1Folder(folder);
+        case kRowMostWanted:   return IsMostWantedFolder(folder);
+        default:               return IsWorldFolder(folder) && DirectoryExists(folder + L"\\TRACKS");
     }
-    SetText(dialog, IDC_SETUP_FOLDER_STATUS, text);
-    PropSheet_SetWizButtons(::GetParent(dialog), valid ? PSWIZB_NEXT : 0);
 }
 
-void BrowseForFolder(HWND dialog) {
+// What one game's row says under its folder.
+std::wstring DescribeRow(int row, const std::wstring& folder) {
+    if (folder.empty())
+        return row == kRowUnderground2 || row == kRowWorld ? L"Not set." : L"Not set: its models stay out of the library.";
+    if (!RowValid(row, folder)) {
+        switch (row) {
+            case kRowUnderground2: return L"Not this game's folder: SPEED2.EXE and TRACKS are not both here.";
+            case kRowUnderground1: return L"Not this game's folder: speed.exe and TRACKS are not both here.";
+            case kRowWorld:        return L"Not this game's folder: nfsw.exe and TRACKS are not both here.";
+            default:               return L"Not this game's folder: speed.exe and TRACKS\\L2RA.BUN are not both here.";
+        }
+    }
+    if (row == kRowUnderground1) return L"Found. Its models are in the library; its worlds open to look at and export.";
+    if (row == kRowMostWanted) return L"Found. Its worlds open to look at and export.";
+    if (row == kRowWorld) return L"Found. It needs no plugin: Save writes your edits into the map's own files.";
+    std::wstring text = SupportedExecutable(folder) ? L"Found, v1.2." : L"Found, not v1.2: the plugins leave it alone.";
+    std::vector<std::wstring> present;
+    if (WorldLoaderInstalled(folder)) present.push_back(L"FRS World Loader");
+    if (FastBootInstalled(folder)) present.push_back(L"FRSFastTest");
+    if (!present.empty()) text += L" Installed: " + Joined(present) + L".";
+    else text += L" Edits reach the game through the plugins, next.";
+    return text;
+}
+
+// The rows' statuses, and the games whose worlds can be edited: the ones
+// found. Next is offered when one is chosen and no row names a wrong folder.
+void DescribeFolder(HWND dialog) {
+    bool wrong = false;
+    std::vector<int> found;
+    for (int row = 0; row < kRows; ++row) {
+        const std::wstring folder = Trimmed(TextOf(dialog, kRowControls[row].path));
+        SetText(dialog, kRowControls[row].status, DescribeRow(row, folder));
+        if (!folder.empty() && !RowValid(row, folder)) wrong = true;
+        // Most Wanted's worlds open in a later version: listed once the reader is there.
+        if (RowValid(row, folder) && row != kRowMostWanted) found.push_back(row);
+    }
+    HWND combo = ::GetDlgItem(dialog, IDC_SETUP_MAIN);
+    int was = -1;
+    const int selected = (int)::SendMessageW(combo, CB_GETCURSEL, 0, 0);
+    if (selected >= 0) was = (int)::SendMessageW(combo, CB_GETITEMDATA, (WPARAM)selected, 0);
+    if (was < 0) was = (int)(INT_PTR)::GetPropW(dialog, L"FRSMainRow") - 1;
+    ::SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+    int select = -1;
+    for (int row : found) {
+        std::wstring label = kRowControls[row].name;
+        if (row != kRowUnderground2 && row != kRowWorld) label += L" (look and export)";
+        const int at = (int)::SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)label.c_str());
+        ::SendMessageW(combo, CB_SETITEMDATA, (WPARAM)at, (LPARAM)row);
+        if (row == was || select < 0) select = row == was ? at : (select < 0 ? at : select);
+    }
+    if (select >= 0) ::SendMessageW(combo, CB_SETCURSEL, (WPARAM)select, 0);
+    ::EnableWindow(combo, !found.empty());
+    PropSheet_SetWizButtons(::GetParent(dialog), !wrong && select >= 0 ? PSWIZB_NEXT : 0);
+}
+
+int MainRow(HWND dialog) {
+    HWND combo = ::GetDlgItem(dialog, IDC_SETUP_MAIN);
+    const int selected = (int)::SendMessageW(combo, CB_GETCURSEL, 0, 0);
+    return selected < 0 ? -1 : (int)::SendMessageW(combo, CB_GETITEMDATA, (WPARAM)selected, 0);
+}
+
+void BrowseForFolder(HWND dialog, int field = IDC_SETUP_PATH,
+                     const wchar_t* title = L"The Need for Speed Underground 2 folder (SPEED2.EXE), or Underground's (speed.exe)") {
     IFileOpenDialog* picker = nullptr;
     if (FAILED(::CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
                                   IID_PPV_ARGS(&picker))))
@@ -404,8 +452,8 @@ void BrowseForFolder(HWND dialog) {
     DWORD options = 0;
     picker->GetOptions(&options);
     picker->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
-    picker->SetTitle(L"The game's folder: Underground 2 (SPEED2.EXE), Underground (speed.exe) or NFS World (nfsw.exe)");
-    const std::wstring current = Trimmed(TextOf(dialog, IDC_SETUP_PATH));
+    picker->SetTitle(title);
+    const std::wstring current = Trimmed(TextOf(dialog, field));
     IShellItem* start = nullptr;
     if (!current.empty() &&
         SUCCEEDED(::SHCreateItemFromParsingName(current.c_str(), nullptr, IID_PPV_ARGS(&start)))) {
@@ -417,7 +465,7 @@ void BrowseForFolder(HWND dialog) {
         if (SUCCEEDED(picker->GetResult(&item))) {
             PWSTR path = nullptr;
             if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
-                SetText(dialog, IDC_SETUP_PATH, path);
+                SetText(dialog, field, path);
                 ::CoTaskMemFree(path);
             }
             item->Release();
@@ -431,12 +479,26 @@ INT_PTR CALLBACK FolderPage(HWND dialog, UINT message, WPARAM wParam, LPARAM lPa
         case WM_INITDIALOG: {
             auto* wizard = (Wizard*)((PROPSHEETPAGEW*)lParam)->lParam;
             ::SetWindowLongPtrW(dialog, DWLP_USER, (LONG_PTR)wizard);
-            SetText(dialog, IDC_SETUP_PATH, wizard->choices.folder);
+            const SetupChoices& c = wizard->choices;
+            SetText(dialog, IDC_SETUP_PATH, c.underground2Folder);
+            SetText(dialog, IDC_SETUP_U1_PATH, c.underground1Folder);
+            SetText(dialog, IDC_SETUP_MW_PATH, c.mostWantedFolder);
+            SetText(dialog, IDC_SETUP_NFSW_PATH, c.worldFolder);
+            // The game edited until now stays the one chosen.
+            const int main = IsWorldFolder(c.folder)          ? kRowWorld
+                             : IsUnderground1Folder(c.folder) ? kRowUnderground1
+                                                              : kRowUnderground2;
+            ::SetPropW(dialog, L"FRSMainRow", (HANDLE)(INT_PTR)(main + 1));
             return TRUE;
         }
+        case WM_DESTROY:
+            ::RemovePropW(dialog, L"FRSMainRow");
+            break;
         case WM_COMMAND:
-            if (LOWORD(wParam) == IDC_SETUP_BROWSE) BrowseForFolder(dialog);
-            if (LOWORD(wParam) == IDC_SETUP_PATH && HIWORD(wParam) == EN_CHANGE) DescribeFolder(dialog);
+            for (const RowControls& row : kRowControls) {
+                if (LOWORD(wParam) == row.browse) BrowseForFolder(dialog, row.path, row.browseTitle);
+                if (LOWORD(wParam) == row.path && HIWORD(wParam) == EN_CHANGE) DescribeFolder(dialog);
+            }
             return TRUE;
         case WM_NOTIFY:
             switch (((NMHDR*)lParam)->code) {
@@ -444,16 +506,31 @@ INT_PTR CALLBACK FolderPage(HWND dialog, UINT message, WPARAM wParam, LPARAM lPa
                     DescribeFolder(dialog);
                     return TRUE;
                 case PSN_WIZNEXT: {
-                    const std::wstring folder = Trimmed(TextOf(dialog, IDC_SETUP_PATH));
-                    if (!IsGameFolder(folder)) { Stay(dialog); return TRUE; }
                     Wizard* wizard = WizardOf(dialog);
-                    wizard->choices.folder = folder;
-                    if (IsUnderground1Folder(folder)) {
-                        // Nothing to install: straight to the end.
+                    SetupChoices& c = wizard->choices;
+                    c.underground2Folder = Trimmed(TextOf(dialog, IDC_SETUP_PATH));
+                    c.underground1Folder = Trimmed(TextOf(dialog, IDC_SETUP_U1_PATH));
+                    c.mostWantedFolder = Trimmed(TextOf(dialog, IDC_SETUP_MW_PATH));
+                    c.worldFolder = Trimmed(TextOf(dialog, IDC_SETUP_NFSW_PATH));
+                    const int main = MainRow(dialog);
+                    const std::wstring* folders[kRows] = { &c.underground2Folder, &c.underground1Folder,
+                                                           &c.mostWantedFolder, &c.worldFolder };
+                    bool wrong = main < 0;
+                    for (int row = 0; row < kRows; ++row)
+                        if (!folders[row]->empty() && !RowValid(row, *folders[row])) wrong = true;
+                    if (wrong) { Stay(dialog); return TRUE; }
+                    c.folder = *folders[main];
+                    if (main != kRowUnderground2) {
+                        // The plugins are Underground 2's: nothing to install.
                         wizard->installed = true;
                         wizard->installOk = true;
-                        wizard->report = L"Need for Speed Underground: no plugins installed (they are for "
-                                         L"Underground 2). Its regions open read-only.";
+                        wizard->report = std::wstring(kRowControls[main].name) +
+                                         L": its worlds open to look at and export; the plugins are for "
+                                         L"Underground 2, so nothing is installed.";
+                        if (main == kRowWorld)
+                            wizard->report = L"Need for Speed World needs no plugin: nothing was installed. Save "
+                                             L"writes your edits into the map's own files and keeps the shipped "
+                                             L"ones in TRACKS\\frs-original.";
                         ::SetWindowLongPtrW(dialog, DWLP_MSGRESULT, IDD_SETUP_DONE);
                     }
                     return TRUE;
@@ -485,9 +562,9 @@ void DescribeParts(HWND dialog) {
         SetText(dialog, IDC_SETUP_ASILOADER_NOTE, L"Not used with NFS World.");
         SetText(dialog, IDC_SETUP_PARTS_NOTE,
                 L"NFS World needs none of these. Save writes objects removed, moved and placed, "
-                L"edited models, replaced textures and collision into the map's own files; the "
-                L"shipped files are kept in TRACKS\\frs-original. New objects, roads, terrain and "
-                L"markers are not written to NFS World yet.");
+                L"new and edited models, textures and collision into the map's own files; the "
+                L"shipped files are kept in TRACKS\\frs-original. Roads, terrain and markers are "
+                L"not written to NFS World yet.");
         PropSheet_SetWizButtons(::GetParent(dialog), PSWIZB_BACK | PSWIZB_NEXT);
         PropSheet_SetNextText(::GetParent(dialog), L"&Next");
         return;
@@ -590,7 +667,7 @@ INT_PTR CALLBACK DonePage(HWND dialog, UINT message, WPARAM wParam, LPARAM lPara
             if (header->code == PSN_SETACTIVE) {
                 Wizard* wizard = WizardOf(dialog);
                 std::wstring text = wizard->installOk
-                    ? L"All set. The editor opens the game's regions from:\r\n" + wizard->choices.folder +
+                    ? L"All set. The editor opens the worlds of:\r\n" + wizard->choices.folder +
                           L"\r\n\r\n"
                     : L"The game folder is set, but not everything was installed -- see below. You can "
                       L"run this setup again from File > Game Folder and Plugins.\r\n\r\n";
@@ -637,7 +714,65 @@ bool IsGameFolder(const std::wstring& folder) {
 
 bool IsUnderground1Folder(const std::wstring& folder) {
     return !folder.empty() && !FileExists(folder + L"\\SPEED2.EXE") && FileExists(folder + L"\\speed.exe") &&
-           DirectoryExists(folder + L"\\TRACKS");
+           DirectoryExists(folder + L"\\TRACKS") && !IsMostWantedFolder(folder);
+}
+
+bool IsMostWantedFolder(const std::wstring& folder) {
+    return !folder.empty() && FileExists(folder + L"\\speed.exe") && FileExists(folder + L"\\TRACKS\\L2RA.BUN");
+}
+
+// Whether the setup stored the folder at all (an empty one: "none").
+bool HasOtherGameFolder(const wchar_t* game) {
+    const std::wstring value = std::wstring(game) + L"Folder";
+    DWORD size = 0;
+    return ::RegGetValueW(HKEY_CURRENT_USER, L"Software\\FRSWorldEditor", value.c_str(), RRF_RT_REG_SZ, nullptr,
+                          nullptr, &size) == ERROR_SUCCESS;
+}
+
+std::wstring OtherGameFolder(const wchar_t* game) {
+    wchar_t buffer[MAX_PATH] = {};
+    DWORD size = sizeof(buffer);
+    const std::wstring value = std::wstring(game) + L"Folder";
+    if (::RegGetValueW(HKEY_CURRENT_USER, L"Software\\FRSWorldEditor", value.c_str(), RRF_RT_REG_SZ, nullptr, buffer,
+                       &size) != ERROR_SUCCESS)
+        return {};
+    return Trimmed(buffer);
+}
+
+void StoreOtherGameFolder(const wchar_t* game, const std::wstring& folder) {
+    const std::wstring value = std::wstring(game) + L"Folder";
+    ::RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\FRSWorldEditor", value.c_str(), REG_SZ, folder.c_str(),
+                      (DWORD)((folder.size() + 1) * sizeof(wchar_t)));
+}
+
+std::wstring DetectUnderground1Folder() {
+    const wchar_t* keys[] = { L"SOFTWARE\\EA GAMES\\Need for Speed Underground",
+                              L"SOFTWARE\\Electronic Arts\\Need for Speed Underground" };
+    for (HKEY root : { HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER })
+        for (const wchar_t* key : keys)
+            for (DWORD view : { (DWORD)KEY_WOW64_32KEY, (DWORD)KEY_WOW64_64KEY })
+                for (const wchar_t* value : { L"Install Dir", L"InstallDir", L"Install Path" }) {
+                    wchar_t path[MAX_PATH] = {};
+                    DWORD size = sizeof(path);
+                    if (::RegGetValueW(root, key, value, RRF_RT_REG_SZ | view, nullptr, path, &size) == ERROR_SUCCESS) {
+                        std::wstring folder = Trimmed(path);
+                        while (!folder.empty() && folder.back() == L'\\') folder.pop_back();
+                        if (IsUnderground1Folder(folder)) return folder;
+                    }
+                }
+    wchar_t buffer[MAX_PATH] = {};
+    std::vector<std::wstring> candidates;
+    for (const wchar_t* variable : { L"ProgramFiles(x86)", L"ProgramFiles" })
+        if (::GetEnvironmentVariableW(variable, buffer, MAX_PATH))
+            for (const wchar_t* tail : { L"\\EA GAMES\\Need For Speed Underground", L"\\Need for Speed Underground" })
+                candidates.push_back(std::wstring(buffer) + tail);
+    for (wchar_t drive = L'C'; drive <= L'H'; ++drive)
+        for (const wchar_t* tail : { L":\\Games\\NFS Underground", L":\\Games\\Need for Speed Underground",
+                                     L":\\Games\\NFSU", L":\\NFSU" })
+            candidates.push_back(std::wstring(1, drive) + tail);
+    for (const std::wstring& folder : candidates)
+        if (IsUnderground1Folder(folder)) return folder;
+    return {};
 }
 
 std::wstring DetectGameFolder() {
@@ -682,10 +817,21 @@ bool RunSetupWizard(HINSTANCE instance, HWND owner, std::wstring& folder) {
 
     Wizard wizard;
     wizard.choices.folder = IsGameFolder(folder) ? folder : DetectGameFolder();
+    // Every game's folder: the one edited, else as stored, else found -- the
+    // first time, the games installed are proposed.
+    SetupChoices& c = wizard.choices;
+    c.underground2Folder = IsUnderground1Folder(c.folder) || IsWorldFolder(c.folder) ? OtherGameFolder(L"Underground2")
+                                                                                    : c.folder;
+    if (c.underground2Folder.empty() && !HasOtherGameFolder(L"Underground2")) c.underground2Folder = DetectGameFolder();
+    c.underground1Folder = IsUnderground1Folder(c.folder) ? c.folder : OtherGameFolder(L"Underground1");
+    if (c.underground1Folder.empty() && !HasOtherGameFolder(L"Underground1"))
+        c.underground1Folder = DetectUnderground1Folder();
+    c.mostWantedFolder = OtherGameFolder(L"MostWanted");
+    c.worldFolder = IsWorldFolder(c.folder) ? c.folder : OtherGameFolder(L"World");
 
     PROPSHEETPAGEW pages[] = {
-        Page(instance, IDD_SETUP_FOLDER, FolderPage, L"Where is Need for Speed Underground 2?", &wizard),
-        Page(instance, IDD_SETUP_PARTS, PartsPage, L"Plugins for the game", &wizard),
+        Page(instance, IDD_SETUP_FOLDER, FolderPage, L"Your games", &wizard),
+        Page(instance, IDD_SETUP_PARTS, PartsPage, L"Plugins for Need for Speed Underground 2", &wizard),
         Page(instance, IDD_SETUP_DONE, DonePage, L"Setup finished", &wizard),
     };
     HPROPSHEETPAGE handles[3] = {};
@@ -704,6 +850,10 @@ bool RunSetupWizard(HINSTANCE instance, HWND owner, std::wstring& folder) {
 
     if (result <= 0 || !IsGameFolder(wizard.choices.folder)) return false;
     folder = wizard.choices.folder;
+    StoreOtherGameFolder(L"Underground2", wizard.choices.underground2Folder);
+    StoreOtherGameFolder(L"Underground1", wizard.choices.underground1Folder);
+    StoreOtherGameFolder(L"MostWanted", wizard.choices.mostWantedFolder);
+    StoreOtherGameFolder(L"World", wizard.choices.worldFolder);
     return true;
 }
 

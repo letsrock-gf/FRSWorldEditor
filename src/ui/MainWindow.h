@@ -51,6 +51,7 @@ private:
     // The procedural roads (ui/RoadsExtension.cpp), built into every editor.
     friend struct RoadsAccess;
     friend struct MarkersAccess;
+    friend struct U1LibraryAccess;
 
     static LRESULT CALLBACK WndProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     LRESULT Handle(UINT message, WPARAM wParam, LPARAM lParam);
@@ -74,6 +75,8 @@ private:
     // Worlds: whole sets of edits, one open at a time (io/WorldProfiles.h).
     void NewWorld();
     void OpenWorld();
+    // Opens the world file at `path` (File > Open World without the dialog).
+    void OpenWorldPath(const std::wstring& path);
     void SaveWorld();
     void SaveWorldAs();
     // A zip players unpack into their game: the world's game files and the
@@ -101,6 +104,8 @@ private:
     // and callers naturally pass the name out of the world it is about to
     // destroy.
     void OpenRegion(std::wstring region);
+    // The region list read again (a region was made or removed), then `region` opened.
+    void ReopenRegions(const std::wstring& region);
 
     // Asks where to put it, then writes the selection as OBJ + MTL + a JSON
     // manifest for Blender.
@@ -318,9 +323,15 @@ private:
     int  shownTab_ = -1;
     static constexpr UINT kShellTreeActivate = WM_APP + 0x51;
     static constexpr UINT kStopGameMessage = WM_APP + 0x55;
+    // A world file named on the command line, opened once the window is up.
+    static constexpr UINT kOpenWorldArgMessage = WM_APP + 0x56;
     // View > Sky and View > Animations (added to the View menu at start).
     static constexpr int kViewSkyCommand = 44601, kViewAnimationsCommand = 44602, kViewGameLookCommand = 44603,
-                         kViewHideBackgroundCommand = 44604, kViewHideDistantLodCommand = 44605;
+                         kViewHideBackgroundCommand = 44604, kViewHideDistantLodCommand = 44605,
+                         kViewEditedOnlyCommand = 44606;
+    // View > Show Only Edited: hands the Edits list's models, textures and
+    // records to the renderer's filter.
+    void PushEditedContent();
     void StopGame();
     static constexpr UINT kShellLibraryActivate = WM_APP + 0x52;
 

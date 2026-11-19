@@ -1,4 +1,6 @@
 #include "io/MarkerWrite.h"
+#include "nfs/CustomRegions.h"
+#include "io/DistrictFog.h"
 
 #include "core/Log.h"
 #include "nfs/Jdlz.h"
@@ -781,20 +783,20 @@ bool WriteMarkersToGame(const std::wstring& gameFolder, const std::wstring& regi
     const bool needGlobal = needRoutes;
 
     std::vector<u8> zones, positions, career, layout;
-    const std::wstring routes = gameFolder + L"\\TRACKS\\ROUTES" + region;
+    const std::wstring routes = nfs::ShippedTrackFile(gameFolder, region, L"ROUTES" + region);
     if (needRoutes) {
         zones = ReadWholeFile(routes + L"\\PathsFreeRoam.bin");
         positions = ReadWholeFile(routes + L"\\TrackPosMarkersFreeRoam.bin");
     }
     if (needGlobal) career = ReadWholeFile(gameFolder + L"\\GLOBAL\\GLOBALB.BUN");
-    layout = ReadWholeFile(gameFolder + L"\\TRACKS\\" + region + L".BUN");
+    layout = ReadWholeFile(nfs::ShippedTrackFile(gameFolder, region, region + L".BUN"));
     if ((needRoutes && (zones.empty() || positions.empty())) || (needGlobal && career.empty()) ||
         layout.empty()) {
         message = L"Could not read the shipped PathsFreeRoam.bin, TrackPosMarkersFreeRoam.bin, "
                   L"GLOBALB.BUN or the region file.";
         return false;
     }
-    const size_t shippedLayout = layout.size();
+    const std::vector<u8> shippedLayout = layout;
 
     // The race triggers first: their run comes before the shops'.
     if (needRoutes && (!BuildRaceZones(zones, starts, message) || !BuildZones(zones, shops, message) ||
@@ -820,12 +822,14 @@ bool WriteMarkersToGame(const std::wstring& gameFolder, const std::wstring& regi
         if (!AddMinimapIndicators(hud, minimapClones, message)) return false;
     }
     if (!BuildBeacons(layout, shops, message)) return false;
+    // The same file carries the fog by neighbourhood (io/DistrictFog): put back in last.
+    if (!ApplyFogFromDisk(layout, gameFolder, region, message)) return false;
 
     MakeFolders(gameFolder, region);
     // The game asks for GLOBALB.LZC and GLOBALB.BUN by name; an uncompressed
     // copy answers for both.
     const std::vector<u8>* contents[6] = { &zones, &positions, &career, &career, &layout, &hud };
-    const bool wanted[6] = { needRoutes, needRoutes, needGlobal, needGlobal, layout.size() != shippedLayout,
+    const bool wanted[6] = { needRoutes, needRoutes, needGlobal, needGlobal, layout != shippedLayout,
                              needHud };
     for (size_t i = 0; i < targets.size(); ++i) {
         if (!wanted[i]) {

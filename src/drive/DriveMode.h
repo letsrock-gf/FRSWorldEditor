@@ -57,7 +57,7 @@ public:
     explicit DriveMode(DriveModeHost host);
     ~DriveMode() override;
 
-    static constexpr int kDriveCommand = 44901;
+    static constexpr int kDriveCommand = 45301;   // 44901 is the race browser's (private RaceTools)
 
     bool Active() const { return active_; }
 

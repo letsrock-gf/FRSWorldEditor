@@ -700,7 +700,12 @@ void DriveMode::DrawHud(float x, float y, float width, float height) {
             ImGui::EndCombo();
         }
         ImGui::SameLine();
-        if (ImGui::Button("Stop")) Stop();
+        if (ImGui::Button("Stop")) {
+            // Stop() takes the car and its physics away: nothing below may read them.
+            Stop();
+            ImGui::End();
+            return;
+        }
 
         const float kmh = std::fabs(sim_->ForwardSpeed()) * 3.6f;
         const int gear = sim_->Gear();

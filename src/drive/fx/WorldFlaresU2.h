@@ -93,6 +93,11 @@ public:
     // Returns the flare count (both kinds).
     size_t Load(const nfs::World& world);
     void Clear();
+
+    // Street-light flares the editor shows before they are written into the
+    // sections (its own street lights, io/LightFlares.h), drawn as pack flares.
+    static void SetExtraFlares(std::vector<LightFlareU2> flares);
+    static std::vector<LightFlareU2>& ExtraFlares();
     bool LoadedFor(const nfs::World* world, size_t loadedSections) const {
         return world_ == world && world != nullptr && loadedSections == loadedSections_;
     }

@@ -37,6 +37,7 @@ struct State {
     std::vector<const nfs::Section*> sections;
     std::vector<std::vector<SectionEdit>> edits;     // parallel to `sections`
     std::vector<Row> rows;
+    std::set<u32> overlayModels;                     // vertex overlays of this region
     std::wstring summary;
     bool reverted = false;
 };
@@ -89,6 +90,7 @@ void Collect(State& state) {
     ListMeshOverlays(state.modelsFolder, overlays);
     for (const MeshOverlayInfo& overlay : overlays) {
         if (Widen(overlay.region) != world.Region()) continue;
+        state.overlayModels.insert(overlay.hash);
         Row row;
         row.overlayPath = overlay.path;
         row.sectionName = L"-";
@@ -278,6 +280,7 @@ void EditsPanel::Refresh(const nfs::World* world, const std::wstring& modelsFold
     ListView_DeleteAllItems(list_);
     if (!world) {
         ::SetWindowTextW(title_, L"Edits in force: no region open");
+        if (onRefreshed) onRefreshed();
         return;
     }
     State& state = impl_->state;
@@ -286,6 +289,26 @@ void EditsPanel::Refresh(const nfs::World* world, const std::wstring& modelsFold
     state.collisionLogged = collisionLogged;
     Collect(state);
     RefreshExtra();
+    if (onRefreshed) onRefreshed();
+}
+
+EditsPanel::EditedContent EditsPanel::Edited() const {
+    EditedContent out;
+    const State& state = impl_->state;
+    out.models = state.overlayModels;
+    for (size_t s = 0; s < state.sections.size(); ++s)
+        for (const SectionEdit& edit : state.edits[s])
+            switch (edit.kind) {
+                case SectionEdit::Kind::MeshChanged:
+                case SectionEdit::Kind::ModelAdded:     out.models.insert(edit.hash); break;
+                case SectionEdit::Kind::TextureChanged:
+                case SectionEdit::Kind::TextureAdded:   out.textures.insert(edit.hash); break;
+                case SectionEdit::Kind::NativeChanged:
+                    out.natives.emplace_back(state.sections[s]->name, edit.sceneryNumber, edit.index);
+                    break;
+                default: break;
+            }
+    return out;
 }
 
 void EditsPanel::RefreshExtra() {

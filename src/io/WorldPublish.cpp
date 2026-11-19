@@ -2,6 +2,7 @@
 
 #include "core/FileFingerprint.h"
 #include "core/Log.h"
+#include "nfs/CustomRegions.h"
 
 #include <windows.h>
 
@@ -30,6 +31,9 @@ std::vector<Pattern>& Patterns() {
         // Not read by the game, but the licences of placed Sketchfab models
         // ask for their authors to be credited wherever the models go.
         { L"CREDITS.TXT", L"" },
+        // New regions (nfs/CustomRegions.h): the loader reads them for the
+        // region's name and its track.
+        { L"REGIONS\\*.FRSREGION", L"" },
     };
     return patterns;
 }
@@ -346,7 +350,9 @@ bool PublishWorld(const PublishRequest& request, PublishResult& result, std::wst
     std::string targets;
     for (const std::wstring& region : regions)
         for (const std::wstring relative : { L"TRACKS\\STREAM" + region + L".BUN", L"TRACKS\\" + region + L".BUN" }) {
-            const frs::FileFingerprint print = frs::FingerprintFile(request.gameFolder + L"\\" + relative);
+            // A new region's files are its source's (nfs/CustomRegions.h); the loader resolves the same way.
+            const frs::FileFingerprint print = frs::FingerprintFile(
+                nfs::ShippedTrackFile(request.gameFolder, region, relative.substr(7)));
             if (!print.valid) continue;
             char line[512];
             std::snprintf(line, sizeof(line), "target=%s|%llu|%016llx\r\n", Utf8(relative).c_str(), print.size,

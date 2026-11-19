@@ -82,6 +82,7 @@ const char* ToolbarIcon(const std::wstring& text) {
         { L"Grid", ICON_PH_GRID_FOUR },             { L"Lights", ICON_PH_LIGHTBULB },
         { L"Terrain", ICON_PH_MOUNTAINS },
         { L"Trees", ICON_PH_TREE },                 { L"Props", ICON_PH_TRAFFIC_CONE },
+        { L"Water", ICON_PH_DROP },
         { L"Fast test", ICON_PH_PLAY },
     };
     for (const Pair& pair : kIcons)
@@ -158,7 +159,7 @@ void MainWindow::DrawShellBars() {
         const auto groupOf = [](const std::wstring& text) {
             for (const wchar_t* game : { L"Launch game", L"Show map", L"Show game", L"Fast test" })
                 if (text == game) return 0;
-            for (const wchar_t* tool : { L"Move", L"Rotate", L"Scale", L"Roads", L"Grid", L"Trees", L"Terrain" })
+            for (const wchar_t* tool : { L"Move", L"Rotate", L"Scale", L"Roads", L"Grid", L"Trees", L"Terrain", L"Water" })
                 if (text == tool) return 1;
             return 2;
         };
@@ -364,7 +365,11 @@ void MainWindow::DrawShellLibrary() {
         const int current = (int)::SendMessageW(libShelf_, CB_GETCURSEL, 0, 0);
         wchar_t text[200] = {};
         if (current >= 0) ::SendMessageW(libShelf_, CB_GETLBTEXT, (WPARAM)current, (LPARAM)text);
-        ImGui::SetNextItemWidth(-FLT_MIN);
+        // The game filter beside it: every game whose models the library
+        // holds (nfs/ForeignModels.h), and the way to add the others.
+        const std::vector<std::wstring> games = catalog_.Games();
+        const float gameWidth = std::min(150.0f, ImGui::GetContentRegionAvail().x * 0.4f);
+        ImGui::SetNextItemWidth(-(gameWidth + ImGui::GetStyle().ItemSpacing.x));
         const char* currentIcon = ShelfIcon(text);
         std::wstring shown = text;
         while (!shown.empty() && shown[0] == L' ') shown.erase(0, 1);
@@ -382,6 +387,26 @@ void MainWindow::DrawShellLibrary() {
                 }
             }
             ImGui::EndCombo();
+        }
+        {
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            const std::wstring& game = catalog_.GameFilter();
+            const std::string label = std::string(ICON_PH_GAME_CONTROLLER) + "  " +
+                                      (game.empty() ? std::string(games.size() > 1 ? "All games" : "")
+                                                    : Utf8(game)) +
+                                      (game.empty() && games.size() == 1 ? Utf8(games[0]) : std::string());
+            if (ImGui::BeginCombo("##game", label.c_str())) {
+                if (games.size() > 1 && ImGui::Selectable("All games", game.empty())) catalog_.SetGameFilter(L"");
+                for (const std::wstring& g : games)
+                    if (ImGui::Selectable(Utf8(g).c_str(), game == g || games.size() == 1))
+                        catalog_.SetGameFilter(games.size() > 1 ? g : L"");
+                ImGui::Separator();
+                if (ImGui::Selectable(ICON_PH_FOLDER_OPEN "  Other games' folders..."))
+                    ::PostMessageW(window_, WM_COMMAND, ID_FILE_OPEN_GAME, 0);
+                ImGui::EndCombo();
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Which game's models. The other games come from File > Game Folder and Plugins.");
         }
         bool used = ::SendMessageW(libUsed_, BM_GETCHECK, 0, 0) == BST_CHECKED;
         if (ImGui::Checkbox("Only models the map places", &used)) {

@@ -356,16 +356,30 @@ END
 // ---------------------------------------------------------------------------
 // The setup wizard (ui/SetupWizard.cpp)
 
-IDD_SETUP_FOLDER DIALOGEX 0, 0, 300, 150
+IDD_SETUP_FOLDER DIALOGEX 0, 0, 300, 170
 STYLE DS_SETFONT | WS_CHILD | WS_DISABLED | WS_CAPTION
 FONT 9, "Segoe UI", 400, 0, 1
 BEGIN
-    LTEXT           "The editor reads the city straight from the game's own files. Point it at the game's folder: the one that holds SPEED2.EXE (Underground 2), speed.exe (Underground) or nfsw.exe (NFS World). Choosing it changes nothing in the game.",
-                    -1, 0, 0, 300, 28
-    LTEXT           "&Game folder:", -1, 0, 36, 300, 10
-    EDITTEXT        IDC_SETUP_PATH, 0, 48, 236, 14, ES_AUTOHSCROLL
-    PUSHBUTTON      "&Browse...", IDC_SETUP_BROWSE, 242, 47, 58, 16
-    LTEXT           "", IDC_SETUP_FOLDER_STATUS, 0, 72, 300, 60
+    LTEXT           "FRS World Editor works with these Need for Speed games. Show it where yours are: each one is optional. Only Need for Speed World has its map files written by Save; the shipped ones are kept.",
+                    -1, 0, 0, 300, 18
+    LTEXT           "Need for Speed &Underground 2", -1, 0, 19, 236, 9
+    EDITTEXT        IDC_SETUP_PATH, 0, 29, 236, 14, ES_AUTOHSCROLL
+    PUSHBUTTON      "Browse...", IDC_SETUP_BROWSE, 242, 28, 58, 16
+    LTEXT           "", IDC_SETUP_FOLDER_STATUS, 0, 44, 300, 8
+    LTEXT           "Need for Speed U&nderground", -1, 0, 52, 236, 9
+    EDITTEXT        IDC_SETUP_U1_PATH, 0, 62, 236, 14, ES_AUTOHSCROLL
+    PUSHBUTTON      "Browse...", IDC_SETUP_U1_BROWSE, 242, 61, 58, 16
+    LTEXT           "", IDC_SETUP_U1_STATUS, 0, 77, 300, 8
+    LTEXT           "Need for Speed &Most Wanted", -1, 0, 85, 236, 9
+    EDITTEXT        IDC_SETUP_MW_PATH, 0, 95, 236, 14, ES_AUTOHSCROLL
+    PUSHBUTTON      "Browse...", IDC_SETUP_MW_BROWSE, 242, 94, 58, 16
+    LTEXT           "", IDC_SETUP_MW_STATUS, 0, 110, 300, 8
+    LTEXT           "Need for Speed &World", -1, 0, 118, 236, 9
+    EDITTEXT        IDC_SETUP_NFSW_PATH, 0, 128, 236, 14, ES_AUTOHSCROLL
+    PUSHBUTTON      "Browse...", IDC_SETUP_NFSW_BROWSE, 242, 127, 58, 16
+    LTEXT           "", IDC_SETUP_NFSW_STATUS, 0, 143, 300, 8
+    LTEXT           "&Edit the worlds of:", -1, 0, 157, 70, 10
+    COMBOBOX        IDC_SETUP_MAIN, 72, 155, 228, 80, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
 END
 
 IDD_SETUP_PARTS DIALOGEX 0, 0, 300, 170
@@ -399,8 +413,8 @@ END
 // ---------------------------------------------------------------------------
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 0,2,1,0
- PRODUCTVERSION 0,2,1,0
+ FILEVERSION 0,2,7,0
+ PRODUCTVERSION 0,2,7,0
  FILEOS VOS_NT_WINDOWS32
  FILETYPE VFT_APP
 BEGIN
@@ -409,13 +423,13 @@ BEGIN
         BLOCK "040904B0"
         BEGIN
             VALUE "CompanyName",      "Chrystian Farias"
-            VALUE "FileDescription",  "FRS World Editor - a map editor for Need for Speed Underground 2"
-            VALUE "FileVersion",      "0.2.1"
+            VALUE "FileDescription",  "FRS World Editor - a world editor for the Need for Speed games of the Black Box era"
+            VALUE "FileVersion",      "0.2.7"
             VALUE "InternalName",     "FRSWorldEditor"
             VALUE "LegalCopyright",   "(c) 2026 Chrystian Farias. CC BY-NC 4.0"
             VALUE "OriginalFilename", "FRSWorldEditor.exe"
             VALUE "ProductName",      "FRS World Editor"
-            VALUE "ProductVersion",   "0.2.1"
+            VALUE "ProductVersion",   "0.2.7"
         END
     END
     BLOCK "VarFileInfo"

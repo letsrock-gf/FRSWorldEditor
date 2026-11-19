@@ -1,5 +1,7 @@
 #include "ui/ModelCatalog.h"
 
+#include "nfs/ForeignModels.h"
+
 #include "nfs/ModelCategory.h"
 #include "nfs/World.h"
 #include "render/ModelThumbnails.h"
@@ -132,7 +134,34 @@ void ModelCatalog::SetWorld(const nfs::World* world) {
             const nfs::ModelCategory category = nfs::CategorizeModel(model->name);
             row.group = category.group;
             row.sub = category.sub;
+            row.game = world->IsUnderground1() ? L"Underground 1" : L"Underground 2";
             rows_.push_back(std::move(row));
+        }
+        // Another game's models (nfs/ForeignModels.h), on the same shelves.
+        std::unordered_set<u32> listed;
+        for (const nfs::ForeignModels* foreign : nfs::ForeignSources()) {
+            // The open region's own game is listed as the region.
+            if (foreign->Game() == (world->IsUnderground1() ? L"Underground 1" : L"Underground 2")) continue;
+            std::vector<const nfs::SolidObject*> models;
+            foreign->ListModels(models);
+            for (const nfs::SolidObject* model : models) {
+                if (!model || model->IsBackdrop()) continue;
+                // One the region holds itself is the region's; one in two
+                // games, the first game's.
+                if (world->ModelHome(model->hash) < world->Loaded().size()) continue;
+                if (!listed.insert(model->hash).second) continue;
+                Row row;
+                row.model = model;
+                row.name = Widen(model->name);
+                row.home = foreign->Origin(model->hash);
+                row.library = true;
+                row.foreign = true;
+                row.game = foreign->Game();
+                const nfs::ModelCategory category = nfs::CategorizeModel(model->name);
+                row.group = category.group;
+                row.sub = category.sub;
+                rows_.push_back(std::move(row));
+            }
         }
         // Shelf by shelf, in the catalogue's order, so "All models" opens on
         // your own and then the buildings rather than on whatever sorts first.
@@ -144,6 +173,7 @@ void ModelCatalog::SetWorld(const nfs::World* world) {
             const size_t ra = rank(a.group), rb = rank(b.group);
             if (ra != rb) return ra < rb;
             if (a.sub != b.sub) return a.sub < b.sub;
+            if (a.foreign != b.foreign) return !a.foreign;
             return a.name < b.name;
         });
         // The extensions' rows last; their models are not the region's.
@@ -165,9 +195,26 @@ void ModelCatalog::ShowShelf(const std::wstring& group) {
     Fill();
 }
 
+void ModelCatalog::SetGameFilter(const std::wstring& game) {
+    if (game == gameFilter_) return;
+    gameFilter_ = game;
+    FillShelves();
+    Fill();
+}
+
+std::vector<std::wstring> ModelCatalog::Games() const {
+    std::vector<std::wstring> games;
+    for (const Row& row : rows_)
+        if (!row.game.empty() && std::find(games.begin(), games.end(), row.game) == games.end())
+            games.push_back(row.game);
+    return games;
+}
+
 bool ModelCatalog::Passes(const Row& row) const {
+    if (!gameFilter_.empty() && !row.IsExtra() && row.game != gameFilter_) return false;
     const bool usedOnly = !usedOnly_ || ::SendMessageW(usedOnly_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    if (!usedOnly || row.mine || row.IsExtra()) return true;
+    // Another game's models are never placed by this map: the filter is about the region's.
+    if (!usedOnly || row.mine || row.IsExtra() || row.foreign) return true;
     // The ground is placed by scenery records like everything else -- all
     // 4,372 pieces of it in L4RA -- so being used does not keep it out. It is
     // the city's floor, not something to put down on it.

@@ -1,6 +1,8 @@
 #include "io/ModelCopy.h"
 
+#include "core/Log.h"
 #include "nfs/ChunkReader.h"
+#include "nfs/ForeignModels.h"
 #include "nfs/World.h"
 
 #include <algorithm>
@@ -72,8 +74,16 @@ bool AppendSolidObject(ByteSpan pack, u64 packOffset, ByteSpan object, u64 objec
                     Put32(bytes, 8 + kInfoObjectCount, Read32(bytes.data() + 8 + kInfoObjectCount) + 1);
                 } else if (part.id == kListHashes) {
                     // Pairs of (hash, 0), sorted, possibly after 0x11 filler.
+                    // A hash may itself start with the byte 0x11 (0x1E88A511),
+                    // so the filler is the longest run of it that still leaves
+                    // whole pairs -- never the first byte of a hash.
+                    size_t run = 8;
+                    while (run < bytes.size() && bytes[run] == 0x11) ++run;
                     size_t first = 8;
-                    while (first < bytes.size() && bytes[first] == 0x11) ++first;
+                    for (size_t filler = run - 8; ; --filler) {
+                        if ((bytes.size() - 8 - filler) % 8 == 0) { first = 8 + filler; break; }
+                        if (filler == 0) break;
+                    }
                     std::vector<std::pair<u32, u32>> pairs;
                     for (size_t at = first; at + 8 <= bytes.size(); at += 8)
                         pairs.push_back({ Read32(bytes.data() + at), Read32(bytes.data() + at + 4) });
@@ -121,7 +131,19 @@ bool AppendSolidObject(ByteSpan pack, u64 packOffset, ByteSpan object, u64 objec
 bool FindModelChunk(const nfs::World& world, u32 hash, ByteSpan& object, u64& fileOffset,
                     u32* packOrder) {
     const size_t home = world.ModelHome(hash);
-    if (home >= world.Loaded().size() || !world.Loaded()[home]->info) return false;
+    if (home >= world.Loaded().size() || !world.Loaded()[home]->info) {
+        // Not the region's: a model from outside it, already in this game's layout.
+        const nfs::ForeignModels* foreign = nfs::ForeignSourceOf(hash);
+        u32 mod128 = 0;
+        std::wstring error;
+        if (!foreign || !foreign->ModelChunk(hash, object, mod128, error)) {
+            if (!error.empty()) LOG_WARN("model %08X from outside the region: %S", hash, error.c_str());
+            return false;
+        }
+        fileOffset = mod128;
+        if (packOrder) *packOrder = 0;
+        return true;
+    }
     const nfs::Section& section = *world.Loaded()[home]->info;
     const ByteSpan bytes = world.SectionBytes(section);
 
@@ -177,6 +199,27 @@ const nfs::Texture* FindGameTextureByFile(const nfs::World& world, const std::st
 }
 
 bool CopyGameTexture(const nfs::Texture& source, NewTexture& copy) {
+    if (source.format == nfs::TextureFormat::Palettised8) {
+        // The street surfaces (lanes, shoulders, pavements) are palettised,
+        // and a pack of ours only holds DXT: the top level is expanded
+        // through its palette -- D3DCOLOR entries, so B, G, R straight
+        // across; the fourth byte is the wet-road gloss, not opacity -- and
+        // compressed with fresh mips. Without this the copy was refused and
+        // the model named a texture its section never had: drawn as nothing.
+        const u32 w = source.width, h = source.height;
+        if (!w || !h || (w % 4) || (h % 4) || source.palette.size < 256 * 4 ||
+            source.pixels.size < (size_t)w * h)
+            return false;
+        std::vector<u32> bgra((size_t)w * h);
+        for (size_t i = 0; i < bgra.size(); ++i) {
+            const u8* entry = source.palette.data + (size_t)source.pixels.data[i] * 4;
+            bgra[i] = (u32)entry[0] | ((u32)entry[1] << 8) | ((u32)entry[2] << 16) | 0xFF000000u;
+        }
+        TextureFromPixels(source.name, bgra, w, h, copy);
+        copy.name = source.name;
+        copy.hash = source.hash;
+        return !copy.pixels.empty();
+    }
     copy.name   = source.name;
     copy.hash   = source.hash;
     copy.width  = source.width;
@@ -210,6 +253,25 @@ std::vector<NewTexture> TexturesToCopy(const nfs::World& world, u32 hash, size_t
                 if (pack->Find(texture)) visible = true;
         }
         if (visible) continue;
+
+        // A model from outside the region brings its own, converted by its source.
+        const nfs::ForeignModels* foreign = nfs::ForeignSourceOf(hash);
+        if (foreign && world.ModelHome(hash) >= world.Loaded().size()) {
+            bool inRegion = false;
+            for (const auto& section : world.Loaded())
+                for (const auto& pack : section->texturePacks)
+                    if (pack->Find(texture)) inRegion = true;
+            NewTexture copy;
+            if (!inRegion) {
+                if (!foreign->CopyTexture(texture, copy)) {
+                    problem += L"A texture of the model could not be converted. ";
+                    continue;
+                }
+                if (std::none_of(out.begin(), out.end(), [&](const NewTexture& t) { return t.hash == copy.hash; }))
+                    out.push_back(std::move(copy));
+                continue;
+            }
+        }
 
         const nfs::Texture* source = world.FindTexture(texture);
         if (!source) {

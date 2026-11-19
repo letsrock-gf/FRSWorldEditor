@@ -5,6 +5,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <algorithm>
 #include <cstring>
 #include <unordered_set>
 
@@ -97,9 +98,17 @@ size_t WorldFlaresU2::Load(const nfs::World& world) {
     world_ = &world;
     loadedSections_ = world.Loaded().size();
     std::unordered_map<uint32_t, ModelMarkers> models;
+    // An empty region (nfs/CustomRegions.h): none of the city's flares. A
+    // positioned section still as shipped holds only the city's; one the
+    // editor wrote has the city's switched off (count 0) and keeps its own.
+    const ByteSpan stream = world.StreamBytes();
+    const auto cityOnly = [&](const nfs::Section& section, const ByteSpan& bytes) {
+        if (!world.EmptyCity() || (section.number >= 2400 && section.number < 2700)) return false;
+        return bytes.data >= stream.data && bytes.data < stream.data + stream.size;
+    };
     for (const nfs::Section& section : world.Table().Sections()) {
         const ByteSpan s = world.SectionBytes(section);
-        if (s.empty()) continue;
+        if (s.empty() || cityOnly(section, s)) continue;
         ReadModelMarkers(s, models);
         for (const ChunkRef& top : Children(s, 0, s.size)) {
             if (top.id != PackChunk) continue;
@@ -145,8 +154,13 @@ size_t WorldFlaresU2::Load(const nfs::World& world) {
     for (const auto& loaded : world.Loaded()) {
         if (!loaded || !loaded->info) continue;
         const nfs::Scenery& sc = loaded->scenery;
+        const auto& removed = loaded->removedNatives;
         for (const nfs::SceneryInstance& inst : sc.instances) {
             if (inst.flags & 0x10) continue;   // hidden in free roam
+            // Removed in the editor (an empty region removes them all).
+            if (!removed.empty() && std::find(removed.begin(), removed.end(),
+                                              std::make_pair(inst.sceneryNumber, inst.record)) != removed.end())
+                continue;
             const auto it = models.find(sc.ModelHash(inst));
             if (it == models.end()) continue;
             const nfs::SceneryInfo& info = sc.infos[inst.infoIndex];
@@ -185,6 +199,13 @@ size_t WorldFlaresU2::Load(const nfs::World& world) {
     return flareCount_;
 }
 
+std::vector<LightFlareU2>& WorldFlaresU2::ExtraFlares() {
+    static std::vector<LightFlareU2> extra;
+    return extra;
+}
+
+void WorldFlaresU2::SetExtraFlares(std::vector<LightFlareU2> flares) { ExtraFlares() = std::move(flares); }
+
 bool WorldFlaresU2::BoxVisible(const FlareViewU2& v, const float* mn, const float* mx) {
     for (int i = 0; i < 6; ++i) {
         const float* q = v.Planes + 4 * i;
@@ -216,6 +237,13 @@ void WorldFlaresU2::Build(const FlareViewU2& view, const std::vector<u32>* visib
             const int n = CarLightFlaresU2::Render(view, f, identity, 1.0f, 0, table_, polys, 2);
             for (int k = 0; k < n && k < 2; ++k) out.push_back({ polys[k], false });
         }
+    }
+    // The editor's own street lights, not in any pack yet: as pack flares.
+    for (const LightFlareU2& f : ExtraFlares()) {
+        const float mn[3] = { f.X - 1.0f, f.Y - 1.0f, f.Z - 1.0f }, mx[3] = { f.X + 1.0f, f.Y + 1.0f, f.Z + 1.0f };
+        if (!BoxVisible(view, mn, mx)) continue;
+        const int n = CarLightFlaresU2::Render(view, f, identity, 1.0f, 0, table_, polys, 2);
+        for (int k = 0; k < n && k < 2; ++k) out.push_back({ polys[k], false });
     }
     // B: the pools, filled in section order by the scenery pass, drawn by sub_494270: list 0 then list 1.
     int used[2] = { 0, 0 };

@@ -229,6 +229,18 @@ def _setup_collision(obj_path):
     bpy.ops.object.select_all(action='DESELECT')
 
 
+def _obj_export(**options):
+    # The exporter's options change between Blender versions: apply_transform
+    # only exists from 4.2 (before, transforms were always applied, which is
+    # what is asked for anyway). An option this Blender does not know is left
+    # out instead of failing the whole export.
+    known = bpy.ops.wm.obj_export.get_rna_type().properties.keys()
+    dropped = [name for name in options if name not in known]
+    if dropped:
+        print("FRS quick edit: this Blender's OBJ exporter lacks", ", ".join(dropped))
+    bpy.ops.wm.obj_export(**{k: v for k, v in options.items() if k in known})
+
+
 def _export(obj_path):
     # Object mode flushes any edit-mode changes into the mesh the exporter
     # reads. A save already does this, but "Send" from the menu does not.
@@ -243,7 +255,7 @@ def _export(obj_path):
         for obj in bpy.data.objects:
             if obj.name.startswith("collision_"):
                 obj.select_set(True)
-        bpy.ops.wm.obj_export(
+        _obj_export(
             filepath=obj_path, check_existing=False, forward_axis='NEGATIVE_Z', up_axis='Y',
             global_scale=1.0, apply_modifiers=True, apply_transform=True, export_selected_objects=True,
             export_uv=False, export_normals=False, export_colors=False, export_materials=True,
@@ -263,7 +275,7 @@ def _export(obj_path):
     #    editor never has to guess how a quad was meant to be cut;
     #  - materials keep their tex_XXXXXXXX names, which is how a face finds its
     #    texture again.
-    bpy.ops.wm.obj_export(
+    _obj_export(
         filepath=obj_path,
         check_existing=False,
         forward_axis='NEGATIVE_Z',

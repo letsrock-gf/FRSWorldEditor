@@ -7,7 +7,12 @@
 #include "ui/CrashReport.h"
 #include "ui/MeshTools.h"
 #include "drive/DriveMode.h"
+#include "ui/FogTools.h"
+#include "ui/RegionTools.h"
+#include "ui/ImportTools.h"
+#include "io/SectionSplice.h"
 #include "ui/HiddenItems.h"
+#include "ui/ReferenceImages.h"
 #include "ui/ZoneTools.h"
 #include "ui/OnlineLibrary.h"
 #include "io/PlacementWrite.h"
@@ -26,6 +31,7 @@
 #include "ui/Resource.h"
 #include "ui/MarkersExtension.h"
 #include "ui/RoadsExtension.h"
+#include "ui/U1Library.h"
 #include "ui/SetupWizard.h"
 #include "io/WorldMesh.h"
 #include "io/WorldWrite.h"
@@ -454,6 +460,22 @@ LRESULT MainWindow::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
             StopGame();
             return 0;
 
+        case kOpenWorldArgMessage: {
+            // FRSWorldEditor.exe <world.frsworld>: opened like File > Open World.
+            int count = 0;
+            LPWSTR* arguments = ::CommandLineToArgvW(::GetCommandLineW(), &count);
+            std::wstring path;
+            for (int i = 1; arguments && i < count; ++i) {
+                const std::wstring argument = arguments[i];
+                if (argument.size() > 9 && ::_wcsicmp(argument.c_str() + argument.size() - 9, L".frsworld") == 0)
+                    path = argument;
+            }
+            if (arguments) ::LocalFree(arguments);
+            if (!path.empty() && CanSwitchWorld() && ConfirmUnsavedPlacements() && ConfirmWorldFileSaved())
+                OpenWorldPath(path);
+            return 0;
+        }
+
         case kBakeWriteMessage:
             WriteBake();
             return 0;
@@ -659,6 +681,7 @@ void MainWindow::OnCreate() {
     edits_.collisionLogged = [this](const std::string& section) {
         return collisionTools_ && collisionTools_->LogCovers(section);
     };
+    edits_.onRefreshed = [this] { PushEditedContent(); };
     edits_.onRevertExtra = [this](const void* owner, const std::vector<size_t>& indices) {
         if (owner == this) { RevertWorldEditRows(indices); return; }
         if (EditorExtension* extension = ExtensionOf(owner)) extension->RevertRows(indices);
@@ -705,6 +728,8 @@ void MainWindow::OnCreate() {
     // After the private ones: a click tries what stands in front of a beacon first.
     extensions_.push_back(CreateMarkersExtension(*this));
     extensions_.push_back(CreateRoadsExtension(*this));
+    // Need for Speed Underground's models in the library (ui/U1Library.h).
+    extensions_.push_back(CreateU1Library(*this));
     // The mesh editor (ui/MeshTools.h), asked before the collision tools so
     // that while it edits, Ctrl+Z steps its own edit back.
     {
@@ -738,6 +763,21 @@ void MainWindow::OnCreate() {
         host.menuChecks = [this] { UpdateMenuChecks(); };
         extensions_.push_back(std::make_unique<HiddenItems>(std::move(host)));
     }
+    // Pictures to build over, editor only (ui/ReferenceImages.h).
+    {
+        ReferenceImagesHost host;
+        host.window = window_;
+        host.menu = menu_;
+        host.viewport = &viewport_;
+        host.properties = &properties_;
+        host.world = [this] { return world_.get(); };
+        host.modelsFolder = [this] { return modelsFolder_; };
+        host.status = [this](const std::wstring& text) { SetStatusText(2, text); };
+        host.menuChecks = [this] { UpdateMenuChecks(); };
+        host.updateProperties = [this] { UpdateProperties(); };
+        host.viewCentre = [this](Vec3& point) { return world_ && ViewCentrePoint(point); };
+        extensions_.push_back(std::make_unique<ReferenceImages>(std::move(host)));
+    }
     // The game's visibility zones, seen and their lists edited (ui/ZoneTools.h).
     {
         ZoneToolsHost host;
@@ -763,6 +803,48 @@ void MainWindow::OnCreate() {
         zoneTools_ = zones.get();
         extensions_.push_back(std::move(zones));
     }
+    // Fog by neighbourhood (ui/FogTools.h): View > Fog by Neighbourhood.
+    {
+        FogToolsHost host;
+        host.menu = menu_;
+        host.viewport = &viewport_;
+        host.world = [this] { return world_.get(); };
+        host.gameFolder = [this] { return gameFolder_; };
+        host.zones = [this]() -> const std::vector<nfs::CityZone>& { return zones_; };
+        host.travelToZone = [this](size_t index) { TravelToZone(index); };
+        host.status = [this](const std::wstring& text) { SetStatusText(2, text); };
+        host.menuChecks = [this] { UpdateMenuChecks(); };
+        extensions_.push_back(std::make_unique<FogTools>(std::move(host)));
+    }
+#ifndef FRS_NO_REGIONS   // CMake FRS_WITH_REGIONS: off in the release build
+    // New regions (ui/RegionTools.h): File > New Region.
+    {
+        RegionToolsHost host;
+        host.window = window_;
+        host.menu = menu_;
+        host.world = [this] { return world_.get(); };
+        host.gameFolder = [this] { return gameFolder_; };
+        host.status = [this](const std::wstring& text) { SetStatusText(2, text); };
+        host.reopenRegions = [this](const std::wstring& region) { ReopenRegions(region); };
+        host.saveEdits = [this] { return SavePlacements(); };
+        extensions_.push_back(std::make_unique<RegionTools>(std::move(host)));
+    }
+    // Whole regions brought into this one (ui/ImportTools.h).
+    {
+        ImportToolsHost host;
+        host.window = window_;
+        host.menu = menu_;
+        host.viewport = &viewport_;
+        host.properties = &properties_;
+        host.world = [this] { return world_.get(); };
+        host.gameFolder = [this] { return gameFolder_; };
+        host.status = [this](const std::wstring& text) { SetStatusText(2, text); };
+        host.updateProperties = [this] { UpdateProperties(); };
+        host.confirmUnsaved = [this] { return ConfirmUnsavedPlacements(); };
+        host.reopenRegion = [this](const std::wstring& region) { ReopenRegions(region); };
+        extensions_.push_back(std::make_unique<ImportTools>(std::move(host)));
+    }
+#endif
     // Collision editing (ui/CollisionTools.h) is part of every build, asked
     // after the build's own extensions.
     {
@@ -795,6 +877,14 @@ void MainWindow::OnCreate() {
         extensions_.push_back(std::make_unique<DriveMode>(std::move(host)));
     }
     for (auto& extension : extensions_) extension->OnCreate();
+    // Alt+E: View > Show Only Edited.
+    if (accelerators_) {
+        const int count = ::CopyAcceleratorTableW(accelerators_, nullptr, 0);
+        std::vector<ACCEL> table((size_t)count);
+        ::CopyAcceleratorTableW(accelerators_, table.data(), count);
+        table.push_back({ (BYTE)(FVIRTKEY | FALT), 'E', (WORD)kViewEditedOnlyCommand });
+        if (HACCEL extended = ::CreateAcceleratorTableW(table.data(), (int)table.size())) accelerators_ = extended;
+    }
 
     // From here the frame is drawn with ImGui (ui/MainWindowShell.cpp): the
     // native menu, toolbar, status bar and side panel stay as hidden sources.
@@ -810,6 +900,8 @@ void MainWindow::OnCreate() {
             ::AppendMenuW(view, MF_STRING, kViewGameLookCommand, L"&Game look (the game's shaders, fog and reflections)");
             ::AppendMenuW(view, MF_STRING, kViewHideBackgroundCommand, L"Hide &background scenery (PAN_ panoramas)");
             ::AppendMenuW(view, MF_STRING, kViewHideDistantLodCommand, L"Hide &distant LOD models (PAN_*_Z, LOD_, _1Z_)");
+            ::AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
+            ::AppendMenuW(view, MF_STRING, kViewEditedOnlyCommand, L"Show &Only Edited (what you changed)	Alt+E");
             // Remembered between sessions.
             for (auto [name, set] : { std::pair<const wchar_t*, void (WorldRenderer::*)(bool)>{
                                           L"HideBackgroundScenery", &WorldRenderer::SetBackgroundSceneryHidden },
@@ -878,6 +970,7 @@ void MainWindow::OnCreate() {
         ::PostMessageW(window_, kOpenStoredMessage, 0, 0);
     }
     if (StoredSetupVersion() < kSetupVersion) ::PostMessageW(window_, kRunSetupMessage, 0, 0);
+    else ::PostMessageW(window_, kOpenWorldArgMessage, 0, 0);
 }
 
 void MainWindow::OnSize() {
@@ -1124,6 +1217,22 @@ void MainWindow::OnCommand(int id, int notification, HWND control) {
     }
     if (id == kViewAnimationsCommand) {
         viewport_.GetRenderer().SetAnimationsEnabled(!viewport_.GetRenderer().AnimationsEnabled());
+        UpdateMenuChecks();
+        return;
+    }
+    if (id == kViewEditedOnlyCommand) {
+        WorldRenderer& renderer = viewport_.GetRenderer();
+        renderer.SetEditedOnly(!renderer.EditedOnly());
+        if (renderer.EditedOnly()) {
+            PushEditedContent();
+            // Whatever is selected may be gone from the view now.
+            renderer.ClearSelection();
+            UpdateProperties();
+        }
+        SetStatusText(2, renderer.EditedOnly()
+                             ? L"Showing only what you changed: placed and moved objects, edited meshes and "
+                               L"textures, and the extensions' own (roads, markers...). Alt+E shows all again."
+                             : L"Showing the whole world again.");
         UpdateMenuChecks();
         return;
     }
@@ -1417,13 +1526,16 @@ void MainWindow::RunSetup() {
     StoreSetupVersion(kSetupVersion);
     StoreGameFolder(folder);
     if (folder != gameFolder_ || !world_) SetGameFolder(folder);
+    // The other games' model libraries (ui/U1Library.h, ...) read their folders again.
+    ::PostMessageW(window_, WM_COMMAND, ID_LIBRARY_FOLDERS_CHANGED, 0);
 }
 
 void MainWindow::ShowAbout() {
     const int answer = ::MessageBoxW(
         window_,
         L"FRS World Editor 0.1.0\n"
-        L"A map editor for Need for Speed Underground 2.\n\n"
+        L"A world editor for the Need for Speed games of the Black Box era: it edits Underground 2's "
+        L"worlds and reads Underground's models.\n\n"
         L"Created by Chrystian Farias.\n\n"
         L"Licensed under Creative Commons Attribution-NonCommercial 4.0 (CC BY-NC 4.0): you may "
         L"share and adapt it, crediting Chrystian Farias, and not for commercial purposes -- it may "
@@ -1483,6 +1595,10 @@ std::wstring MainWindow::WorldDisplayName() const {
 
 void MainWindow::RememberWorldFile() {
     worldSignature_ = io::WorldSignature(modelsFolder_);
+    // A session on another game folder (FRS_GAME_FOLDER, tests) keeps its
+    // world to itself: the stored one belongs to the player's game.
+    const wchar_t* overrideFolder = _wgetenv(L"FRS_GAME_FOLDER");
+    if (overrideFolder && *overrideFolder) return;
     HKEY key = nullptr;
     if (::RegCreateKeyExW(HKEY_CURRENT_USER, kSettingsKey, 0, nullptr, 0, KEY_WRITE, nullptr, &key, nullptr) ==
         ERROR_SUCCESS) {
@@ -1490,6 +1606,9 @@ void MainWindow::RememberWorldFile() {
                          (DWORD)((worldPath_.size() + 1) * sizeof(wchar_t)));
         ::RegSetValueExA(key, "WorldSignature", 0, REG_SZ, (const BYTE*)worldSignature_.c_str(),
                          (DWORD)(worldSignature_.size() + 1));
+        // Which game folder's models the world was opened into.
+        ::RegSetValueExW(key, L"WorldFileGame", 0, REG_SZ, (const BYTE*)gameFolder_.c_str(),
+                         (DWORD)((gameFolder_.size() + 1) * sizeof(wchar_t)));
         ::RegCloseKey(key);
     }
     worldName_ = WorldDisplayName();
@@ -1578,6 +1697,10 @@ void MainWindow::OpenWorld() {
     dialog.lpstrTitle = L"Open World";
     dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
     if (!::GetOpenFileNameW(&dialog)) return;
+    OpenWorldPath(path);
+}
+
+void MainWindow::OpenWorldPath(const std::wstring& path) {
     io::WorldFile file;
     std::wstring error;
     if (!file.Load(path, error)) {
@@ -1861,6 +1984,29 @@ void MainWindow::LaunchGame() {
             kWindowTitle, MB_ICONQUESTION | MB_YESNOCANCEL);
         if (answer == IDYES) { RunSetup(); return; }
         if (answer == IDCANCEL) return;
+    }
+
+    // Sections an older version wrote with a broken object list crash the
+    // game as soon as it loads them: they are rebuilt by a save, asked first
+    // since a save writes every unsaved edit as well.
+    if (world_) {
+        std::wstring broken;
+        size_t count = 0;
+        for (const auto& section : world_->Loaded())
+            if (section->brokenObjectList && section->info) {
+                if (count++ < 8) broken += (broken.empty() ? L"" : L", ") + Widen(section->info->name);
+            }
+        if (count) {
+            const int answer = ::MessageBoxW(
+                window_,
+                Format(L"%zu section(s) of this world were written by an older version of the editor in a way "
+                       L"that crashes the game (%s).\n\nSave the world now to rebuild them? Saving also "
+                       L"writes any other edit not saved yet.",
+                       count, broken.c_str()).c_str(),
+                kWindowTitle, MB_ICONWARNING | MB_YESNOCANCEL);
+            if (answer == IDCANCEL) return;
+            if (answer == IDYES && !SavePlacements()) return;
+        }
     }
 
     // What is still only in the editor (roads, terrain) goes into the game's
@@ -2723,16 +2869,31 @@ void MainWindow::SetGameFolder(const std::wstring& folder) {
     viewport_.GetRenderer().SetGameFolder(folder);
     modelsFolder_ = folder + L"\\models";
     if (IsWorldFolder(folder)) {
-        // The NFS World port only reads the game so far. Whatever the editor
-        // writes goes beside the editor, never into the game's folder.
+        // NFS World loads nothing from <game>\models. What the Underground 2
+        // path keeps there stays beside the editor; the map's edits are written
+        // into TRACKS by Save (io/WorldWrite.h).
         wchar_t self[MAX_PATH] = {};
         ::GetModuleFileNameW(nullptr, self, MAX_PATH);
         std::wstring beside = self;
         beside.resize(beside.find_last_of(L'\\'));
         modelsFolder_ = beside + L"\\nfsw-models";
     }
-    // The world file last opened or saved, and how <game>\models stood then.
-    {
+    // The world file last opened or saved, and how <game>\models stood then
+    // -- only for the game folder it was opened into. A session on another
+    // folder (FRS_GAME_FOLDER) starts untitled: saving there once wrote a
+    // test folder's edits over the player's last world file.
+    worldPath_.clear();
+    worldSignature_.clear();
+    const wchar_t* overrideFolder = _wgetenv(L"FRS_GAME_FOLDER");
+    bool sameGame = !(overrideFolder && *overrideFolder);
+    if (sameGame) {
+        wchar_t stored[MAX_PATH * 2] = {};
+        DWORD size = sizeof(stored);
+        if (::RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, L"WorldFileGame", RRF_RT_REG_SZ, nullptr, stored, &size) ==
+            ERROR_SUCCESS)
+            sameGame = ::_wcsicmp(stored, folder.c_str()) == 0;
+    }
+    if (sameGame) {
         wchar_t path[MAX_PATH * 2] = {};
         char signature[64] = {};
         DWORD size = sizeof(path);
@@ -2761,9 +2922,27 @@ void MainWindow::SetGameFolder(const std::wstring& folder) {
     SetStatusText(0, Format(L"%zu regions available", regions.size()));
 
     if (!regions.empty()) {
-        ::SendMessageW(regionCombo_, CB_SETCURSEL, 0, 0);
-        OpenRegion(regions.front());
+        // FRS_REGION=<name> opens that region first (tests), else the first one.
+        size_t first = 0;
+        if (const wchar_t* wanted = _wgetenv(L"FRS_REGION"))
+            for (size_t i = 0; i < regions.size(); ++i)
+                if (regions[i] == wanted) first = i;
+        ::SendMessageW(regionCombo_, CB_SETCURSEL, (WPARAM)first, 0);
+        OpenRegion(regions[first]);
     }
+}
+
+void MainWindow::ReopenRegions(const std::wstring& region) {
+    ::SendMessageW(regionCombo_, CB_RESETCONTENT, 0, 0);
+    const auto regions = nfs::World::AvailableRegions(tracksFolder_);
+    int select = 0;
+    for (size_t i = 0; i < regions.size(); ++i) {
+        ::SendMessageW(regionCombo_, CB_ADDSTRING, 0, (LPARAM)regions[i].c_str());
+        if (regions[i] == region) select = (int)i;
+    }
+    if (regions.empty()) return;
+    ::SendMessageW(regionCombo_, CB_SETCURSEL, (WPARAM)select, 0);
+    OpenRegion(regions[(size_t)select]);
 }
 
 void MainWindow::OpenRegion(std::wstring region) {
@@ -2777,6 +2956,14 @@ void MainWindow::OpenRegion(std::wstring region) {
     world->SetOverlayFolder(modelsFolder_);
 
     if (!world->Open(tracksFolder_, region)) {
+        ::MessageBoxW(window_, Format(L"Could not open region %s.", region.c_str()).c_str(),
+                      kWindowTitle, MB_ICONERROR | MB_OK);
+        return;
+    }
+    // Sections whose edited bytes share stream space (io/SectionSplice.h):
+    // moved apart, and the region read again with them where they now are.
+    if (!world->IsUnderground1() && RepairOverlappingSpans(*world, modelsFolder_) > 0 &&
+        !world->Open(tracksFolder_, region)) {
         ::MessageBoxW(window_, Format(L"Could not open region %s.", region.c_str()).c_str(),
                       kWindowTitle, MB_ICONERROR | MB_OK);
         return;
@@ -3168,6 +3355,18 @@ void MainWindow::LoadAllSections() {
         std::vector<size_t> all(worldEditRows_.size());
         for (size_t i = 0; i < all.size(); ++i) all[i] = i;
         RevertWorldEditRows(all);
+    }
+    // FRS_SAVE_SELFTEST=1, and only with FRS_GAME_FOLDER (a scratch game
+    // folder, never the player's): saves what the load found to save -- such
+    // as sections an older version wrote broken -- once, then closes.
+    static bool saveTested = false;
+    if (!saveTested && std::getenv("FRS_SAVE_SELFTEST") && std::getenv("FRS_GAME_FOLDER")) {
+        saveTested = true;
+        size_t pending = 0;
+        for (const auto& section : world_->Loaded()) pending += section->placementsChanged;
+        const bool saved = SavePlacements();
+        LOG_INFO("save selftest: %zu sections to save, %s", pending, saved ? "saved" : "FAILED");
+        ::PostMessageW(window_, WM_CLOSE, 0, 0);
     }
 }
 
@@ -3610,7 +3809,25 @@ void MainWindow::UpdateMenuChecks() {
                     MF_BYCOMMAND | (viewport_.GetRenderer().BackgroundSceneryHidden() ? MF_CHECKED : MF_UNCHECKED));
     ::CheckMenuItem(menu_, kViewHideDistantLodCommand,
                     MF_BYCOMMAND | (viewport_.GetRenderer().DistantLodHidden() ? MF_CHECKED : MF_UNCHECKED));
+    ::CheckMenuItem(menu_, kViewEditedOnlyCommand,
+                    MF_BYCOMMAND | (viewport_.GetRenderer().EditedOnly() ? MF_CHECKED : MF_UNCHECKED));
     for (auto& extension : extensions_) extension->UpdateMenuChecks(menu_);
+}
+
+void MainWindow::PushEditedContent() {
+    EditsPanel::EditedContent edited = edits_.Edited();
+    std::set<std::string> natives;
+    if (world_)
+        for (const auto& [sectionName, sceneryNumber, record] : edited.natives)
+            for (const auto& loaded : world_->Loaded()) {
+                if (!loaded->info || loaded->info->name != sectionName) continue;
+                const auto& instances = loaded->scenery.instances;
+                for (size_t n = 0; n < instances.size(); ++n)
+                    if (instances[n].sceneryNumber == sceneryNumber && instances[n].record == record)
+                        natives.insert("N " + sectionName + " " + std::to_string(n));
+            }
+    viewport_.GetRenderer().SetEditedContent(std::move(edited.models), std::move(edited.textures),
+                                             std::move(natives));
 }
 
 void MainWindow::SetStatusText(int part, const std::wstring& text) {

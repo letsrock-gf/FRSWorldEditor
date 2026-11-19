@@ -160,7 +160,7 @@ int ClassifyBuilding(const std::string& name, const Vec3& min, const Vec3& max) 
 void Network::PlaceBuildings(std::vector<Pole>& poles, std::vector<MeshPiece>& pieces) const {
     bool any = false;
     for (const Segment& s : segments_)
-        if (!s.profile.bridge && (s.profile.zoneLeft || s.profile.zoneRight)) any = true;
+        if (!s.profile.OffGround() && (s.profile.zoneLeft || s.profile.zoneRight)) any = true;
     if (!any || buildings_.empty()) return;
 
     // The models of each kind; a kind the region has none of takes any.
@@ -245,7 +245,7 @@ void Network::PlaceBuildings(std::vector<Pole>& poles, std::vector<MeshPiece>& p
     size_t placed = 0;
     for (const Segment& s : segments_) {
         const RoadProfile& p = s.profile;
-        if (p.bridge || (!p.zoneLeft && !p.zoneRight)) continue;
+        if (p.OffGround() || (!p.zoneLeft && !p.zoneRight)) continue;
         const Curve curve = CurveOf(s);
         // Length along the road's middle, for walking it.
         const int n = 200;
@@ -347,8 +347,12 @@ void Network::PlaceBuildings(std::vector<Pole>& poles, std::vector<MeshPiece>& p
                     Box inner = box;
                     inner.hu = std::max(0.5f, box.hu - 0.3f);
                     inner.hv = std::max(0.5f, box.hv - 0.3f);
+                    // Walls of the model's height, not a barrier: a barrier
+                    // stands +/-127 m and would wall off a road passing over
+                    // or under the building.
                     CollisionWall wall;
-                    wall.barrier = true;
+                    wall.barrier = false;
+                    wall.height = std::clamp(m.max.z - m.min.z, 3.0f, 100.0f);
                     wall.surface = kSurfaceWall;
                     for (int k = 0; k <= 4; ++k) {
                         Vec3 c = inner.Corner(k % 4);

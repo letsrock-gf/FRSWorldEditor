@@ -1,4 +1,5 @@
 #include "nfs/Markers.h"
+#include "nfs/CustomRegions.h"
 
 #include "core/Log.h"
 #include "nfs/World.h"
@@ -193,6 +194,7 @@ Mat4 PlacedDoorMatrix(const Mat4& templateDoor, const Marker& shop, const Marker
 void MarkerSet::Clear() {
     zones_.clear();
     markers_.clear();
+    templates_.clear();
     careerRaces_.clear();
     keptLines_.clear();
     placedChanged_ = false;
@@ -210,6 +212,17 @@ bool MarkerSet::Load(const std::wstring& gameFolder, const std::wstring& region)
     }
     if (!LoadCareer(gameFolder + L"\\GLOBAL\\GLOBALB.BUN"))
         LOG_WARN("markers: could not read the career in GLOBALB.BUN; zones are shown unnamed");
+    // An empty region (nfs/CustomRegions.h): the career's shops and race
+    // starts stand in the city it does not have -- only the ones placed in it.
+    CustomRegion custom;
+    if (FindCustomRegion(gameFolder, region, custom) && custom.empty) {
+        // Kept apart, not shown: a shop placed here is still a working copy of one.
+        for (const Marker& m : markers_)
+            if (!m.IsPlaced()) templates_.push_back(m);
+        markers_.erase(std::remove_if(markers_.begin(), markers_.end(),
+                                      [](const Marker& m) { return !m.IsPlaced(); }),
+                       markers_.end());
+    }
     LoadPlaced();
 
     size_t shops = 0, races = 0;
@@ -472,16 +485,18 @@ bool MarkerSet::RemovePlaced(size_t index) {
 }
 
 const Marker* MarkerSet::FindShop(const std::string& name) const {
-    for (const Marker& marker : markers_)
-        if (!marker.IsPlaced() && marker.kind != MarkerKind::RaceStart && marker.name == name) return &marker;
+    for (const std::vector<Marker>* list : { &markers_, &templates_ })
+        for (const Marker& marker : *list)
+            if (!marker.IsPlaced() && marker.kind != MarkerKind::RaceStart && marker.name == name) return &marker;
     return nullptr;
 }
 
 const Marker* MarkerSet::FirstShopOfKind(MarkerKind kind) const {
     // The one that opens earliest in the career.
     const Marker* best = nullptr;
-    for (const Marker& marker : markers_)
-        if (!marker.IsPlaced() && marker.kind == kind && (!best || marker.stage < best->stage)) best = &marker;
+    for (const std::vector<Marker>* list : { &markers_, &templates_ })
+        for (const Marker& marker : *list)
+            if (!marker.IsPlaced() && marker.kind == kind && (!best || marker.stage < best->stage)) best = &marker;
     return best;
 }
 

@@ -24,8 +24,9 @@
 # version pinned below, into third_party\asi-loader.
 
 param(
-    [string]$Version = "0.2.1",
+    [string]$Version = "0.2.7",
     [switch]$WithExtensions,
+    [switch]$WithRegions,
     [string]$FastTest = (Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) "FRSFastTest"),
     [string]$AsiLoaderVersion = "v9.7.4"
 )
@@ -35,6 +36,8 @@ $root = $PSScriptRoot
 $dist = Join-Path $root "dist"
 $name = "FRSWorldEditor-$Version" + $(if ($WithExtensions) { "-private" } else { "" })
 $extensions = if ($WithExtensions) { "ON" } else { "OFF" }
+# New regions and region import are left out unless asked for: not ready for players.
+$regions = if ($WithRegions) { "ON" } else { "OFF" }
 $stage = Join-Path $dist $name
 $asiLoader = Join-Path $root "third_party\asi-loader"
 
@@ -54,7 +57,7 @@ function Build([string]$source, [string]$binary, [string]$arch, [string[]]$optio
 
 # ---- build: the editor is x64, the game and its plugins are 32-bit
 "[..] building the editor"
-Build $root (Join-Path $root "build-release") "x64" @("-DFRS_WITH_EXTENSIONS=$extensions")
+Build $root (Join-Path $root "build-release") "x64" @("-DFRS_WITH_EXTENSIONS=$extensions", "-DFRS_WITH_REGIONS=$regions")
 "[..] building FRS World Loader"
 Build (Join-Path $root "loader") (Join-Path $root "loader\build-release") "Win32" @("-DFRS_WITH_EXTENSIONS=$extensions")
 if (-not (Test-Path (Join-Path $FastTest "CMakeLists.txt"))) {

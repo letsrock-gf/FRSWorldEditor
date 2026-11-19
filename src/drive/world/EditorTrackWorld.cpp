@@ -1,5 +1,6 @@
 // Editor -> bb::TrackWorld bridge and the CityDrive spawn helpers.
 #include "drive/world/EditorTrackWorld.h"
+#include "nfs/CustomRegions.h"
 
 #include "nfs/Collision.h"
 #include "nfs/SectionTable.h"
@@ -124,7 +125,7 @@ bool NearestGround(TrackWorld& track, float x, float y, float& outX, float& outY
 
 bool FindFreeRoamStart(const std::wstring& gameFolder, const std::wstring& region, TrackPositionMarkerU2& marker)
 {
-    const std::wstring path = gameFolder + L"\\TRACKS\\ROUTES" + region + L"\\TrackPosMarkersFreeRoam.bin";
+    const std::wstring path = nfs::ShippedTrackFile(gameFolder, region, L"ROUTES" + region + L"\\TrackPosMarkersFreeRoam.bin");
     std::ifstream f(path, std::ios::binary);
     if (!f) return false;
     std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());

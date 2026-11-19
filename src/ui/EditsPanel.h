@@ -5,6 +5,8 @@
 #include <windows.h>
 
 #include <functional>
+#include <set>
+#include <tuple>
 #include <memory>
 #include <string>
 #include <vector>
@@ -46,6 +48,19 @@ public:
     // A section whose collision changes an extension lists itself, one row
     // per change: its whole-pack "Collision edited" rows are left out.
     std::function<bool(const std::string& section)> collisionLogged;
+    // After every Refresh: the list was made anew (View > Show Only Edited
+    // reads EditedContent then).
+    std::function<void()> onRefreshed;
+
+    // What the listed edits touch, for View > Show Only Edited: models whose
+    // mesh changed, was added or had vertices moved; textures changed or
+    // added; and shipped scenery records altered, as (section, scenery
+    // chunk number, record index).
+    struct EditedContent {
+        std::set<u32> models, textures;
+        std::vector<std::tuple<std::string, u32, u32>> natives;
+    };
+    EditedContent Edited() const;
 
     // The ticked rows as text (section, kind, what, detail), and ticking the
     // rows that read the same again -- across a refresh, when a save in

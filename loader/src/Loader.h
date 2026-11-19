@@ -80,6 +80,9 @@ void RouteProbeFrame();
 
 // Parts linked in from elsewhere: installed from DllMain on v1.2 only, then
 // called on the game thread every frame.
+void InstallLimits();     // Limits.cpp: the engine's limits raised, from DllMain on v1.2
+void LimitsFrame();
+void StartTracks();       // Tracks.cpp: new track numbers (races, regions), from DllMain on v1.2
 void InstallExtensions();
 void ExtensionsFrame();
 

@@ -7,10 +7,13 @@
 #include "io/SectionRebuild.h"
 #include <algorithm>
 #include "nfs/ChunkReader.h"
+#include "nfs/ForeignModels.h"
 #include "nfs/SceneryEdit.h"
 #include "nfs/World.h"
 
+#include <cstdio>
 #include <sstream>
+#include <string>
 
 namespace {
 
@@ -24,11 +27,68 @@ bool PlanPlacementSave(const nfs::World& world, const std::wstring& modelsFolder
     ListSpanOverlays(modelsFolder, world.Region(), existing);
 
     const auto& loaded = world.Loaded();
+
+    // Models from outside the region (nfs/ForeignModels.h) placed anywhere: they
+    // go into the region's library, where every section sees them. Half the
+    // positioned sections have no texture pack to take a texture in. The
+    // library keeps models and textures apart -- in L4RA the X sections hold
+    // only models (X0) and the Y sections only textures (Y0) -- so the model
+    // goes to the largest library section with models and its textures to the
+    // largest one with textures, which may be the same section.
+    std::vector<u32> foreign;
+    size_t library = SIZE_MAX, textureLibrary = SIZE_MAX;
+    if (!nfs::ForeignSources().empty()) {
+        for (const auto& section : loaded)
+            for (const auto& placement : section->placements) {
+                const u32 hash = placement.instance.modelHash;
+                if (world.ModelHome(hash) < loaded.size() || !world.FindModel(hash)) continue;
+                if (std::find(foreign.begin(), foreign.end(), hash) == foreign.end()) foreign.push_back(hash);
+            }
+        if (!foreign.empty()) {
+            const auto larger = [&](size_t i, size_t than) {
+                return than == SIZE_MAX || loaded[i]->info->originalStreamSize > loaded[than]->info->originalStreamSize;
+            };
+            for (size_t i = 0; i < loaded.size(); ++i) {
+                if (!loaded[i]->info || !world.IsLibrary(*loaded[i])) continue;
+                if (!loaded[i]->solidLists.empty() && larger(i, library)) library = i;
+                if (!loaded[i]->texturePacks.empty() && larger(i, textureLibrary)) textureLibrary = i;
+            }
+            if (library == SIZE_MAX || textureLibrary == SIZE_MAX) {
+                report << L"The region has no library section to take in the "
+                       << (library == SIZE_MAX ? L"models" : L"textures") << L" of the models from outside it. "
+                       << L"Left alone.\n";
+                plan.ok = false;
+                foreign.clear();
+                library = textureLibrary = SIZE_MAX;
+            } else {
+                LOG_INFO("placements: %zu models from outside the region go to library section %s, their textures to %s",
+                         foreign.size(), loaded[library]->info->name.c_str(), loaded[textureLibrary]->info->name.c_str());
+            }
+        }
+    }
+    const auto isForeign = [&](u32 hash) { return std::find(foreign.begin(), foreign.end(), hash) != foreign.end(); };
+
     for (size_t index = 0; index < loaded.size(); ++index) {
         const nfs::LoadedSection& section = *loaded[index];
-        if (!(section.placementsChanged || section.collisionChanged) || !section.info) continue;
+        const bool takesForeign = index == library && !foreign.empty();
+        const bool takesForeignTextures = index == textureLibrary && !foreign.empty();
+        if (!(section.placementsChanged || section.collisionChanged || takesForeign || takesForeignTextures) ||
+            !section.info)
+            continue;
         const nfs::Section& entry = *section.info;
         const std::wstring name(entry.name.begin(), entry.name.end());
+
+        // A section with nothing of its own in the stream file -- one an
+        // imported region brought in (io/RegionImport.h): it is made whole
+        // from its source region at every bake of the import, so it holds no
+        // edits of its own. A change that reached it (the copy of new road
+        // collision along its edge) is left out, and the rest is written.
+        if (entry.originalStreamOffset + (u64)entry.originalStreamSize > world.StreamBytes().size) {
+            LOG_WARN("placements %s: an imported region's section takes no edits; its change is left out",
+                     entry.name.c_str());
+            report << name << L": part of an imported region, which takes no edits yet; its change is left out.\n";
+            continue;
+        }
 
         // The edits in force, with the placements replaced by the editor's
         // own list.
@@ -85,11 +145,18 @@ bool PlanPlacementSave(const nfs::World& world, const std::wstring& modelsFolder
         // Collision edited in the editor: each changed pack re-encoded, grid
         // and all, in place of whatever collision edit the section had.
         size_t collisionPacks = 0, collisionPolygons = 0;
-        if (section.collisionChanged) {
+        // An empty region (nfs/CustomRegions.h): a section written goes out
+        // with every pack as the editor holds it -- the city's collision is
+        // not in it -- not only the ones edited.
+        std::vector<u32> packsToWrite = section.changedCollisionPacks;
+        if (world.EmptyCity())
+            for (u32 p = 0; p < (u32)section.collision.size(); ++p)
+                if (std::find(packsToWrite.begin(), packsToWrite.end(), p) == packsToWrite.end()) packsToWrite.push_back(p);
+        if (section.collisionChanged || (world.EmptyCity() && !packsToWrite.empty())) {
             std::vector<u32> orders;
             collision::CollisionChunkOrders(world, entry, orders);
             bool bad = false;
-            for (const u32 packIndex : section.changedCollisionPacks) {
+            for (const u32 packIndex : packsToWrite) {
                 if (packIndex >= section.collision.size() || packIndex >= orders.size()) {
                     report << name << L": an edited collision pack is not where the loader found it. Left alone.\n";
                     bad = true;
@@ -120,7 +187,11 @@ bool PlanPlacementSave(const nfs::World& world, const std::wstring& modelsFolder
         // Models to copy in, with the textures the section cannot see.
         size_t copiedModels = 0, copiedTextures = 0;
         bool failed = false;
-        for (const u32 hash : section.importedModels) {
+        std::vector<u32> toCopy;
+        for (const u32 hash : section.importedModels)
+            if (!isForeign(hash)) toCopy.push_back(hash);
+        if (takesForeign) toCopy.insert(toCopy.end(), foreign.begin(), foreign.end());
+        for (const u32 hash : toCopy) {
             const bool present = std::any_of(kept.begin(), kept.end(), [&](const SectionEdit& e) {
                 return e.kind == SectionEdit::Kind::ModelAdded && e.hash == hash;
             });
@@ -133,7 +204,25 @@ bool PlanPlacementSave(const nfs::World& world, const std::wstring& modelsFolder
             ByteSpan object;
             u64 objectOffset = 0;
             if (!FindModelChunk(world, hash, object, objectOffset)) {
-                report << name << L": a model to copy in could not be found. Left alone.\n";
+                // Named in full -- model, hash and the section it was looked
+                // for in -- so a report from a user says which one it was.
+                const nfs::SolidObject* solid = world.FindModel(hash);
+                const std::string modelName = solid ? solid->name : std::string("(unknown model)");
+                const size_t home = world.ModelHome(hash);
+                std::string homeName;
+                if (home >= loaded.size())
+                    homeName = "no loaded section holds it";
+                else if (!loaded[home]->info)
+                    homeName = "its section has no table entry";
+                else
+                    homeName = "not found in the bytes of section " + loaded[home]->info->name;
+                char hashText[16];
+                std::snprintf(hashText, sizeof(hashText), "%08X", hash);
+                LOG_WARN("placements %s: model %s (%s) to copy in: %s", entry.name.c_str(),
+                         modelName.c_str(), hashText, homeName.c_str());
+                report << name << L": the model " << std::wstring(modelName.begin(), modelName.end())
+                       << L" (" << std::wstring(hashText, hashText + 8) << L") could not be copied in: "
+                       << std::wstring(homeName.begin(), homeName.end()) << L". Left alone.\n";
                 failed = true;
                 break;
             }
@@ -146,6 +235,9 @@ bool PlanPlacementSave(const nfs::World& world, const std::wstring& modelsFolder
             kept.push_back(std::move(model));
             ++copiedModels;
 
+            // A model from outside the region has its textures put in the
+            // texture library instead, when that is another section.
+            if (isForeign(hash) && !takesForeignTextures) continue;
             std::wstring problem;
             for (NewTexture& texture : TexturesToCopy(world, hash, index, problem)) {
                 const bool had = std::any_of(kept.begin(), kept.end(), [&](const SectionEdit& e) {
@@ -165,6 +257,32 @@ bool PlanPlacementSave(const nfs::World& world, const std::wstring& modelsFolder
                 report << name << L": " << problem << L"Left alone.\n";
                 failed = true;
                 break;
+            }
+        }
+        // The textures of the models from outside the region, when they live
+        // apart from the models (the Y sections of L4RA).
+        if (!failed && takesForeignTextures && !takesForeign) {
+            for (const u32 hash : foreign) {
+                std::wstring problem;
+                for (NewTexture& texture : TexturesToCopy(world, hash, index, problem)) {
+                    const bool had = std::any_of(kept.begin(), kept.end(), [&](const SectionEdit& e) {
+                        return (e.kind == SectionEdit::Kind::TextureAdded ||
+                                e.kind == SectionEdit::Kind::TextureChanged) && e.hash == texture.hash;
+                    });
+                    if (had) continue;
+                    SectionEdit edit;
+                    edit.kind = SectionEdit::Kind::TextureAdded;
+                    edit.hash = texture.hash;
+                    edit.label = texture.name;
+                    edit.texture = std::move(texture);
+                    kept.push_back(std::move(edit));
+                    ++copiedTextures;
+                }
+                if (!problem.empty()) {
+                    report << name << L": " << problem << L"Left alone.\n";
+                    failed = true;
+                    break;
+                }
             }
         }
         if (failed) { plan.ok = false; continue; }

@@ -1,5 +1,7 @@
 #include "io/ObjMesh.h"
 
+#include <cstdlib>
+
 #include "core/Log.h"
 
 #include <windows.h>
@@ -7,6 +9,8 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <array>
+#include <string>
 #include <cctype>
 #include <cmath>
 #include <unordered_map>
@@ -239,6 +243,8 @@ bool ReadObjMeshes(const std::wstring& path, std::vector<ObjMesh>& out,
     std::string currentMaterial;
     std::unordered_map<Corner, u16, CornerHash> seen;
     size_t objectFirstPosition = 0;
+    std::unordered_map<std::string, Vec3> faceNormals;   // per object: corner set -> facing
+    size_t backFaces = 0;
 
     const auto finishGroup = [&]() {
         if (current.groups.empty()) return;
@@ -252,11 +258,30 @@ bool ReadObjMeshes(const std::wstring& path, std::vector<ObjMesh>& out,
             out.push_back(std::move(current));
         current = ObjMesh{};
         seen.clear();
+        faceNormals.clear();
         currentMaterial.clear();
     };
 
+    // Where a file carries no colour: mid grey, which the track shader (texture
+    // times colour at double strength) draws as the texture itself.
+    constexpr u32 kNoColor = 0xFF808080u;
+    size_t mrgbNext = 0;   // the next vertex a ZBrush #MRGB block colours
+
     std::string line;
     while (std::getline(file, line)) {
+        // ZBrush (and tools copying it) keep the colours in comment blocks after
+        // the vertices: "#MRGB " and then MMRRGGBB in hex, one group per vertex
+        // in the order of the `v` lines, the first byte being a mask.
+        if (line.compare(0, 6, "#MRGB ") == 0) {
+            for (size_t at = 6; at + 8 <= line.size(); at += 8) {
+                const std::string group = line.substr(at, 8);
+                if (group.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) break;
+                const u32 value = (u32)std::strtoul(group.c_str(), nullptr, 16);
+                if (mrgbNext < colors.size()) colors[mrgbNext] = 0xFF000000u | (value & 0xFFFFFFu);
+                ++mrgbNext;
+            }
+            continue;
+        }
         if (line.empty() || line[0] == '#') continue;
 
         std::istringstream stream(line);
@@ -270,16 +295,20 @@ bool ReadObjMeshes(const std::wstring& path, std::vector<ObjMesh>& out,
 
             // Three more numbers on the line are the vertex colour. Blender
             // writes them when its "Colors" option is on, and without them
-            // there is nothing to carry the baked lighting back.
+            // there is nothing to carry the baked lighting back. Most tools
+            // write 0..1; some write 0..255, which a value above 1 gives away.
+            // A fourth number (alpha) is left on the line.
             float r = 1.0f, g = 1.0f, b = 1.0f;
             const bool hasColor = (bool)(stream >> r >> g >> b);
-            const auto toByte = [](float v) {
+            const float scale = (r > 1.0f || g > 1.0f || b > 1.0f) ? 1.0f / 255.0f : 1.0f;
+            const auto toByte = [scale](float v) {
+                v *= scale;
                 const float clamped = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
                 return (u32)(clamped * 255.0f + 0.5f);
             };
             colors.push_back(hasColor ? (0xFF000000u | (toByte(r) << 16) |
                                          (toByte(g) << 8) | toByte(b))
-                                      : 0xFFFFFFFFu);
+                                      : kNoColor);
 
         } else if (keyword == "vn") {
             Vec3 normal;
@@ -351,7 +380,7 @@ bool ReadObjMeshes(const std::wstring& path, std::vector<ObjMesh>& out,
                 current.sourcePositions.push_back((u32)((size_t)p >= objectFirstPosition ? (size_t)p - objectFirstPosition
                                                                                         : (size_t)p));
                 current.colors.push_back((size_t)p < colors.size() ? colors[(size_t)p]
-                                                                   : 0xFFFFFFFFu);
+                                                                   : kNoColor);
                 current.uvs.push_back(t >= 0 && (size_t)t < uvs.size() ? uvs[(size_t)t]
                                                                       : Vec2{});
                 current.normals.push_back(n >= 0 && (size_t)n < normals.size()
@@ -362,6 +391,33 @@ bool ReadObjMeshes(const std::wstring& path, std::vector<ObjMesh>& out,
             }
 
             if (corners.size() < 3) continue;
+
+            // A face lying back to back on one already read (the same corners,
+            // facing the other way: a mesh tool's two-sided copy) is left out.
+            // The game's world shaders draw both sides anyway, and the pair
+            // z-fights in the game; lifting one apart still flickers from a
+            // distance, so the back one goes.
+            {
+                std::vector<std::array<long, 3>> key;
+                Vec3 normal{};
+                for (size_t i = 0; i < corners.size(); ++i) {
+                    const Vec3& a = current.positions[corners[i]];
+                    const Vec3& b = current.positions[corners[(i + 1) % corners.size()]];
+                    normal.x += (a.y - b.y) * (a.z + b.z);
+                    normal.y += (a.z - b.z) * (a.x + b.x);
+                    normal.z += (a.x - b.x) * (a.y + b.y);
+                    key.push_back({ std::lround(a.x * 1000.0f), std::lround(a.y * 1000.0f), std::lround(a.z * 1000.0f) });
+                }
+                std::sort(key.begin(), key.end());
+                std::string packed(reinterpret_cast<const char*>(key.data()), key.size() * sizeof(key[0]));
+                const auto earlier = faceNormals.find(packed);
+                if (earlier == faceNormals.end()) {
+                    faceNormals.emplace(std::move(packed), normal);
+                } else if (Dot(earlier->second, normal) < 0.0f) {
+                    ++backFaces;
+                    continue;
+                }
+            }
 
             // A face with more than three corners becomes a fan. OBJ allows any
             // convex polygon and the game draws triangles only.
@@ -388,5 +444,6 @@ bool ReadObjMeshes(const std::wstring& path, std::vector<ObjMesh>& out,
     }
 
     LOG_INFO("read %zu meshes from the OBJ", out.size());
+    if (backFaces) LOG_INFO("left out %zu faces lying back to back on another (they z-fight in the game)", backFaces);
     return true;
 }

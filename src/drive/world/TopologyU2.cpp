@@ -254,13 +254,15 @@ std::vector<TopologyTree*> TopologyManagerU2::Trees() const
 
 int TopologyManagerU2::Slot(int16_t number) const
 {
-    if (number == 0) return 0;
-    int n = number;
-    int rem = n % 100;
-    if (rem >= DrivableLimit && rem < DrivableLimit + DrivableLimit) n = static_cast<int16_t>(n - DrivableLimit);
-    int s = static_cast<int16_t>(n);
-    int letter = static_cast<int8_t>(static_cast<uint8_t>(s / 100 + 0x40));
-    return (s % 100) + (letter - 0x41) * 20;
+    // FRSWorldLoader replaces the game's Slot() (0x5D3C10, loader/src/Limits.cpp):
+    // one slot per section number, a collision section (n % 100 in 20..39)
+    // folded onto its zone. The game's own -- (letter - 'A') * 20 + digits,
+    // 520 slots, 40..99 aliasing the next letter -- is what the loader lifts.
+    const int n = static_cast<uint16_t>(number);
+    if (n == 0) return 0;
+    const int rem = n % 100;
+    if (rem >= DrivableLimit && rem < DrivableLimit + DrivableLimit) return n - DrivableLimit;
+    return n;
 }
 
 TopologyTree* TopologyManagerU2::GetIndex(int16_t number) const
@@ -689,7 +691,7 @@ F24 TopologyManagerU2::NewGetElevation(TopologyCoordinate* c, float px, float py
         for (int r = first; r < end; r++) {
             if ((static_cast<uint32_t>(t->RefMask(r)) & mask) == 0) continue;
             int i = t->RefPolygon(r);
-            if ((t->Flags(i) & 0x0A) != 0) continue;                          // vertical faces and 0x08
+            if ((t->Flags(i) & 0x0A) != 0) break;   // a wall or a 0x08 face ENDS the cell walk (0x5E7557 jnz 0x5E765D)
             int code = t->CornerCode(i);
             if (qx < TopologyTree::Shl13(t->Xs(i, code & 3))) continue;
             if (qy < TopologyTree::Shl13(t->Ys(i, (code >> 2) & 3))) continue;

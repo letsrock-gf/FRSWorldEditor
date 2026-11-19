@@ -848,6 +848,41 @@ bool BuildAddedModel(const nfs::World& world, const std::wstring& objPath, const
     return false;
 }
 
+} // namespace
+
+std::function<void(size_t, size_t)>& ImportProgress() {
+    static std::function<void(size_t, size_t)> progress;
+    return progress;
+}
+
+namespace {
+
+// The OBJ's meshes, read once for as long as the file stays the same. A bake
+// hands hundreds of objects of one file to the import, and reading the whole
+// file again for each made it quadratic: the 273 pieces of a 4 km ground took
+// minutes with the window frozen, and Windows closed it as hung.
+const std::vector<ObjMesh>* ObjMeshesOf(const std::wstring& path, std::wstring& error) {
+    static std::wstring cachedPath;
+    static FILETIME cachedTime{};
+    static unsigned long long cachedSize = 0;
+    static std::vector<ObjMesh> cached;
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!::GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) {
+        error = L"That OBJ could not be opened.";
+        return nullptr;
+    }
+    const unsigned long long size = ((unsigned long long)data.nFileSizeHigh << 32) | data.nFileSizeLow;
+    if (path == cachedPath && size == cachedSize && ::CompareFileTime(&data.ftLastWriteTime, &cachedTime) == 0)
+        return &cached;
+    std::vector<ObjMesh> meshes;
+    if (!ReadObjMeshes(path, meshes, error)) return nullptr;
+    cached = std::move(meshes);
+    cachedPath = path;
+    cachedTime = data.ftLastWriteTime;
+    cachedSize = size;
+    return &cached;
+}
+
 // A shape in the OBJ that the manifest does not know: a new object.
 //
 // It becomes a model of its own in the positioned section under it, and a
@@ -857,9 +892,10 @@ bool BuildAddedModel(const nfs::World& world, const std::wstring& objPath, const
 bool CreateNewObject(const nfs::World& world, const std::wstring& objPath,
                      const std::string& objectName, const Vec3& origin, ImportPlan& plan,
                      std::string& modelName, std::wstring& why) {
-    std::vector<ObjMesh> meshes;
     std::wstring error;
-    if (!ReadObjMeshes(objPath, meshes, error)) { why = error; return false; }
+    const std::vector<ObjMesh>* all = ObjMeshesOf(objPath, error);
+    if (!all) { why = error; return false; }
+    const std::vector<ObjMesh>& meshes = *all;
     const ObjMesh* source = nullptr;
     for (const ObjMesh& mesh : meshes)
         if (mesh.name == objectName) { source = &mesh; break; }
@@ -1007,9 +1043,10 @@ bool RebuildForNewMesh(const nfs::World& world, const std::wstring& objPath,
         return false;
     }
 
-    std::vector<ObjMesh> meshes;
     std::wstring error;
-    if (!ReadObjMeshes(objPath, meshes, error)) { why = error; return false; }
+    const std::vector<ObjMesh>* all = ObjMeshesOf(objPath, error);
+    if (!all) { why = error; return false; }
+    const std::vector<ObjMesh>& meshes = *all;
 
     const ObjMesh* source = nullptr;
     for (const ObjMesh& mesh : meshes) {
@@ -1200,7 +1237,9 @@ bool PlanImport(const nfs::World& world, const std::wstring& objPath, ImportPlan
     std::wostringstream report;
     std::wostringstream rebuilds;
 
+    size_t objectIndex = 0;
     for (const ObjObject& object : objects) {
+        if (ImportProgress()) ImportProgress()(objectIndex++, objects.size());
         // Blender appends a suffix when two objects share a name, and older
         // exports carried a placement counter, so the match falls back through
         // both before giving up.

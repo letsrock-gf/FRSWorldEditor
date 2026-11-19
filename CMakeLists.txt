@@ -21,6 +21,7 @@ add_executable(FRSWorldEditor WIN32
     src/io/CollisionGenerate.cpp
     src/io/MeshOverlay.cpp
     src/io/ModelCopy.cpp
+    src/io/U1Convert.cpp
     src/io/ObjMesh.cpp
     src/io/PlacementWrite.cpp
     src/io/SectionRebuild.cpp
@@ -32,7 +33,12 @@ add_executable(FRSWorldEditor WIN32
     src/io/WorldFile.cpp
     src/io/WorldPublish.cpp
     src/io/MarkerWrite.cpp
+    src/io/DistrictFog.cpp
+    src/io/RegionCreate.cpp
+    src/io/RegionImport.cpp
     src/io/MarkerEffects.cpp
+    src/io/LightFlares.cpp
+    src/nfs/CustomRegions.cpp
     src/nfs/Markers.cpp
     src/ui/MarkersExtension.cpp
     src/io/WorldMesh.cpp
@@ -58,6 +64,7 @@ add_executable(FRSWorldEditor WIN32
     src/nfs/EaCompress.cpp
     src/nfs/WorldAnimation.cpp
     src/nfs/World.cpp
+    src/nfs/ForeignModels.cpp
 
     # MINIMAP PREVIEW (temporary)
     src/minimap/MinimapBuildings.cpp
@@ -78,6 +85,11 @@ add_executable(FRSWorldEditor WIN32
     src/ui/EmbeddedGame.cpp
     src/ui/CrashReport.cpp
     src/ui/HiddenItems.cpp
+    src/ui/FogTools.cpp
+    src/ui/RegionTools.cpp
+    src/ui/ImportTools.cpp
+    src/terrain/Procedural.cpp
+    src/ui/ReferenceImages.cpp
     src/ui/ZoneTools.cpp
     src/ui/MainWindow.cpp
     src/ui/MainWindowShell.cpp
@@ -89,9 +101,11 @@ add_executable(FRSWorldEditor WIN32
     src/ui/OverlayBrowser.cpp
     src/ui/PlacementDialogs.cpp
     src/ui/PropertiesPanel.cpp
+    src/ui/ProgressWindow.cpp
     src/ui/RoadsExtension.cpp
     src/roads/RoadNetwork.cpp
     src/roads/CityZones.cpp
+    src/roads/Water.cpp
     src/roads/Prefabs.cpp
     src/roads/RoadBake.cpp
     src/roads/RoadRoutes.cpp
@@ -102,6 +116,7 @@ add_executable(FRSWorldEditor WIN32
     src/ui/CollisionTools.cpp
     src/ui/MeshTools.cpp
     src/ui/ModelCatalog.cpp
+    src/ui/U1Library.cpp
     src/ui/SetupWizard.cpp
     src/ui/WorldDialogs.cpp
 
@@ -142,6 +157,14 @@ else()
     target_sources(FRSWorldEditor PRIVATE src/ui/NoExtensions.cpp)
 endif()
 
+# New regions and region import (ui/RegionTools, ui/ImportTools) are not
+# ready for players yet: package.ps1 builds the release with this OFF, which
+# leaves File > New Region and World > Import Region out of the editor.
+option(FRS_WITH_REGIONS "File > New Region and World > Import Region" ON)
+if(NOT FRS_WITH_REGIONS)
+    target_compile_definitions(FRSWorldEditor PRIVATE FRS_NO_REGIONS)
+endif()
+
 target_compile_definitions(FRSWorldEditor PRIVATE
     UNICODE _UNICODE
     WIN32_LEAN_AND_MEAN
@@ -164,7 +187,8 @@ target_link_libraries(FRSWorldEditor PRIVATE
 )
 
 if(MSVC)
-    target_compile_options(FRSWorldEditor PRIVATE /W4 /permissive- /Zc:preprocessor /utf-8)
+    # /we4129: an unknown escape in a string (L"\TRACKS") is an error, not a path that silently loses its slash.
+    target_compile_options(FRSWorldEditor PRIVATE /W4 /permissive- /Zc:preprocessor /utf-8 /we4129)
     target_link_options(FRSWorldEditor PRIVATE /SUBSYSTEM:WINDOWS)
     # Symbols beside the Release build too, so a crash dump says where it died.
     target_compile_options(FRSWorldEditor PRIVATE $<$<CONFIG:Release>:/Zi>)

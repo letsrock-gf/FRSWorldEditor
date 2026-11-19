@@ -32,7 +32,8 @@ namespace collision {
 nfs::CollisionPolygon MakeGround(const Vec3* corners, int count, u8 surface);
 
 // A barrier from `from` to `to`: blocks cars on its left-hand side only
-// (looking from `from` towards `to`); AppendWall writes both directions.
+// (looking from `from` towards `to`). AppendWall makes walls that block from
+// both sides.
 nfs::CollisionPolygon MakeBarrier(const Vec3& from, const Vec3& to, u8 surface);
 
 // A vertical wall standing from `bottom` up to `bottom + height` at each end
@@ -50,12 +51,23 @@ struct WallOptions {
     u8       surface = nfs::kSurfaceSolidWall;
     float    height  = 3.0f;     // vertical walls: above the points
     float    sink    = 0.5f;     // vertical walls: how far the foot goes below the points
-    bool     bothSides = true;   // a twin facing the other way, so it blocks from either side
+    // Blocks from either side. The game gives every face a solid 1 m deep
+    // behind it and pushes a car that touches it out along the face's normal
+    // (SPEED2 0x7A1878, Contact::Normal), so a twin facing the other way on
+    // the same line throws a car through the wall to the far side. A wall
+    // for both sides is a closed box instead (kTwoSidedThickness thick,
+    // centred on the points), each face's solid inside it.
+    bool     bothSides = true;
     float    maxPiece  = 8.0f;   // longer segments are cut into pieces of at most this
 };
 
+// How thick a wall that blocks from both sides is: just over the 1 m solid the
+// game puts behind each face, so neither face's solid reaches past the other.
+constexpr float kTwoSidedThickness = 1.05f;
+
 // A wall along a polyline of points on the ground: one piece per segment
 // (cut up when long). Repeat the first point at the end for a closed loop.
+// One-sided, it faces the left of the direction the points run in.
 void AppendWall(const std::vector<Vec3>& points, const WallOptions& options,
                 std::vector<nfs::CollisionPolygon>& out);
 

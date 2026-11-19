@@ -34,6 +34,7 @@ struct SectionEdit {
         NativeDeleted,    // a shipped scenery record with its matrix zeroed
         NativeChanged,    // a shipped scenery record otherwise altered
         Emitters,         // the section's placed effects (0x35020) differ, or were added
+        Flares,           // the section's light flares (0x80135100) differ, or were added
         Other,            // a difference the editor does not know how to separate
     };
 
@@ -51,7 +52,8 @@ struct SectionEdit {
     NewTexture texture;
     nfs::PlacedInstance placement;
     std::vector<u8> record;     // 64-byte scenery record, for shipped ones;
-                                // for Emitters, the chunk's payload without its filler
+                                // for Emitters, the chunk's payload without its filler;
+                                // for Flares, the pack header (0x60) then the flares (0x30 each)
 
     bool Revertible() const { return kind != Kind::Other; }
 };

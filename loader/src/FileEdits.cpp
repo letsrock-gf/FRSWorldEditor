@@ -101,6 +101,7 @@ std::vector<Edit> g_edits;
 // Whole-file replacements: the game's path relative to its folder, upper case
 // with backslashes, and the file to open instead.
 std::vector<std::pair<std::wstring, std::wstring>> g_redirects;
+std::vector<std::pair<std::wstring, std::wstring>> g_aliases;   // a new region's names -> its source's files
 volatile LONG g_redirected = 0;
 
 // Counted so a silent failure can be told apart from a wrong edit. Without
@@ -296,7 +297,15 @@ void CheckPublishedTargets() {
 
         wchar_t wide[MAX_PATH]{};
         ::MultiByteToWideChar(CP_UTF8, 0, relative.c_str(), -1, wide, MAX_PATH);
-        const frs::FileFingerprint here = frs::FingerprintFile(GameFolder() + L"\\" + wide);
+        // A region the editor made: the file of the region it copies.
+        std::wstring target = GameFolder() + L"\\" + wide;
+        if (::GetFileAttributesW(target.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            std::wstring key = wide;
+            for (wchar_t& c : key) c = (wchar_t)::towupper(c);
+            for (const auto& alias : g_aliases)
+                if (alias.first == key) { target = alias.second; break; }
+        }
+        const frs::FileFingerprint here = frs::FingerprintFile(target);
         if (here.valid && here.size == size && here.hash == hash) {
             Log("published world '%s': %s matches the one it was made for", worldName.c_str(), relative.c_str());
             continue;
@@ -344,11 +353,66 @@ void LoadRedirects(const std::wstring& folder, const std::wstring& relative) {
     ::FindClose(search);
 }
 
+// Regions the editor made (<game>\models\regions\<R>.frsregion: "region R",
+// "source S") read the files of the region they copy under their own name:
+// TRACKS\<R>.BUN is TRACKS\<S>.BUN, STREAM<R>.BUN is STREAM<S>.BUN and every
+// file of ROUTES<S> answers for ROUTES<R>. The handle keeps the name the game
+// asked for, so edits made in R apply to it and never to S. Files of R's own
+// in models\files (listed first) win over these (g_aliases, beside g_redirects).
+
+void LoadRegionAliases() {
+    const std::wstring game = GameFolder();
+    const std::wstring folder = game + L"\\models\\regions\\";
+    WIN32_FIND_DATAW found{};
+    HANDLE find = ::FindFirstFileW((folder + L"*.frsregion").c_str(), &found);
+    if (find == INVALID_HANDLE_VALUE) return;
+    do {
+        FILE* file = nullptr;
+        if (::_wfopen_s(&file, (folder + found.cFileName).c_str(), L"rb") != 0 || !file) continue;
+        std::string region, source;
+        char line[512];
+        while (std::fgets(line, sizeof(line), file)) {
+            char key[32] = {}, value[64] = {};
+            if (std::sscanf(line, "%31s %63s", key, value) != 2) continue;
+            if (std::strcmp(key, "region") == 0) region = value;
+            else if (std::strcmp(key, "source") == 0) source = value;
+        }
+        std::fclose(file);
+        if (region.empty() || source.empty() || region.size() > 7 || source.size() > 7 || region == source) continue;
+        std::wstring r(region.begin(), region.end()), s(source.begin(), source.end());
+        for (wchar_t& c : r) c = (wchar_t)::towupper(c);
+        for (wchar_t& c : s) c = (wchar_t)::towupper(c);
+        const std::wstring tracks = game + L"\\TRACKS\\";
+        if (::GetFileAttributesW((tracks + L"STREAM" + s + L".BUN").c_str()) == INVALID_FILE_ATTRIBUTES) {
+            Log("regions: %s copies %s, which this game does not have; left out", region.c_str(), source.c_str());
+            continue;
+        }
+        g_aliases.emplace_back(L"TRACKS\\" + r + L".BUN", tracks + s + L".BUN");
+        g_aliases.emplace_back(L"TRACKS\\STREAM" + r + L".BUN", tracks + L"STREAM" + s + L".BUN");
+        WIN32_FIND_DATAW routeFile{};
+        HANDLE routes = ::FindFirstFileW((tracks + L"ROUTES" + s + L"\\*").c_str(), &routeFile);
+        size_t count = 0;
+        if (routes != INVALID_HANDLE_VALUE) {
+            do {
+                if (routeFile.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                std::wstring name = routeFile.cFileName;
+                for (wchar_t& c : name) c = (wchar_t)::towupper(c);
+                g_aliases.emplace_back(L"TRACKS\\ROUTES" + r + L"\\" + name,
+                                       tracks + L"ROUTES" + s + L"\\" + routeFile.cFileName);
+                ++count;
+            } while (::FindNextFileW(routes, &routeFile));
+            ::FindClose(routes);
+        }
+        Log("regions: %s reads the files of %s (%zu route files)", region.c_str(), source.c_str(), count);
+    } while (::FindNextFileW(find, &found));
+    ::FindClose(find);
+}
+
 // The replacement for a path the game is opening, or null. The game builds
 // its paths as "<folder>/Tracks\RoutesL4RA\..." -- mixed separators, its own
 // casing -- so both sides are reduced to one spelling before comparing.
 const std::wstring* RedirectFor(const wchar_t* name) {
-    if (g_redirects.empty() || !name) return nullptr;
+    if ((g_redirects.empty() && g_aliases.empty()) || !name) return nullptr;
 
     std::wstring path = name;
     for (wchar_t& c : path) c = c == L'/' ? L'\\' : (wchar_t)::towupper(c);
@@ -368,6 +432,8 @@ const std::wstring* RedirectFor(const wchar_t* name) {
 
     for (const auto& redirect : g_redirects)
         if (redirect.first == clean) return &redirect.second;
+    for (const auto& alias : g_aliases)
+        if (alias.first == clean) return &alias.second;
     return nullptr;
 }
 
@@ -787,7 +853,7 @@ HANDLE WINAPI HookedCreateFileW(LPCWSTR name, DWORD access, DWORD share,
 HANDLE WINAPI HookedCreateFileA(LPCSTR name, DWORD access, DWORD share,
                                 LPSECURITY_ATTRIBUTES security, DWORD creation,
                                 DWORD flags, HANDLE templateFile) {
-    if (name && !t_inside && !g_redirects.empty() && ReadOnlyOpen(access, creation)) {
+    if (name && !t_inside && (!g_redirects.empty() || !g_aliases.empty()) && ReadOnlyOpen(access, creation)) {
         wchar_t wide[MAX_PATH]{};
         ::MultiByteToWideChar(CP_ACP, 0, name, -1, wide, MAX_PATH);
         if (const std::wstring* replacement = RedirectFor(wide)) {
@@ -1133,7 +1199,7 @@ DWORD WINAPI Start(LPVOID) {
     LoadEdits();
     CheckPublishedTargets();
 
-    if (g_edits.empty() && g_redirects.empty()) {
+    if (g_edits.empty() && g_redirects.empty() && g_aliases.empty()) {
         Log("nothing to apply; the game will read its own files unchanged");
         return 0;
     }
@@ -1264,6 +1330,7 @@ void StartFileEdits() {
     // waits on anything.
     ::InitializeCriticalSection(&g_lock);
     LoadRedirects(GameFolder() + L"\\models\\files", L"");
+    LoadRegionAliases();
     // Patched whether or not anything is replaced. The region's table file is
     // opened before the import walk on the thread reaches the module that
     // opens it, and a handle this plugin never saw opened is never known to be

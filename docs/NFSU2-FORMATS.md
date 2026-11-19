@@ -6,6 +6,13 @@ checking each rule against all 118 MB of `STREAML4RA.BUN` (1145 solid packs,
 are hexadecimal and byte offsets from the start of the structure. Fields still
 unidentified are marked as such rather than guessed at.
 
+Some sections fold in findings from porting other maps into the game
+(Underground 1, its PS2 demo, the Underground 2 PS2 demo city, Hot Pursuit 2,
+Midnight Club 3, Gran Turismo 4), each port played in the game. Those carry a
+tag saying how they were established: **[game]** seen in the running game,
+**[code]** read from the exe, **[files]** counted over the shipped data.
+Addresses are for SPEED2.EXE 1.2.
+
 ## 1. Container format (BChunk)
 
 Every asset file is a flat sequence of chunks:
@@ -56,7 +63,11 @@ size = 0` as a chunk.
 | `0x00034112` | region bounds |
 | `0x80034150` | visibility / preculler data |
 | `0x00034110` | **streaming section table** |
-| `0x80034020`, `0x8003B200`, `0x8003B600` | AI paths, traffic, events |
+| `0x80034020`, `0x8003B200` | AI paths, traffic, events |
+| `0x8003B600` | **parameter maps**: fog, screen tint, rain, wind and reverb by place (§5d) |
+| `0x00034107`, `0x00034108` | scenery override table and scenery groups: race barriers and other switched objects (§5b) |
+| `0x00035021` | particle emitter definitions (§5c) |
+| `0x00037080`, `0x00037090`, `0x00037110`, `0x00037150`, `0x00E34010` | world animations: scene nodes, placements, controllers, banks (§5e) |
 
 ### Section table entry — 80 bytes
 
@@ -247,9 +258,13 @@ repeated buildings are each stored once and placed many times.
 ├── 0x00034101  header
 ├── 0x00034102  SceneryInfo   -- 68 bytes, the models this section can place
 ├── 0x00034103  SceneryInstance -- 64 bytes, one placement each
-├── 0x00034104  groups
-└── 0x00034106  overrides
+├── 0x00034104  bounding-volume tree over the instances
+├── 0x00034105  override hooks: (index, instance) pairs into the region's 0x34107 (§5b)
+└── 0x00034106  preculler blocks, 128 bytes each
 ```
+
+(This tree used to label `0x00034104` "groups" and `0x00034106` "overrides";
+both readings were wrong, see below and §5b.)
 
 ### SceneryInfo — 68 bytes
 
@@ -270,7 +285,8 @@ somewhere in the region.
 | `0x00` | `float[3]` | world bounds minimum |
 | `0x0C` | `float[3]` | world bounds maximum |
 | `0x18` | `u16` | index into the SceneryInfo table |
-| `0x1A` | `u16` | flags |
+| `0x1A` | `u16` | flags (see *Instance flags* below) |
+| `0x1C` | `u32` | preculler block, 1-based (below) |
 | `0x20` | `float[3]` | translation |
 | `0x2C` | `i16[9]` | 3x3 matrix, row major, fixed point with 1.0 = 0x2000 |
 
@@ -285,6 +301,51 @@ The transform is `rotation * scale` from `0x2C` with the translation from
 reproduces the stored box with a median centre error of 0.03 units across all
 44 158 instances that resolve; composing the header matrix instead gives a
 median error of 1571 units.
+
+### Instance flags — the `u16` at `0x1A`
+
+An instance is drawn when `((flags & 0xFF) ^ 0x60) & view cull flags == 0`
+[code].
+
+| Flag | Meaning |
+| --- | --- |
+| `0x10` | hidden until a scenery group shows it (§5b) |
+| `0x20` | rear view mirror (view 3) |
+| `0x40` | road reflection and car environment views (cull flags `0x800` and `0x1000`) |
+| `0x0100` | **the model is in world space**: drawn without the instance matrix (below) |
+| `0x200` with `0x10` | race barrier, hidden until its race (`0x210`) |
+| `0x400` | take the second LOD slot instead of the third for the reflection views |
+
+Retail L4RA counts by flags [files]: 0 22381, `0x60` 10927, `0x210` 5610,
+`0x20` 3629, `0x560` 2942 (terrain), `0x100` 1448, `0x40` 850, `0x10` 105,
+`0x70` 102.
+
+**`0x0100`, world space** [code, game]. `sub_5D6570` draws an instance with
+this flag **without its matrix**. It is the switch behind the pre-placed mesh
+heuristic (see *Pre-placed meshes*), and it matters when writing:
+
+- Moving or rotating a `TRN_` chunk changes nothing in the game while `0x0100`
+  stays set. Clear it, and rebase the mesh around its own origin.
+- Setting `0x0100` on an ordinary object draws it at the world origin: a port
+  that set it on all roads stacked every road piece at (0, 0, 0).
+- Deleting a shipped instance therefore has to clear `0x0100` as well as zero
+  the matrix: with the flag left on, the zeroed matrix is never applied and the
+  mesh stays in the game. The editor's deletion (`DeletedRecord` in
+  `nfs/SceneryEdit.cpp`) does both; deletions saved before that are upgraded
+  at the next save.
+
+**Road reflection** (view 4) draws the third LOD slot of the scenery info, or
+the second with `0x400`, for models of 32 pixels and up; a slot of 0 is not
+drawn. Each instance is mirrored about its own origin, so an object off the
+ground mirrors in the wrong place. Retail leaves terrain (`0x100`) out of the
+reflection [code].
+
+**A pack is drawn by its number** [game]. The game draws a scenery pack only
+when the pack's **number** (the one in its `0x00034101` header, not the
+section's number) is on the current drivable section's loading list.
+Underground 1's always-loaded section X99 holds 85 packs numbered after areas,
+each drawn only from the areas that list it; merging them into one pack drew
+them everywhere.
 
 ### The rest of the chunk, and adding placements
 
@@ -305,7 +366,11 @@ the writer's round trip):
   942 of 6406 cases, so a new entry is best copied from one the game ships.
 - **SceneryInstance `0x1C`** is a u32, 1-based index of a 128-byte block in
   `0x00034106` (0 = none); `0x3E` is always 0. The blocks are 32x32-bit masks
-  whose meaning is still open; block 0 is all zeros.
+  whose meaning is still open; block 0 is all zeros. For new or moved
+  instances a safe value is known [game]: ports that write a single all-zero
+  block and point every instance at it (or write 0) get nothing culled by the
+  preculler, and that works in the game. This answers the practical side of
+  experiment E6 in `STREAMING-STUDY.md`; the mask semantics stay open.
 - **`0x00034104` is a bounding-volume tree** over the records. 36-byte nodes:
   `float3 min, float3 max, u16 count, u16 child[5]`. A child below `0x8000`
   is a record index; above, it is node `0x10000 - child`. Node 0 is the root.
@@ -370,6 +435,13 @@ same way. Any other image format is a new texture and goes through the DXT
 compressor. Windows' imaging component has no TGA decoder, so TGAs are read by
 the editor itself; before that, a TGA beside the OBJ made the import of every
 mesh that went through a rebuild fail.
+
+**Back faces.** The world shaders draw both sides of a triangle, so the
+coplanar back-to-back pair a mesh tool writes for a two-sided face z-fights in
+the game; lifting one of them apart still flickers from a distance [game]. The
+OBJ reader (`io/ObjMesh.cpp`) drops a face lying back to back on an earlier one
+of the same object (the same corners, facing the opposite way) and logs how
+many it left out.
 
 ### Taking a model to another section
 
@@ -444,7 +516,7 @@ regardless of the real terrain.
 | `0x00` | `u8` | **race barrier group**, 0 = always present (below) |
 | `0x01` | `u8` | **extreme-corner code** (below) — not a surface id |
 | `0x02` | `u8` | **surface** (below): 1 `ROAD` on most ground, `0x14` `SOLID_WALL` on most barriers |
-| `0x03` | `u8` | flags: `0x10` quad, `0x02` vertical (see below); barriers are always `0x16`; `0x01 0x08 0x40` unknown |
+| `0x03` | `u8` | flags: `0x10` quad, `0x02` vertical, `0x04` infinite barrier, `0x01` compare heights, `0x08` not ground, `0x40` never cached (see *Flags* below); barriers are always `0x16` |
 | `0x04` | `i16` | height base, whole units |
 | `0x06` | `u16` | always `0xFFFF` |
 | `0x08` | `i16[4]` | x of each corner, in eighths of a unit |
@@ -523,6 +595,78 @@ a section edge). An edit that removes or moves such a polygon in one pack
 leaves the other copy colliding; new geometry near an edge needs to go into
 every pack the car may be using there.
 
+### Flags — byte 3
+
+`0x10` (quad), `0x02` (vertical) and `0x04` (infinite barrier) are above. The
+other three bits, earlier listed as unknown, are all read by
+`TopologyCoordinate::NewGetElevation` `0x5E72E0` [code]:
+
+| Bit | Meaning |
+| --- | --- |
+| `0x01` | **Compare heights.** A floor without it is taken as soon as the point is strictly inside it, at any height. A floor with it competes: the highest floor at most 1 m above the car wins. Retail sets it on about 99 % of the floors that have another floor above or below them [files]. |
+| `0x08` | **Not ground.** Tested together with `0x02` (`& 0x0A`), so a polygon with it is never a floor. |
+| `0x40` | **Never cached.** Such a floor is not put into the four-entry recent-floor cache, and it does not end the walk of the cell. In retail L4RC (drift arenas) 44 % of the floors have it: the `ROAD_DRIFT` patches lie 2-14 cm over the floor of the lot, and both are flagged. L4RA has it on 2.3 % [files]. |
+
+- **`0x01` missing** [game]: a bridge deck without it became the ground of the
+  street under it, and cars on that street were pushed up onto the deck.
+  Where only one floor lies at a point, `0x01` gives the same result as no
+  flag, so it is safe to write it everywhere.
+- **`0x40` is risky** [game]. Writing it on every floor that overlaps another
+  2 cm to 4.5 m apart, as the drift arenas do, made cars on a port step up in
+  one frame onto scenery floors lying 10-50 cm over the original ones (a plaza
+  behind a fence over a sloping sidewalk) and be thrown into the air. Without
+  the flag the cache keeps the car on the floor it is on until it leaves it,
+  which hides small overlaps. Use `0x40` only for deliberate overlays (painted
+  patches), and otherwise keep overlaps flat (a drift band laid 1/256 over the
+  floor under it works). The editor never writes `0x40` (a shipped polygon
+  keeps whatever it has).
+- **`0x04` only on the infinite barriers.** All 21 699 walls with `0x16` in
+  L4RA are the ±127 extruded barriers, and none stands over a road [files].
+  Walls with a real height are `0x12`. Writing `0x16` on a bridge railing made
+  it a wall through the street below [game].
+
+### How the game walks a cell
+
+`NewGetElevation` `0x5E72E0` walks the references of the cell under the point
+in their stored order. Rejects of a single reference (sub-cell mask, corner
+box, switched-off race group) jump to `0x5E783D`, the next reference. A
+polygon with `flags & 0x0A` -- a wall, a barrier or a `0x08` face -- does not:
+
+```
+005E7554  test cl, 0Ah
+005E7557  jnz  loc_5E765D     ; end of the cell walk: is there a best floor? else the next pass
+```
+
+So the walk **ends** at the first wall, and any floor listed after it does
+not exist for the game (verified in the exe). Retail always lists floors
+before walls, which is why shipped data never shows it; collision with a wall
+first in a cell loses its ground there, the car sinks and the game resets it
+("walls that teleport the car" [game]). The walk also ends at the first floor
+within 4 m below `z + 1` (unless that floor has `0x40`), so where floors
+overlap the higher one has to come first, or a car on it is pulled down
+through it; retail lists the higher floor first in about 90 % of stacked
+pairs [files].
+
+The inside test is `max(-1, edge values) <= 0` and assumes counter-clockwise
+corners seen from above: a clockwise or concave polygon is never "inside".
+
+The test drive's port (`src/drive/world/TopologyU2.cpp`) used to skip such a
+polygon (`continue`); it now ends the walk there (`break` to the "best found?"
+check), so the test drive fails where the game fails.
+
+### What resets the car
+
+From `Car::Move` [code]:
+
+- `sub_5ECBA0`: the ground is more than 0.25 m above the car.
+- `sub_604740`: no topology, or the car is more than 5 km from the track path.
+  It is checked every 32 frames, at the car and 1 m to the side.
+
+None of the resets looks at the surface class [code]: "grass resets" seen on a
+port were holes in the collision. A plain hole resets the car; a gap meant to
+be jumped needs a floor under it **and** a `RESET` zone with a height (see
+*Free-roam zones*).
+
 ### Export for editing
 
 With the collision shown (Ctrl+K) a click selects collision polygons instead of
@@ -566,9 +710,56 @@ checked with `FRS_COLLISION_SELFTEST=1`):
 - **Order within a cell** is not file order. The tool lists polygons grouped
   (ground, vertical faces, barriers — by some source order the file does not
   record), but every pack is consistent with one global order, which a
-  topological sort of the consecutive pairs in the cells recovers.
+  topological sort of the consecutive pairs in the cells recovers. The
+  grouping is not cosmetic: the game's walk of a cell ends at the first wall
+  (see *How the game walks a cell*), so floors must come first.
 - **An empty pack** is still written: a 1x1 grid at the origin, bounds
   `+FLT_MAX` / `-FLT_MAX`, no polygons and one empty cell (84 bytes).
+
+### Collision the game accepts
+
+Byte-for-byte reproduction holds for shipped packs, and a shipped pack the
+editor has not touched is still re-encoded exactly as it was. A pack that was
+edited, or built from nothing, is first brought to the rules retail's tool
+always follows and the game's lookup relies on (`EncodeCollision`,
+`nfs/Collision.cpp`):
+
+- **No degenerate polygons after quantising.** Retail has none [files], and a
+  car touching one gets a NaN normal, which showed as random resets at walls
+  [game]. Repeated corners are compared **in 3D**, plan in 1/8 and height in
+  1/256: retail does have quads with two corners on one plan point at
+  different heights, so a plan-only comparison is wrong. A quad that loses a
+  corner becomes a triangle (third corner repeated in the fourth slot); a
+  floor with no area left, or a wall or barrier with no length, is dropped.
+- **Convex floors.** A concave floor quad is split into two triangles at its
+  reflex corner (the inside test fails everywhere on a concave polygon).
+- **Walls stand upright.** The contact normal comes from the polygon, so a
+  wall leaning a few degrees launches the car that touches it [game]; retail
+  walls are 98 % vertical [files], and rounding to 1/8 alone leans thin walls.
+  The top of a rising wall edge is snapped onto its foot (same x, y) when the
+  two lie within 0.15 m in plan.
+- **Floors before walls in every cell**, then vertical faces, then barriers.
+- **Stacked floors highest first.** One height per floor is not enough to sort
+  by: a ramp that passes 1.5 m over a flat floor is lower on average than that
+  floor (the encoder used to sort by average corner height). Instead every
+  overlapping pair of floors in a cell is compared at the centre of its
+  overlap, the higher one goes first, and the cell is sorted topologically;
+  ties keep the existing order.
+- **`0x01` on stacked floors.** A floor lying more than 0.5 m over or under
+  another one it overlaps gets `0x01`, so the two compete by height. `0x40` is
+  never added.
+
+In short, for any writer of collision:
+
+1. Floors before walls in every cell.
+2. Overlapping floors ordered highest first, compared pairwise at the centre
+   of each overlap.
+3. Convex polygons, counter-clockwise from above.
+4. No degenerate polygons after quantising (1/8 in plan, 1/256 in height).
+5. Upright walls: corners of a rising edge share x, y.
+6. `0x04` (`0x16`) only on infinite barriers; real-height walls are `0x12`.
+7. `0x01` on floors with another floor above or below; `0x40` only for
+   deliberate flat overlays.
 
 ### Import
 
@@ -599,7 +790,12 @@ Collision menu over it. What they rely on:
   position -- with its foot sunk 0.5 below the drawn points. Walls of either
   kind are written in both directions and cut into pieces of at most 8 units.
   New polygons carry race group 0 and the surface chosen (default `ROAD` for
-  ground, `SOLID_WALL` for walls).
+  ground, `SOLID_WALL` for walls). New floors (`collision::MakeGround`) carry
+  flag `0x01`, so they compete by height with anything under or over them.
+- **Real-height walls, not barriers, for generated walls.** The walls at
+  junction corners of the road creator and the building walls of city zones
+  are written as real-height walls (`0x12`) instead of ±127 barriers
+  (`0x16`): a barrier walls off any road passing above or below.
 - **Placing.** A polygon goes into every pack that has ground under one of its
   corners or its middle -- the same rule that makes the shipped edge copies --
   and, over no ground at all, into the nearest pack.
@@ -621,9 +817,431 @@ Collision menu over it. What they rely on:
   other edit. `FRS_COLLISION_TOOLS_SELFTEST=1` runs the whole path on the
   loaded region without writing anything and logs the result.
 
+## 5b. Scenery groups, race barriers and breakable props
+
+The collision side of race barriers is the race group byte of §5a (an index
+into `0x3412F`). Loading race N (`sub_578060`) also switches on the
+**objects** [code, game]:
+
+- **Scenery groups**, chunk `0x34108` in the region file. Each record:
+
+  | Offset | Meaning |
+  | --- | --- |
+  | `0x00` | `u32` 11, `u32` 11 |
+  | `0x08` | name[32] |
+  | `0x28` | hash |
+  | `0x2C` | `u32` 0 |
+  | `0x30` | count |
+  | `0x34` | `u16` indices into the override table `0x34107`, padded to 4 |
+
+  `sub_5710A0` clears the hidden bit `0x10` of those entries.
+- **Names:** `PLAYER_BARRIERS_<N>` (retail 4001: 157 objects) and
+  `BARRIERS_<N>`, plus `BARRIERS_CAREER0..4`, `FREE_ROAM`, `FREE_ROAM_STAGE0`
+  and `SMOKEABLE`.
+- **Override table `0x34107`:** 8-byte entries `(i16 pack, i16 instance, u16
+  flags, u16 1)`, grouped by the low byte of the pack number. Each scenery
+  pack has hooks in `0x34105` `(index, instance)`.
+- **Race barrier instances** carry flags `0x210` (hidden plus barrier).
+- **Path barrier lines** (`0x3414D`) are found by the group name hash
+  (`sub_5D5010`).
+- **Per-track packs:** packs 2601..2619 (Z1..Z19) are switched per track
+  through a per-track pack list (`sub_5DB610`).
+
+Without the group, a race shows its barrier walls but not the barriers
+themselves [game].
+
+### Breakable props — spawner chunk `0x34027`
+
+A header `(0x0B, 0x0B, section, number of spawners in sections with a lower
+number, count)`, then 0x70-byte records [code, game]:
+
+| Offset | Meaning |
+| --- | --- |
+| `0x00` | type key (= `+0x80` of the `0x34026` type record) |
+| `0x04` | index into the override table `0x34107` |
+| `0x08` | model hash |
+| `0x10` / `0x20` | bbox |
+| `0x30` / `0x40` / `0x50` | rotation rows |
+| `0x60` | position, 1.0 |
+
+- A spawner whose `+0x04` points outside the override table crashes at
+  `0x5DB0EE`.
+- Spawning hides the stand-in instance and takes a slot from
+  `VirginSmokeableSlotPool` (256). When the pool is empty the prop is just
+  missing, with no crash. `SmokeableSlotPool` is 32.
+
+## 5c. Particle effects (Acid) — `0x35021`, `0x35020`
+
+The shop markers' emitters can be copied as they are; this is what the records
+mean, how the game runs them, and what a new emitter needs.
+
+| Address | What |
+| --- | --- |
+| `0x491C70` `LoaderAcidFX` | loads `0x35021` (emitter definitions) and `0x35020` (placed emitters), and the containers `0x80035000` and `0x80035010` |
+| `0x48BC00` | links a placed emitter to its definition by key |
+| `0x48BC50` `AcidEffectSystem::AddAutoEmitter` | starts a placed emitter |
+| `0x491E50` `AcidEffectSystem::TriggerEmitter` | makes particles |
+| `0x492E10` `AcidEffectSystem::DoTimeStep` | switches emitters on and off, moves particles |
+| `0x48BDF0` | draws them, from `eDisplayFrame` |
+| `0x4881D0` | a curve: four cubics |
+| `0x487360` | random numbers: xorshift 17, 13, 5, then `(x & 0x7FFFFFFF) * 2^-31` |
+| `CarRenderInfo::TriggerEffect` `0x615CC0` | the cars' effects: `TriggerEmitter` with a negative time |
+
+Pools: 250 emitters (0xD0 bytes each in memory) and particles of 32 bytes.
+
+**Chunk header.** Both chunks start their body on the next 16-byte boundary
+after the chunk header; then `+0x08` version, `+0x0C` count, `+0x10` records.
+In `0x35020` the first word is the section number: `(section, 0, 6, count)`.
+
+### Emitter definition — `0x35021`, version 4, 544 bytes [code, files]
+
+| Offset | Type | Meaning |
+| --- | --- | --- |
+| `+8` | `u32` | key: hash of the emitter's name |
+| `+12` | `u32` | texture hash |
+| `+16` | `u32` | effect hash: the emitters of one effect fire together |
+| `+24` | `u8` | 1 = all round: direction `(cos a, sin a, 0)` at any `a`, tilted by the spread |
+| `+25`, `+26` | `u8` | log2 of the texture's columns and rows of pictures |
+| `+27` | `u8` | pictures per second (0 = none) |
+| `+28` | `u8` | start on a random picture |
+| `+29` | `u8` | random flip of the turn |
+| `+30` | `u8` | follows the emitter's own motion |
+| `+31` | `u8` | shape: width and height factors `(1,1) (1,0.5) (0.5,1) (0,0)` (table `0x7F3944`) |
+| `+32` | `u8` | orientation: 0 faces the camera, 1 flat in XY (the ground), 2 XZ, 3 YZ |
+| `+33` | `u8` | made even with particles switched off |
+| `+36`, `+40` | `f32` | on time, its variance (a fraction) |
+| `+44`, `+48` | `f32` | off time, its variance (0 = for ever) |
+| `+52`, `+56` | `f32` | particles per second, variance (0 makes 10 per second) |
+| `+60`, `+64` | `f32` | life in seconds, variance (at most 60) |
+| `+68`, `+72` | `f32` | speed in m/s, variance |
+| `+76` | `f32` | turn at birth, degrees (random within ± half) |
+| `+80` | `f32` | spread, degrees |
+| `+84`, `+88` | `f32` | share of the emitter's motion taken, variance |
+| `+92` | `u32` | type: which car marker a car effect stands on |
+| `+96` | `3 × f32` | offset |
+| `+112` | `3 × f32` | box the particles start in, around the offset |
+| `+128` | `f32` | range: particles are made only within this distance of a camera |
+| `+132` | `f32` | gravity along Z in m/s² (negative rises) |
+| `+136` | `f32` | drag on the square of the speed |
+| `+140` | `f32` | largest size on screen (0 = 512) |
+| `+144` | `28 × f32` | the authoring tool's keys of the curves |
+| `+256` | `16 × f32` | colour curve: R, G, B, A, each `t³ t² t 1`, values 0..255 |
+| `+320` | `16 × f32` | size curve: size in metres, turn (65536 = a full turn) |
+| `+0x180` | `char[64]` | emitter name |
+| `+0x1C0` | `char[48]` | texture name |
+| `+0x1F0` | `char[48]` | effect name |
+
+### Placed emitter — `0x35020`, version 6, 208 bytes [code, game]
+
+| Offset | Type | Meaning |
+| --- | --- | --- |
+| `+8` | `u32` | key |
+| `+12` | `u32` | key of the definition |
+| `+16` | `u32` | state: 0 off, 1 on, 2 and 3 only when triggered |
+| `+0x28` | `u16` | 0 |
+| `+0x2A` | `u16` | section |
+| `+0x2C` | `u32` | scenery group that switches it on (0 = always on) |
+| `+0x30` | 8 bytes | 0 |
+| `+0x40` | `4 × 4 f32` | matrix, D3D row vectors (position in the last row) |
+| `+0x80` | | velocity |
+| `+0x90` | `char[]` | name |
+
+Emitters written with the `+0x28` block this way show in the game [game]. The
+game overwrites `+20..+47` at run time (timer, next particle, definition
+pointer, active group, seed), so the file values there do not matter.
+
+### How the game runs them [code]
+
+**AddAutoEmitter:** the timer starts at the on time (state 1) or the off time
+(state 0), randomised as `rand * var * t + t - var * t`. A time of 0 means for
+ever.
+
+**DoTimeStep(dt):** state 1 calls `TriggerEmitter(dt)`. The timer runs down;
+at its end, on becomes off and off becomes on, with a new time and a cleared
+wait. An emitter with an on time and no off time fires once.
+
+**TriggerEmitter(time):** works only within the range of a camera. The time is
+limited to what is left of the on time. While the time covers the wait, it
+makes a particle; the next wait is `1 / (rate * (1 - var + rand * var))`, at
+most 240 s.
+
+**Each new particle:**
+
+| Property | How |
+| --- | --- |
+| Direction | the placed matrix's Z axis turned around X, Y and Z by up to half the spread each. All round: `(cos a, sin a, 0)` turned around Y by the tilt, then by the matrix |
+| Position | `offset + rand * box - box / 2`, through the matrix |
+| Life, turn, speed | each varied by its variance |
+| Picture | `rand * pictures` when the start is random |
+
+**Each step:** life goes down by `dt * 1024` and the particle is gone at 0; the
+picture moves on every `1024 / fps` ticks; per axis `v -= sign(v) * v² * drag *
+dt`, on Z also `- gravity * dt`; `position += v * dt`, and a following
+particle also moves with the emitter.
+
+### How they are drawn [code]
+
+The age is `t = 1 - life / (emitter's life)`. Colour and size come from the
+curves at `t`; the colour is clamped to 0..255.
+
+- **Orientation 0:** a quad facing the camera, width `size * shape w`, height
+  `size * shape h`, no turn. The batch leaves out quads with alpha 20 or less.
+- **Orientations 1 to 3:** a quad flat in that plane, turned by the particle's
+  turn plus or minus the curve's turn (by the flip).
+- **Picture:** column `p & (columns - 1)`, row `(p >> log2 columns) & (rows - 1)`.
+- **Effect `worldnodepth.efx`:** colour = `2 * texture * vertex colour`, alpha
+  = `texture * vertex alpha`, no depth write.
+- **Blend** from the texture record's `+0x56`: 1 = source alpha over, 2 =
+  added, 5 and 6 = with the destination's alpha. Alpha test at 95 when
+  `+0x55` is 1.
+
+### What a new emitter needs [code, game]
+
+- **The texture must already be loaded when the region loads.** `LoaderAcidFX`
+  resolves it then with `GetTextureInfo(hash, 0, 0)`: there is no default
+  texture, and an emitter without its texture draws nothing. In practice the
+  texture has to be in `GLOBAL\InGameCommon` (113 textures), which loads
+  before any region; a texture in the region's own stream is too late.
+- **The definition goes into the region file (`L4Rx.BUN`); the placement goes
+  into the stream section** where the emitter stands.
+- **Where the effects live in retail:**
+
+  | File | Emitters | What |
+  | --- | --- | --- |
+  | `GLOBAL\GlobalB` | 92 definitions | the cars' and the map's |
+  | each region file (`L4RA.BUN` ...) | 37 definitions in L4RA | event rings, smoke, shop icons, industrial smoke |
+  | `FRONTEND\PLATFORMS\Showroom.BIN` | 1 | the manhole steam |
+
+## 5d. Parameter maps — `0x8003B600` (fog, tint, rain, wind, reverb)
+
+Fog, screen tint, rain, wind and reverb are set by place through **parameter
+maps**: chunk `0x8003B600` in the region file, read by `LoaderParameterMaps`
+`0x60B810` [code]. Each `0x8003B601` is one layer:
+
+| Chunk | Contents |
+| --- | --- |
+| `0x3B602` | 0x24 bytes: `u32` bStringHash of the layer name, `f32` box x0 y0 x1 y1, `u32` nodes, sets, set size, fields |
+| `0x3B603` | `u32` per field: 0 float, 1 int |
+| `0x3B604` | `u32` per field: offset in the set |
+| `0x3B605` | `sets × set size` bytes: the values |
+| `0x3B607` | quad tree, 4 × `u8` per node |
+| `0x3B608` | quad tree, 4 × `u16` per node |
+
+**Quad tree.** A node has children 0 = x low y low, 1 = x low y high, 2 = x
+high y low, 3 = x high y high. A node whose first child is 0 is a leaf, and
+its second value is the set index. Outside the box, or with no tree, the set
+is 0. Retail maps cover 10240 m in cells of 160 m (6 levels); deeper trees
+work, since the walk halves the box until it meets a leaf.
+
+A layer is found by the hash of its name, so a layer the code does not ask for
+does nothing.
+
+| Layer name | Read by | Fields |
+| --- | --- | --- |
+| `Normal Fog`, `Night Normal Fog` | `sub_614300` | 0 strength, 1 start in m, 2..4 colour, 5..7 (no reader on the PC) |
+| `Night Raining Fog` | `sub_614300` | the same; mixed in by rain intensity |
+| `Fog Blend Distance` | `sub_614300` | metres of cross fade while it rains |
+| `Sunrise Screen Tint`, `Night Screen Tint` | `sub_5D77F0` | 0..2 colour, 3 amount, 4..6 |
+| `Horizon Fog Visibility` | `sub_5DB900` | 1 value |
+| `Rain` | `GetDesiredRainIntensity` | 0 intensity, 1 share of the time it rains |
+| `Wind` | | 0 strength, 1 direction in degrees |
+| `Reverb` | `sub_47C6D0` | 0 preset of `g_REVERBFXMODULES` `0x7ED608`, 1, 2 blend |
+
+Reverb presets: 0 Car_Show, 2 Car_Show_Bass, 3 Garage, 4 Garage_sml, 5
+Simple_Tunnel, 6 Simple_Tunnel_Sml, 7 Hills_Close, 8 Hills, 9 City_Open, 10
+City_Dense, 11 Alley. Retail L4RA uses only 8..11: the map gives the
+neighbourhood, not the tunnels.
+
+### How the fog is computed [code]
+
+Each frame `sub_614300` uses the position of the view:
+
+1. **The set under the camera.** `sub_5FA660` cross-fades over 50 m when the
+   set changes.
+2. **The time of day:** Normal against Night. `sub_60FAA0` turns the sky every
+   300 s with 20 s fades.
+3. **Rain:** with intensity `r`, the result is `(1 - r) * dry + r * Night
+   Raining Fog`.
+
+Rendering (`eDisplayFrame`): vertex fog runs from the start distance to a far
+distance of 250 m (`1 / (250 - start)`). The most fog is `strength`, but never
+less than 0.4 (`dword_784564`), so the PC cannot turn fog off; to hide it,
+give it the sky's colour. The sky dome is fogged too.
+
+**Colour byte order.** The colour sent as FOGCOLOR is `field2 | field3 << 8 |
+field4 << 16`, each times 0.75 (`flt_785510`). D3DCOLOR takes the low byte as
+blue, so for a colour `(r, g, b)` on screen write field 2 = `b / 0.75`, field
+3 = `g / 0.75`, field 4 = `r / 0.75`. The PS2 reads the same bytes as red
+first, so console and PC retail hold the same values, with red and blue
+appearing swapped on the PC.
+
+### Authoring fog by district [game]
+
+1. Choose a square box over the city and a power-of-two number of cells (128
+   cells over 4096 m works).
+2. Define sets of `(strength, start, colour on screen)`, plus a lighter "rain"
+   version of each. Rain darkens the sky on top of its fog, so a dark district
+   colour in `Night Raining Fog` gave a nearly black picture. The game's own
+   rain fog shows as grey 96 on screen at strength 0.5 from 200 m.
+3. Give each cell the set of its nearest seed point. Build the quad tree,
+   merging four equal leaves into one.
+4. Replace the three fog layers (`Normal Fog`, `Night Normal Fog`, `Night
+   Raining Fog`) and keep every other layer as it is. Set 0 is the fog outside
+   the box.
+
+Each layer's set size and field types come from the template layer, so only
+the values and the tree change.
+
+**A trap:** the retail test region L4RR carries the demo-era Street X fog map
+(green, red and brown zones over x -1920..-640, y -2400..-1120). A region
+built from a copy of L4RR inherits it, which gave one port an unexplained
+green fog.
+
+## 5e. World animations — moving objects
+
+A moving object (tram, planes, doors, spotlights) is not a scenery instance
+with a changing matrix. It is a **scene**: a small tree of nodes, an animation
+bank that moves them, a controller, and a placement that puts the scene into
+the world, all in the region file (`L4Rx.BUN`) [code, files, game]. Retail
+examples: the jumbo planes (`ANM_JumboPlane`, `XV_PlaneC`) in Z0, trains
+(`ANM_Graffiti_*`), the casino's moving lights (`ANM_BridgeSpotlightA`), doors
+(one scene with 23 placements).
+
+| Chunk | What |
+| --- | --- |
+| `0x00E34010` | **Animation bank**: an EAGL toolkit ELF. Channels are named `<name>_q`, `<name>_t`, `<name>_s` (rotation, translation, scale). The animation hash is the hash of `<name>` |
+| `0x37080` | **Scene node**, 0x70 bytes. One root node and one child node per animated model |
+| `0x37110` | **Scene controller**, 0x50 bytes: `u32` scene hash, then zeros |
+| `0x37090` | **Placement** of the scene in the world, 0xA0 bytes, one per place the scene stands |
+| `0x37150` | **Placement companion**, 0x10 bytes: `(id, scene hash, pack, 0)`, one per placement |
+
+All five chunks keep their payload 16-byte aligned, with `0x11` fill in front,
+like the other aligned leaves.
+
+**Scene node `0x37080`** (the layout retail uses, as written by a working
+port):
+
+| Offset | Meaning |
+| --- | --- |
+| `0x00` | `u32` 11 |
+| `0x04` | node name hash. The root uses the scene hash; the child the hash of `<scene>_node` |
+| `0x08` | parent hash (0 on the root; the child names the root) |
+| `0x0C` | model hash. The root uses the hash of a dummy `ANM_<SCENE>_00` that does not have to exist; the child carries the real model |
+| `0x20` | scene hash |
+| `0x24` | animation hash (0 on the root) |
+| `0x28` | `u8` channel mask: rotation 1, translation 2, scale 4 (0 on the root) |
+| `0x29` | `u8`: `0xFF` on the root, 0 on the child (meaning not known) |
+| `0x30` | 4 × 4 floats: start matrix (identity works; the node is relative to the placement) |
+
+**Placement `0x37090`**, 0xA0 bytes:
+
+| Offset | Meaning |
+| --- | --- |
+| `0x00` | id |
+| `0x04` | scene hash |
+| `0x08` | number of the scenery pack the scene is anchored to (2600 = Z0, always loaded, for the planes); inferred: the scene lives while this pack is loaded |
+| `0x0C` | flags: 8 play, `0x20` loop, `0x2000` update even out of view, `0x200` and `0x400` random start. Retail: `0x2028` on planes, `0x28` on the rest |
+| `0x10` | time scale |
+| `0x14` / `0x18` | start / end times (0 and 1.0 work) |
+| `0x20` / `0x24` | hashes of the events that start and stop it (0 = plays from the start) |
+| `0x3E` | two bytes `0x69 0x69` (as retail) |
+| `0x40` | 4 × 4 floats: **world matrix**; the scene nodes are relative to it |
+| `0x80` / `0x90` | box the animation moves in: min xyz, then max xyz. It decides when the scene is in view |
+
+**Time.** Scenes run at 30 frames per second times the time scale. Retail jets
+have 0.02 (23 seconds of animation take about 19 minutes). The Underground 1
+tram, with 690 frames, runs at scale 1.0 at about 63 km/h.
+
+**Order matters** [game]:
+
+- The game creates its animation pools when the **first `0x37090` or
+  `0x37150`** loads. A `0x37110` controller loaded before that crashes at
+  `0x440D43`.
+- Retail order in the file: all `0x37090`, then all `0x37150`, then the banks
+  and the scenes.
+- A scene with a hidden model (instance flag `0x10`) is shown by its
+  animation; the planes work like that.
+
+**Not known yet:** a bank has never been authored from scratch (only
+Underground 1's converted and retail's reused by name), so a new moving object
+needs channels in that ELF format, which is not documented. A scene moves the
+picture only: Underground 1's trams had collision, Underground 2's trains have
+none, and a converted tram has none either (never tested with a car).
+
+### Porting Underground 1's moving objects [files, game]
+
+The tram `XOu_TrolleyA_01` and the plane `XO_PlaneA_1b_01` on Olympic are
+*entities* in the track bundle, chunk `0x3B300`: a 4 × 4 matrix, with the type
+and the name in the 0x10 bytes before it and the model (3 or 4 levels of
+detail) after it. The entity's name is the base name of its animation in
+`GLOBAL\INGAMEB.BUN`.
+
+- Recipe: put the bank from `INGAMEB.BUN` into the region as `0xE34010`
+  (converted, below), write the scene (a root node, a child node with the model
+  and mask 7, a controller), and one placement at the entity's matrix, with the
+  box taken from the model's size.
+- Entities that do not move (parked trams, the hotel's turnstile, a truck)
+  become ordinary scenery in a new pack (2499 in X99 was used). A moving tram
+  can stay parked at the start of its route when animations are switched off.
+- Crowds and flag girls live in the NIS sections and are not world animations.
+
+**Underground 1 banks do not load as they are** [code, game]: the bank header
+is EAGL toolkit 2 in Underground 1 and 4 in Underground 2.
+
+| | Underground 1 | Underground 2 |
+| --- | --- | --- |
+| Header at the symbol that ends with `bank` | `[0x18, count, 0, channels, names]` | `[0x1C, count, 0, 0, channels, names]` |
+| Version string in the strtab | `EAGL_TOOLLIB_VERSION-2` | `EAGL_TOOLLIB_VERSION-4` |
+
+The room for the extra word is there, so the conversion edits the bank in
+place: rewrite the header; add 4 to the two relocations that point at `bank +
+0x0C` and `bank + 0x10`; change the version string. Loaded unconverted, the
+game reads a null name table and crashes at `0x434893`. A bank found in both
+games differs only in these three places. The 2003 PS2 demo of Underground 1
+has banks that crash the game at load (`0x4317A3`, `code/anim`).
+
+## 5f. Light flares
+
+Flare records are 0x30 bytes [code]:
+
+| Offset | Meaning |
+| --- | --- |
+| `0x00` | `u32` 11, `u32` 11 (list links) |
+| `0x08` | id |
+| `0x0C` | colour `FFFFFF00` |
+| `0x10` | position |
+| `0x1C` | mirror height |
+| `0x20` | direction |
+| `0x2C` | type (retail 9) |
+| `0x2D` | flags (retail 2) |
+| `0x2E` | section |
+
+`eRenderLightFlare` `0x490920` draws the reflection on the road at x, y and the
+height at `+0x1C`: 999 means "compute once", `2 × floor - z` with the floor
+from `GetElevation`; 9999 means no reflection (no floor under the flare, or the
+flare sits on it); any other value is used as it is. Retail flares hang 5..15
+m over the road; higher ones (Underground 1 neons up to 40 m) mirror far off
+the road and want 9999.
+
+The editor (`io/LightFlares.cpp`) gives a new flare 999 only when a floor lies
+0.3-15 m under it, and 9999 otherwise.
+
+## 5g. Sky
+
+- `sub_60FAA0` looks up `SKYDOME` (`0xBE43EDBB`) with `eFindSolid` **once, on
+  the first in-game frame** [code, game]. It must be in a section loaded at
+  that moment (retail places it from Z0), and the solid index `0x134003` must
+  be sorted, because the lookup is a binary search (`0x48DF90`).
+- Its textures are in `TRACKS\LOC4DYNTEX.BIN`. The game swaps the picture pairs
+  by hash every 300 s (eight hashes at `0x8A07A8`: sunrise, night, sunset,
+  night).
+
 ## 6. Open questions
 
-- What the unknown collision flag bits (`0x01 0x08 0x40`) select.
+- ~~What the unknown collision flag bits (`0x01 0x08 0x40`) select.~~
+  Answered: compare heights, not ground, never cached (§5a, *Flags*).
+- The meaning of the preculler masks in `0x00034106` (an all-zero block is
+  known to be safe, §5).
 
 - Palette location for the 24 `D3DFMT_P8` textures.
 - ~~Which materials want alpha blending rather than the alpha test.~~ Answered:
@@ -655,6 +1273,10 @@ are a median 1,293 units out and the props' 7.3, so nothing sits near the
 boundary. A pre-placed mesh has to be brought back to its own origin before the
 instance transform is applied.
 
+The game itself does not measure anything: the switch is instance flag
+`0x0100`, which makes it draw the mesh without the instance matrix (§5,
+*Instance flags*). The box test above is a heuristic standing in for that flag.
+
 The check that catches this is in `WorldRenderer::CheckReferences`: rebuild each
 instance's bounding box from the model it references and compare with the box
 the file stores for that instance. Note that only the **centre** is worth
@@ -672,24 +1294,149 @@ before the fix, 3.6 after.
 the free-roam road graph (`0x3414A`, `0x3414D`, identical to `PathsFreeRoam.bin`)
 plus three race-specific chunks: `0x34148`, `0x34149` and `0x3414C`.
 
-`0x34148` holds the race's route nodes, 24 bytes each:
+These three decide whether a race has a course, laps and split times.
+
+### `0x34148` — path points, 24 bytes [code]
 
 | Offset | Type | Meaning |
 |---|---|---|
 | 0x00 | f32 x2 | world X, Y |
-| 0x08 | u16 | segment id (nodes in the same segment are listed in order) |
-| 0x0A | u8 x2 | unknown |
-| 0x0C | u16 x3 | links into the road graph (`0xFFFF` = none) |
-| 0x12 | u16 | padding |
-| 0x14 | f32 | distance along the race |
+| 0x08 | u16 | spline index (points of one spline are listed in order) |
+| 0x0A | u8 | **near**, in half metres |
+| 0x0B | u8 | **far**, in half metres |
+| 0x0C | i16 x3 | **linked points**: indices into this same point table (-1 = none) |
+| 0x12 | u16 | 0 |
+| 0x14 | f32 | course distance (rewritten at race start) |
 
-Some segments are side roads that the race does not use, so they are not part of the drawn route.
+Earlier this table read `0x0A` as unknown and `0x0C` as links into the road
+graph; they are indices into the point table itself, not into the road graph.
+Some splines are side roads that the race does not use, so they are not part
+of the drawn route.
+
+`sub_5D9E30` updates a car's course position each frame. The search stays on
+the spline of the last point and moves one point per update; a jump of more
+than 128 m does a full search of the course. With `d` = twice the distance
+from the path: `near <= d < far` tries the linked points; `d >= far` searches
+the course within 128 m; `near = 255` does neither, and such a point can never
+be taken. A candidate wins with `distance + 1 + max(|course distance
+difference| - 40, 0) * 0.25` below the present distance.
+
+**The links are the only way over a joint between splines.** Retail links the
+last three points of a spline to the first point of the next one. Without
+links a car stays on its first spline for good: on a loop it counts a lap at
+the line, slides back along the spline and loses the lap again [game].
+
+### `0x34149` — splines, 0xDC bytes [code, files]
+
+| Offset | Meaning |
+|---|---|
+| 0x00 | name[16] |
+| 0x10 | bStringHash(name), index |
+| 0x1C, 0x1E, 0x20 | u16 first point, end, count |
+| 0x22, 0x23 | u8 link counts |
+| 0x24 / 0x44 | links at the first / last stored point: u16 spline, u16 which end (0 first, 1 last), u32 runtime pointer |
+| 0x64 | f32 length |
+| 0x68 | i32 1 |
+| 0x6C | f32 length |
+| 0x70 | f32 parameter origin |
+| 0x74 / 0x78 | f32 course distance of the first / last stored point |
+| 0x7C | f32 -1 (points are stored against the course direction in every retail file) |
+| 0x80 / 0x84 | distance interval |
+| 0x88 / 0x90 | f32 first / last xy |
+| 0x98 | f32 bbox |
+| 0xA8 | runtime spline |
+| 0xAC | u8 count of tracks the spline is only for |
+| 0xAD | u8 count of tracks it is not for |
+| 0xAE | u16 track numbers (`sub_5D4F60`; both counts 0 = every track) |
+
+### `0x3414C` — courses, 0x110 bytes, one record per race [code]
+
+| Offset | Meaning |
+|---|---|
+| 0x00 | u16 track |
+| 0x02 | i8 number of waypoints |
+| 0x03 | u8 loop |
+| 0x04 | u8 branches |
+| 0x05 | u8 course width in metres (retail usually 30) |
+| 0x06 | 2 bytes, zero |
+| 0x08 | up to 33 × (f32 x, y) waypoints |
+
+Every retail `Paths<n>.bin` holds the 60 records of its region.
+
+How the course is built at race start:
+
+1. `sub_57A650` calls `sub_5E6A40(track, reverse)` for every race type but 0.
+2. That finds the record (`sub_5D5390`) and builds the course (`sub_5E5BB0`):
+   the point nearest each waypoint picks its spline; the chord of the first two
+   waypoints against the stored points picks the direction; `sub_5D53D0` walks
+   the links between waypoints, to depth 10.
+3. `sub_5E48B0` rewrites the course distance of each course spline and its
+   points: 0 is where the first spline is entered, and the length is the sum
+   of the course splines. The distances in the file do not matter.
+
+**Without a record** the course is empty: every percent is 0, no boundary is
+crossed, so no lap or split counts, and a FastTest / SkipFE race turns into a
+one-lap point to point (`dword_89E7B4 = !loop`, laps 1). A spline whose
+include list leaves the track out gives `sub_5E5BB0` no way over it, and it
+gives up; retail `Paths4021.bin` has such a spline.
+
+### Laps and split times [code, game]
+
+`Race::FigureOutBoundaries` `0x5EE620` and `AddBoundaryPosition` `0x5EE4F0`
+build the boundaries:
+
+| Boundary | Where |
+|---|---|
+| start | the `ForwardStartLine` marker, default 5 % of the path |
+| splits | `SplitTimeBoundary1..3`, or start + 33 % and start + 66 %; a third split only with its marker |
+| finish | `ForwardFinishLine`, used only for point to point races |
+
+Each marker is projected onto the course as a percent. The race object is at
+`*0x890118`: `+0xBF4` count, `+0xBF6` start index, `+0xBF7` finish index,
+`+0xBF8` f32 percents.
+
+`RacingCar::UpdateLapCounts` `0x5F7C30`: a forward crossing of the finish
+boundary is lap + 1, a backward crossing lap - 1; boundaries further than 25 %
+from the car are skipped; racers start at lap -1, behind the line, and the
+first crossing makes it 0. A start line placed exactly on the path's 100 → 0
+jump is never crossed cleanly, so start the path somewhere else.
+
+### Start grid markers [code, files]
+
+Names are bStringHash values of exe strings:
+
+| Hash | Name |
+|---|---|
+| `8E55C895` | ForwardStartingPosition |
+| `6A56B90A` | ForwardStartLine |
+| `8F90F7BF` | BackwardStartingPosition |
+| `EEC70374` | BackwardStartLine |
+
+Also used: ForwardFinishLine, BackwardFinishLine, SplitTimeBoundary1..3.
+
+- `sub_5EB5D0` places the cars. The marker index is the grid slot; the
+  reverse flag (`0x89E7A4`) picks Forward or Backward.
+- With too few markers, cars go along the course path.
+- A sprint without `ForwardFinishLine` ends at start line + 95 % of the path,
+  which can lie behind the start.
+
+**The end of a race** [game]: a few seconds after the player crosses the
+finish, the game moves the car to another place for the race end. In logs this
+looks like a reset or teleport through barriers; it is not a collision fault.
+
+### Track maps
 
 `TRACKS/TRACKMAP<id>.BIN` is a texture pack holding one 512x512 DXT3 minimap per
-race. Every L4RA city map uses the same framing:
+race (named `TRACKMAP<n>`, 7 mips, alpha 0; the HUD masks it). Every L4RA city
+map uses the same framing:
 `px = 0.0917 * x + 312`, `py = -0.0917 * y + 298.5`.
 Drag and closed tracks (L4RB..G) use their own zoom. `tools/race_map.py` builds
 `races-map-L4RA.png` from these.
+
+The map's placement in the world comes only from the TrackInfo calibration
+fields (see *New tracks and regions*), so any framing works. Retail frames one
+map of the whole area for every race in it and lets the menu window and ZoomIn
+zoom; a map cropped to the course enlarges the picture and its line.
 
 ## Race start triggers
 
@@ -736,6 +1483,40 @@ Harbour East, Jackson Heights...): thirteen in L4RA. The hash at `0x30` is the
 bin hash of the name as the game spells it (`JACKSON_HEIGHTS`); the names
 themselves are nowhere in the file. `src/nfs/CityZones.*` matches them and
 groups them into the five districts, which is the editor's own grouping.
+
+### Zone types and what reads them [code]
+
+The type names are `TrackPathZoneTypeNames` `0x800D80`:
+
+| Type | Name | Type | Name |
+|---|---|---|---|
+| 0 | NO_WRONG_WAY | 11 | SHORTCUT |
+| 1 | WRONG_WAY | 12 | STREAMER_PREDICTION |
+| 2 | RESET | 13 (`0x0D`) | RACE_START_TRIGGER |
+| 3 | RESET_TO_POINT | 14 (`0x0E`) | SHOP_TRIGGER |
+| 4 | GUIDED_RESET | 15 | SHOWCASE_TRIGGER |
+| 5 | TUNNEL | 16 | TRAFFIC_TYPE |
+| 6 | OVERPASS | 17 (`0x11`) | NEIGHBOURHOOD |
+| 7 | OVERPASS_SMALL | 18 | SMS_TRIGGER |
+| 8 | DRIFT_GATE | 19 | BANK_TRIGGER |
+| 9 | DRIFT_HOT_SPOT | 20 | GARAGE |
+| 10 | TUTORIAL | | |
+
+- `Player::DetectWrongWay` and `AICarController::Think` look for zones 2 and 3
+  at the car and call `sub_5FBE00`. A **RESET** zone sets the reset flag
+  (Car `+0x96C`) when its height (`+0x14`) is 0, or when the car is connected
+  and under that height. **RESET_TO_POINT** puts the car on the zone's point,
+  facing `+0x0C`.
+- `Player::HandleReset` places a reset car using a **GUIDED_RESET** zone
+  around it.
+- `TrackPathManager::FindZone` `0x5D9BF0` returns the first zone of the type
+  that holds the point, without regard to direction.
+- TUNNEL and OVERPASS hold for a car below the zone height: rain stops there,
+  and the sound asks with masks 32, 64, 128 and `0x100000`.
+- NEIGHBOURHOOD zones (type 17) are read only in career free roam (race
+  type 0).
+- TRAFFIC_TYPE zones (type 16) are required for traffic to keep coming; see
+  `research/road-paths.md`.
 
 ## Solved: the alpha test ate the asphalt
 
@@ -842,6 +1623,168 @@ Everything else is copied from a texture of the same format that the game
 already loads. Those are values the game accepts for a texture of this kind,
 which is more than can be said for anything invented.
 
+## New tracks and regions (GlobalB)
+
+The editor puts edits into existing regions. Adding a **new** track or region
+(a separate world, or a port) takes the following [code, game].
+
+### Regions
+
+- **Region names are free.** The exe builds every path from TrackInfo
+  `RegionName` (`+0x40`) with `%s`. Only `L4RG` is special:
+  `RegionLoader::FinishedLoading` `0x57A580` picks pool index 2 (36000 KB
+  instead of 60000) by that name. Regions such as L4GA..L4HF and L4JA run.
+- Set `RegionDirectory` (`+0x48`) to a unique `Location4\Region<x>` per region.
+
+### TrackInfo — chunk `0x34201`, 0x128 bytes per track
+
+Loaded at `0x5D3EB0`. Useful fields:
+
+| Offset | Field |
+|---|---|
+| 0x00 | RaceDescription[32] |
+| 0x20 | TrackDirectory[32] |
+| 0x40 | RegionName[8] |
+| 0x48 | RegionDirectory[32] |
+| 0x84 | IsValid |
+| 0x85 | IsNotLoopingRace |
+| 0x86 | ReverseVersionExists |
+| 0x8A | TrackNumber |
+| 0x8C | SameAs |
+| 0x90 | SunInfoHash |
+| 0x94 | RaceGameplayMode |
+| 0x98 | RaceLength |
+| 0xAC, 0xB0 | TrackMapCalibrationOffsetX, Y (world point at the map's top left) |
+| 0xB4 | TrackMapCalibrationWidth (metres across) |
+| 0xB8 | TrackMapCalibrationRotation (u16, 32768 = 180°) |
+| 0xBA / 0xBC | start grid / finish line angle on the map |
+| 0xC0 | TrackMapCalibrationZoomIn (HUD zoom) |
+| 0xEC | MaxTrafficCars[8] |
+| 0xF8.. | traffic distances |
+| 0x108 | TrafOncomingFraction[4] |
+| 0x118, 0x11C | MenuMapZoomOffsetX, Y |
+| 0x120 | MenuMapZoomWidth (pixels of the map; retail 4001: 168, 194, 270) |
+| 0x124 | MenuMapStartZoomed |
+
+`RaceGameplayMode` values: `0x10` free roam, `0x71` circuit, `0x34` sprint, 2
+drag, 8 drift, `0x800` Street X, `0x2010` URL.
+
+Quick Race lists a track by mode bits (`UIQRTrackSelect::IsAvailable`
+`0x4987C0`): Circuit 1, Sprint 4, Drag 2, Drift 8, Outrun and Free Run `0x10`,
+Street X `0x800`, URL `0x2000`. A track that no career event owns stays locked
+unless `UnlockAllThings` is set (`UnlockSystem::IsTrackUnlocked` `0x5156F0`).
+
+### GlobalB pitfalls [game]
+
+- **Keep the solid list at the end of GlobalB (`0x80134000`) at its offset
+  modulo 0x80.** Adding 0x128-byte records without re-padding shifted it, and
+  every race start then crashed at `0x493D5B` (solid loader).
+- **Language strings are found by binary search, so keep them sorted by
+  hash.** Track names are `TRACK_NAME_<n>` and `REVERSE_TRACK_NAME_<n>`.
+- **Start markers carry the track number at `+0x24`.** Without markers of the
+  new number, `InitCars` crashed at `0x5DA392`.
+- A new track also needs its route files; see `research/road-paths.md`
+  (which route file each mode reads).
+
+### How the editor makes a new region
+
+File > New Region (`ui/RegionTools`, `io/RegionCreate`, `nfs/CustomRegions`)
+avoids every pitfall above by changing no game file and no GlobalB byte:
+
+- **A region is an alias.** `<game>\models\regions\<R>.frsregion` names the
+  new region (the first free `L4R<letter>`, never `L4RG`), the shipped region
+  it copies, its track number (from 4950, past the shipped tracks and the race
+  editor's), its name and its whole TrackInfo entry. The loader
+  (`FileEdits.cpp`, `LoadRegionAliases`) answers `TRACKS\<R>.BUN`,
+  `STREAM<R>.BUN` and every `ROUTES<R>\*` with the source region's files; the
+  handle keeps the name the game asked for, so overlays written in R (their
+  header names R) apply to R only. Files of R's own in `models\files` win over
+  the alias. Nothing is copied: a new region costs a few hundred kilobytes.
+- **The track is added at run time** (`loader/src/Tracks.cpp`, shared with the
+  race editor's new races): the TrackInfo table is copied into a larger one at
+  the end of the chunk loader (`0x5D3EDE`; table `0x883DA0`, count `0x883DA4`),
+  `IsTrackUnlockedForQuickRace` (`0x5143C0`, track = first argument) answers 1
+  for it, and `SearchForString` (`0x4FF9D0`) answers `TRACK_NAME_<n>`,
+  `REVERSE_TRACK_NAME_<n>` and `QR_TRACK_<n>_COMMENT`. No language file and no
+  GlobalB chunk changes size.
+- **The entry** is the source's free-roam track's (its lowest number: 4000 for
+  L4RA, with the whole-city map calibration) with the new number and `SameAs`,
+  `RegionName` R, `RegionDirectory` `Location4\Region<letter>`, `TrackDirectory`
+  `Location4\Track_<n>`, `ReverseVersionExists` 0 and mode `0x10`, so Quick
+  Race lists it under Free Run only.
+- **Its per-track files** go to `models\files\TRACKS` and are rewritten
+  whenever the editor saves or launches the game, from the region's free-roam
+  files as they stand (the baked roads and placed shops included):
+  `ROUTES<R>\Routes<n>F.bin` and `B` = `RoutesFreeRoam.bin` (Free Run is a race
+  of track n), `Paths<n>.bin` = `PathsFreeRoam.bin` (its zones, TRAFFIC_TYPE
+  among them; no course record), `TrackPosMarkersAll.bin` = the source's plus
+  the free-roam track's start grid (8 `ForwardStartingPosition` and the
+  `ForwardStartLine`) renumbered n, and `TRACKMAP<n>.BIN` = the free-roam
+  track's map with its texture renamed (name and bin hash, same-length digits).
+- **Launch Game** in a new region writes FRSFastTest's dev start (`Mode=dev`,
+  `DevTrack=<n>`, `DevRaceType=0`) for that launch only.
+- **Remove This Region** deletes the `.frsregion`, `models\files\TRACKS\ROUTES<R>`,
+  `<R>.BUN`, `TRACKMAP<n>.BIN` and the region's own edit files in `models`
+  (`<R>-*`, `*-<R>.*`).
+
+**Empty regions** (`kind empty` in the `.frsregion`, made with "Empty, with
+ground made for it"): the same alias, with none of the source's city.
+
+- The editor hides every shipped object of the positioned sections (all but
+  the X, Y, Z libraries) by listing it in `LoadedSection::removedNatives`, so
+  any section it writes goes out with those records zeroed; their shipped
+  collision starts empty, and a written section goes out with every pack as
+  the editor holds it. A section an import rebuilt from its bytes (the bake,
+  a quick edit) that still holds city objects or a pack as shipped is marked
+  `emptyPending` as it loads and written again at once.
+- The region file's zone lists (`0x34153`) are cut in place to the library
+  sections of each shipped list and the sections the editor wrote
+  (`<R>-<SECTION>-stream.frssection`): the game never streams the city in.
+- Its TrackInfo has `MaxTrafficCars` (`+0xEC`) zeroed; the source's road graph
+  stays only so a reset car has somewhere to go. The game's resets read
+  [code]: no topology at the car or 1 m to its side (`0x604928`, every 32
+  frames), more than 5000 m from the track path (`0x60496D`, off when
+  `0x81CB88` is set), a RESET zone (`0x5FBEA8`), and on tracks 4400-4404 and
+  4709 only, 30 m from the path (`0x5EAEC0`). None is a distance to the road
+  graph: a car on ground with collision is not reset for being off the roads.
+- Its ground (`terrain/Procedural`): a square of noise terrain round the start
+  grid, cut to the visibility zones, with a flat 80 m start, a 45 m rim and
+  auto rock, written as terrain patches (`terrain-<R>.txt`, with
+  `terraincollision 1` in `roads-<R>.txt`) and baked like any terrain. The
+  bake takes no light from the hidden city (`SetGameLight`); the patches carry
+  a neutral grey ambient (0x707070).
+
+Not yet tried in the game: whether a free-roam start (race type 0) on a track
+other than 4000 keeps the region's track, and whether Free Run without a
+course record behaves (FastTest/SkipFE turns such a race into a one-lap point
+to point; Free Run has no finish).
+
+## Testing in the game
+
+- **FRSFastTest / FRSFastBoot: `DevRaceType` 1 is a race and 0 is free roam.**
+  The ini comment ("0 circuit, 1 sprint") is wrong: circuit or sprint comes
+  from the course record's loop flag (`0x3414C`, see *Race routes and track
+  maps*).
+- **SkipFE globals** a test plugin can write:
+
+  | Address | What |
+  |---|---|
+  | `0x864FB0` | number of AI racers (`SkipFENumAICars`) |
+  | `0x864FBC` | traffic density: 0 in dev mode; copied to `QRSelectedTrafficDensity` `0x89E7A8` |
+  | `0x864FB4` | reverse |
+  | `0x7FAA28` | race type |
+
+- **F6** (the game's own autopilot) drives the player along the routes, good
+  enough for unattended race runs. On a track with no routes it crashes at
+  `0x41C113` (an AI controller without route state). With a race start scene,
+  the F6 press must wait for race state 4, or it is lost.
+- **Useful car fields:** `+0x60` position, `+0x70` velocity, `+0x5C4`
+  TopologyCoordinate, `+0x96C` reset flag.
+- **Logs worth having:** a launch detector (vertical speed jumps by more than
+  about 4 m/s in one frame) with the polygons under the car; a reset or
+  teleport detector (a position jump); per-car lap, checkpoint and finish
+  values from the race object.
+
 ## Need for Speed Underground (the first game)
 
 The editor reads Underground 1 regions too (read-only). Its chunks are
@@ -863,3 +1806,158 @@ Underground 2's with these differences:
 The editor gives each drivable section the centre of its zone as a position
 (a detail section `<letter>11..19` takes `<letter>1..9`'s), and splits the
 track's collision by the zone that holds each polygon.
+
+The rest of this section comes from converting all of Underground 1's regions
+to Underground 2 [files, game]. It matters once Underground 1 is written, not
+only read.
+
+### Collision
+
+- **Collision exists only on the race routes.** Off-route ground (parks,
+  plazas, the skate park) has none; a port generated it from upward scenery
+  triangles reachable from existing floors.
+- **One race's collision closes side streets that another race uses.** Walls
+  with drivable floor of another race on both sides are race barriers, not
+  city walls.
+- **Drift courses** are a `ROAD_DRIFT` (class 3) band 3-4 cm over the floor of
+  the lot. In Underground 2 that made cars hop between the two (§5a, *Flags*);
+  laying the band on the floor fixed it.
+- **The 14th & Vine drag strip** has floors with byte 3 `0x08` seven metres
+  over the road. Underground 2 reads `0x08` as not ground, so they do not
+  carry the car.
+- **All walls are `0x16`**, real-height ones included. Clear `0x04` on walls
+  under about 200 m (§5a).
+
+### Sections and scenery
+
+- **The data of a drivable section is in that section itself** (A1 = 101),
+  not in N + 20. Underground 2 needs the collision of N in stream section
+  N + 20, or the car freezes at the start.
+- **14 drivable sections have no stream data of their own**, like Underground
+  2's drivable 101 whose data is in A21.
+- **World-space flag:** the instance identity flag is `0x0200` in Underground 1
+  and `0x0100` in Underground 2. The other flag values do not carry over
+  (Underground 1 `0x40` is not Underground 2 `0x40`), and Underground 1 flag 2
+  marks reflection-only copies at the mirror height.
+- **Each race has a Z section** (2600 + k: Z1..Z8 = 1001..1008, Z10..Z17 =
+  1102..1109) with its barriers and start or finish graphics, named
+  `ZPM_<race>_FW/BW_STARTF...`.
+- **Drag strips have unnamed packs.** They can be assigned to the races whose
+  course passes 90 % of the pack's objects within 40 m. Two drags share a
+  street (1201 and 1210, 1206 and 1214), so a pack can belong to both.
+
+### Routes and paths
+
+- **Routes `0x34121`:** a 0x10-byte prefix, then 0x26C-byte headers and
+  0x88-byte float points. Racing lines are i16/256 at `+0x4A` (along the
+  route) and `+0x4C` (against it, not mirrored). Lanes are 6 × i16/256 at
+  `+0x52` and `+0x5E`, signed. Racing speeds are 5 + 5 bytes at `+0x6A`, by
+  car class, fastest first.
+- **Signposts** are 0x20 bytes without a prefix: `+4` target point, `+6`
+  source point, `+9` target route, `+0xA` source route (bytes), `+0xB` racer
+  type, `+0xC` traffic type, `+0xD` direction.
+- **The race course in TRACKB** is `0x34148` (one 40-byte header holding the
+  length) and `0x34149` (20-byte points: x, y, ..., course distance).
+- **Zones (0xB4 bytes)** add what Underground 2 dropped: `+0x18` direction (0
+  forward, 1 reverse, 255 both), `+0x1C` course distance of the point, `+0x20`
+  and `+0x24` the stretch of course the zone covers. Each RESET_TO_POINT comes
+  twice with one box, one point per direction. TRACKB1003 has 0 on both its
+  zones, so use the direction of the point against the course instead.
+- **Race numbers:** 10xx circuits, 11xx sprints, 12xx drag, 13xx drift.
+
+### Fog
+
+Underground 1 keeps fog in TRACKB chunk `0x34250` (`LoaderWeatherMan`
+`0x588D10`; every race has a copy): 8 bytes of fill, then 3, 3, version 2,
+count, then 232-byte records:
+
+| Offset | Meaning |
+|---|---|
+| 0x08 | name[64], such as `FOG_MainB <0.8, 0.5, 1.75>01` |
+| 0x48 | type (1 = fog) |
+| 0x4C | colour |
+| 0x50 | start in m |
+| 0x58 | x, y, z |
+| 0x64 | outer radius |
+| 0x68 | strength |
+| 0x6C | inner radius |
+
+The fog regions are spheres. `sub_588F40` weighs them by distance to the
+camera: full weight inside the inner radius, falling linearly to the outer
+radius. The region fully inside with the smallest outer radius wins. Olympic
+has 91 such spheres along its roads, and `FOG_Main` of radius 4000 at the
+origin as the default. Underground 2 uses parameter maps instead (§5d).
+
+### Particle effects
+
+Underground 1 `0x35021` records have one word less before the numbers:
+`+24..+31` are the same flags, Underground 1 `+32..+91` are Underground 2
+`+36..+95`, and `+92..+95` are zero. To convert a record, move `+32..+91` to
+`+36..+95` and write zero at `+32..+35` (orientation 0, as Underground 1 draws
+them) [files: 35 of the 51 emitters both GlobalBs share match byte for byte
+this way]. Placed emitters are version 5, 0xC0 bytes; Underground 2 inserts
+the 0x10-byte block at `+0x28` (§5c).
+
+Three particle textures do not exist in Underground 2. Swap them, with the
+picture grid of the new texture:
+
+| Underground 1 texture (grid) | Underground 2 replacement (grid) |
+|---|---|
+| `SMOKE_CS` (4 × 4) | `SFX_SMOKE_A_CS` (2 × 2) |
+| `FIREA_CS` (4 × 2) | `SFX_FIREB` (2 × 2) |
+| `SFX_RJBSPARKS` (4 × 2) | `XE_SPARKSA` (2 × 1) |
+
+Moving objects and their animation banks: §5e.
+
+### Textures and other chunks
+
+- **Textures:** TPK version 4. Scroll speeds (`+0x5A`, `+0x5C`) are 32 times
+  finer than Underground 2's (`TRN_WATERFALL_A` `0x7800` against `0x03C0`).
+- **Track textures:** each race's own textures are in section Y0 (file type 2)
+  of `STREAM<region>_<race>.BUN`. The sky and the old map are in
+  `TEX<race>TRACK.BIN`.
+- **Course thumbnails:** `Global\DYNTEX.BIN` is a streamed pack. Chunk
+  `0x33310003` holds 20 bytes per texture (hash, file offset, packed size,
+  0x100, 0), and each picture is its own JDLZ block. `TRACK_<id>_SPLINE` are
+  the hand-drawn course thumbnails of the track select screen, too inexact to
+  trace a course map from; draw from the routes instead.
+- **Lights** `0x80135000` are version 3. **Flares** are 0x50 bytes with a
+  name. **Entities** (parked trams, the moving tram, the plane) are in
+  `0x3B300`.
+- **Surface classes** index the same table in SPEED.EXE and SPEED2.EXE.
+
+### The 2003 PS2 demo (Jampack)
+
+Its files are COMP-packed with older records: section records of 0x34 bytes;
+solid names at `+0x90`; textures in TPK version 3 (pixels directly in
+`0x33320001`); an older surface class table; lights and flares with the name
+first; 72-byte prop collision volume heads; outlines for the scenery sections
+too.
+
+## Appendix: Carbon-format data
+
+Found converting Carbon-format data (the W2C mod's Palmont) to Underground 2
+[files, game]:
+
+- **Materials:** the solid material `+0x30` is the **vertex format**. There is
+  one vertex buffer per format, and the colour and UV offsets differ by
+  format:
+
+  | Format | Colour at | UV at |
+  |---|---|---|
+  | 0, 1, 3, 4 | +24 | +28 |
+  | 5, 25 | +20 | +12 |
+  | 26 | +12 | +16 |
+
+- **Solid material `+0x34`** (Underground 2 `0x134B02`) is the first index of
+  the group in the index buffer, cumulative. Writing 0 made every group draw
+  group 0's triangles.
+- **Textures:** TPK mips at `+0x32`, tilable UV `+0x33`, alpha usage `+0x39`,
+  blend `+0x3A`. Usage 2 with blend 0 is a specular mask: draw it opaque.
+- **Instances:** instance flag `0x8` = hidden until a scenery group enables it
+  (race barriers, seasonal objects).
+- **Collision:** a collision point is the instance position **minus** the
+  article point, and world = `(-z, x, -y)` (median error 3 mm against the
+  road mesh). Carbon keeps building collision inside the objects, so the
+  region's own packs hold only road floors.
+- **Strip winding** is random: floors must be flipped up.

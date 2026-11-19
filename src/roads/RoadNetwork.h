@@ -65,6 +65,21 @@ struct RoadProfile {
     float lampRadius   = 14.0f;
     float lampStrength = 1.0f;
 
+    // A tunnel: walls and a roof round the road (an arch, or a box), seen from
+    // inside, lights along the roof, a concrete portal at each open end, and
+    // the ground left alone over it -- only at the portals is it opened, as
+    // high as the tunnel (Network::Cuts), so the road can go in.
+    bool  tunnel = false;
+    float tunnelHeight = 6.5f;
+    int   tunnelShape = 0;            // 0 arch, 1 box
+    float tunnelLightSpacing = 12.0f; // 0: no lights
+    u32   tunnelLightColor = 0xFFE6B4;
+    float tunnelPortalSize = 3.0f;    // the portal's border round the opening
+    float tunnelPortalDepth = 8.0f;   // unused now: the whole inside is opened (kept in the file)
+    std::string tunnelWall, tunnelRoof, tunnelPortal;   // empty: concrete (ARC_CONCRETE_LIGHT2, ARC_CONCRETEA_VK, ARC_A51CONCRETE2)
+    // Off the ground: a bridge or a tunnel. The ground is never fitted to it.
+    bool  OffGround() const { return bridge || tunnel; }
+
     // A bridge: the road stands on a deck of its own thickness, held up by
     // pillars every `pillarSpacing` down to the ground (0 for none), and the
     // ground is not fitted under it.
@@ -269,6 +284,12 @@ struct Pole {
     float radius = 0.0f;
     float strength = 0.0f;
     float scale = 1.0f;
+    // A lamp under a roof (a tunnel's): it lights nothing above itself, nor
+    // anything further than `across` to either side of the line `along`
+    // (the tunnel's way) -- only the inside of the tunnel.
+    bool  underRoof = false;
+    Vec3  along{ 1.0f, 0.0f, 0.0f };
+    float across = 1e30f;
     // A zoned building, not a light: where it stands, for the overlay.
     bool  building = false;
     Vec3  corners[4];
@@ -293,6 +314,28 @@ struct Light {
 // A game model placed by hand or painted: a tree (with a trunk of collision
 // round it) or a prop -- one of the game's smackables keeps the physics the
 // game gives that model.
+// Water made in the editor, as the game's own is: a lake (a closed outline,
+// flat at `level`) or a stream (a path whose points carry the water's height,
+// falling as waterfalls where it drops by `fallHeight` or more between two
+// points). Under a stream the ground is carved down `depth` with the banks
+// eased, the terrain and the game's ground alike (RoadField::AddWaters); a
+// lake leaves the ground as it is, running on under its surface.
+struct Water {
+    enum Kind { kLake = 0, kStream = 1 };
+    u32   id = 0;
+    int   kind = kLake;
+    std::vector<Vec3> points;      // lake: the outline; stream: the path, z = the water's height
+    float level = 0.0f;            // lake: the water's height
+    float depth = 2.0f;            // the bed under the water
+    float width = 5.0f;            // stream: across
+    float shore = 3.0f;            // how far the surface runs on under the banks
+    float fallHeight = 2.0f;       // stream: a drop this big between two points is a waterfall
+    bool  foam = true;             // foam at the foot of falls and on steep stretches
+    bool  deep = false;            // the car is in water: the game's deep-water surface on top
+    bool  carve = true;            // the ground is cut down under it
+    std::string texture;           // empty: the game's animated water
+};
+
 struct Prop {
     u32   id = 0;
     std::string model;
@@ -411,8 +454,8 @@ struct MeshPiece {
 class Network {
 public:
     void Clear() {
-        nodes_.clear(); segments_.clear(); cuts_.clear(); gameJunctions_.clear(); faceJunctions_.clear(); lights_.clear(); props_.clear();
-        nextId_ = 1; fillBetween_ = false; SetDirty();
+        nodes_.clear(); segments_.clear(); cuts_.clear(); gameJunctions_.clear(); faceJunctions_.clear(); lights_.clear(); props_.clear(); waters_.clear();
+        nextId_ = 1; fillBetween_ = false; terrainCollision_ = false; SetDirty();
     }
 
     const std::vector<Node>& Nodes() const { return nodes_; }
@@ -447,6 +490,30 @@ public:
     }
     // Trees and props (they share the ids too).
     const std::vector<Prop>& Props() const { return props_; }
+
+    // Lakes and streams (they share the ids too).
+    const std::vector<Water>& Waters() const { return waters_; }
+    u32 AddWater(Water water) {
+        water.id = nextId_++;
+        waters_.push_back(std::move(water));
+        SetDirty();
+        return waters_.back().id;
+    }
+    Water* FindWater(u32 id) {
+        for (Water& w : waters_)
+            if (w.id == id) return &w;
+        return nullptr;
+    }
+    const Water* FindWater(u32 id) const {
+        for (const Water& w : waters_)
+            if (w.id == id) return &w;
+        return nullptr;
+    }
+    void RemoveWater(u32 id) {
+        waters_.erase(std::remove_if(waters_.begin(), waters_.end(), [id](const Water& w) { return w.id == id; }),
+                      waters_.end());
+        SetDirty();
+    }
     u32 AddProp(Prop prop) {
         prop.id = nextId_++;
         props_.push_back(std::move(prop));
@@ -484,6 +551,8 @@ public:
     // Stretches of the game's roads replaced by procedural ones, and the
     // boxes the junctions made into them take out.
     std::vector<GameCut> Cuts() const;
+    // The tunnels' portals alone: where the ground is opened for them.
+    std::vector<GameCut> TunnelCuts() const;
     void AddCut(const GameCut& cut) { cuts_.push_back(cut); SetDirty(); }
 
     // Junctions made into the game's own roads.
@@ -610,6 +679,10 @@ public:
     // Ground filling every area the roads close all round (optional, saved).
     bool FillBetween() const { return fillBetween_; }
     void SetFillBetween(bool on) { fillBetween_ = on; SetDirty(); }
+    // Whether the ground beside and between roads, and the terrain patches,
+    // get collision when baked. Off unless asked for.
+    bool TerrainCollision() const { return terrainCollision_; }
+    void SetTerrainCollision(bool on) { terrainCollision_ = on; }
 
     // Save and load, as text.
     bool Save(const std::wstring& path) const;
@@ -629,6 +702,7 @@ private:
     std::vector<FaceJunction> faceJunctions_;
     std::vector<Light> lights_;
     std::vector<Prop> props_;
+    std::vector<Water> waters_;
     GroundQuery ground_;
     ModelBounds modelBounds_;
     std::vector<BuildingModel> buildings_;
@@ -641,7 +715,12 @@ private:
     void PlaceBuildings(std::vector<Pole>& poles, std::vector<MeshPiece>& pieces) const;
     // Ground in every area roads close all round, when fillBetween_.
     void BuildFills(std::vector<MeshPiece>& pieces) const;
+    // The water's surfaces, falls and foam (roads/Water.cpp).
+    void BuildWaters(std::vector<MeshPiece>& pieces) const;
+    // The ground pieces opened at the tunnels' portals.
+    void OpenTunnelPortals(std::vector<MeshPiece>& pieces) const;
     bool fillBetween_ = false;
+    bool terrainCollision_ = false;
     u32 nextId_ = 1;
     bool dirty_ = true;
     u64 revision_ = 1;
@@ -664,6 +743,14 @@ public:
     bool Query(float x, float y, float reach, float& height, float& outside) const;
 
 private:
+public:
+    // The beds of the network's lakes and streams, carved like roads
+    // (roads/Water.cpp). After Build.
+    void AddWaters(const Network& network);
+
+private:
+    // Puts every sample in the grid cells it touches.
+    void Index();
     struct Sample { Vec3 a, b; float half; };     // a stretch of centre line
     std::vector<Sample> samples_;
     std::vector<std::vector<u32>> cells_;

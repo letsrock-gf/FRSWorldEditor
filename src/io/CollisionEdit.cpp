@@ -18,6 +18,7 @@ namespace collision {
 
 namespace {
 
+constexpr u8 kFlagCompare  = 0x01;   // floors: compete by height (see MakeGround)
 constexpr u8 kFlagVertical = 0x02;
 constexpr u8 kFlagQuad     = 0x10;
 constexpr u8 kFlagsBarrier = 0x16;   // every shipped barrier
@@ -123,7 +124,11 @@ nfs::CollisionPolygon MakeGround(const Vec3* corners, int count, u8 surface) {
     for (int c = 0; c < 4; ++c) polygon.corners[c] = outline[(size_t)std::min(c, count - 1)];
     polygon.attributes[0] = 0;
     polygon.attributes[2] = surface;
-    polygon.attributes[3] = (u8)((polygon.quad ? kFlagQuad : 0) | (vertical ? kFlagVertical : 0));
+    // 0x01 on every floor: it makes the floor compete by height with any other
+    // under or over it (without it the first floor the point is strictly
+    // inside wins at any height, and a deck becomes the ground of the street
+    // below). Alone at a point it changes nothing.
+    polygon.attributes[3] = (u8)((polygon.quad ? kFlagQuad : 0) | (vertical ? kFlagVertical : kFlagCompare));
     Finish(polygon);
     return polygon;
 }
@@ -162,24 +167,83 @@ void AppendWall(const std::vector<Vec3>& points, const WallOptions& options,
     const float sink = std::clamp(options.sink, 0.0f, 20.0f);
     const float piece = std::max(1.0f, options.maxPiece);
 
-    for (size_t i = 0; i + 1 < points.size(); ++i) {
-        const Vec3 a = points[i], b = points[i + 1];
-        const float length = std::hypot(b.x - a.x, b.y - a.y);
-        if (length < 0.25f) continue;
-        const int pieces = std::max(1, (int)std::ceil(length / piece));
-        for (int k = 0; k < pieces; ++k) {
-            const float t0 = (float)k / pieces, t1 = (float)(k + 1) / pieces;
-            const Vec3 p = a + (b - a) * t0, q = a + (b - a) * t1;
-            if (options.kind == WallKind::Barrier) {
-                out.push_back(MakeBarrier(p, q, options.surface));
-                if (options.bothSides) out.push_back(MakeBarrier(q, p, options.surface));
-            } else {
-                const Vec3 footP{ p.x, p.y, p.z - sink }, footQ{ q.x, q.y, q.z - sink };
-                out.push_back(MakeVerticalWall(footP, footQ, height + sink, options.surface));
-                if (options.bothSides)
-                    out.push_back(MakeVerticalWall(footQ, footP, height + sink, options.surface));
+    // Points closer than a quarter metre in plan are one point.
+    std::vector<Vec3> line;
+    for (const Vec3& p : points)
+        if (line.empty() || std::hypot(p.x - line.back().x, p.y - line.back().y) >= 0.25f) line.push_back(p);
+    if (line.size() < 2) return;
+    const bool closed = line.size() > 2 && std::hypot(line.front().x - line.back().x,
+                                                      line.front().y - line.back().y) < 0.25f;
+    if (closed) line.back() = line.front();
+
+    // One face per piece along a polyline; it faces the left of the way the
+    // points run (MakeBarrier / MakeVerticalWall).
+    const auto face = [&](const Vec3& p, const Vec3& q) {
+        if (options.kind == WallKind::Barrier) {
+            out.push_back(MakeBarrier(p, q, options.surface));
+        } else {
+            const Vec3 footP{ p.x, p.y, p.z - sink }, footQ{ q.x, q.y, q.z - sink };
+            out.push_back(MakeVerticalWall(footP, footQ, height + sink, options.surface));
+        }
+    };
+    const auto run = [&](const std::vector<Vec3>& along) {
+        for (size_t i = 0; i + 1 < along.size(); ++i) {
+            const Vec3 a = along[i], b = along[i + 1];
+            const float length = std::hypot(b.x - a.x, b.y - a.y);
+            if (length < 0.01f) continue;
+            const int pieces = std::max(1, (int)std::ceil(length / piece));
+            for (int k = 0; k < pieces; ++k) {
+                const float t0 = (float)k / pieces, t1 = (float)(k + 1) / pieces;
+                face(a + (b - a) * t0, a + (b - a) * t1);
             }
         }
+    };
+
+    if (!options.bothSides) {
+        run(line);
+        return;
+    }
+
+    // Both sides: a closed box around the line. Each side is the line moved
+    // half the thickness to that side, mitred at the bends, and runs so it
+    // faces out; an open line gets a cap across each end, facing out too.
+    const float half = kTwoSidedThickness * 0.5f;
+    const size_t n = line.size();
+    const auto leftOf = [](const Vec3& from, const Vec3& to) {
+        const float dx = to.x - from.x, dy = to.y - from.y;
+        const float length = std::max(1e-6f, std::hypot(dx, dy));
+        return Vec3{ -dy / length, dx / length, 0.0f };
+    };
+    std::vector<Vec3> left(n), right(n);
+    for (size_t i = 0; i < n; ++i) {
+        // The segments either side of this point (a closed loop wraps round).
+        const bool first = i == 0, last = i + 1 == n;
+        Vec3 before{}, after{};
+        bool hasBefore = !first, hasAfter = !last;
+        if (!first) before = leftOf(line[i - 1], line[i]);
+        if (!last) after = leftOf(line[i], line[i + 1]);
+        if (closed && first) { before = leftOf(line[n - 2], line[0]); hasBefore = true; }
+        if (closed && last) { after = leftOf(line[0], line[1]); hasAfter = true; }
+        Vec3 offset = hasBefore && hasAfter ? before + after : hasBefore ? before : after;
+        const float length = std::hypot(offset.x, offset.y);
+        if (length < 1e-4f) offset = hasAfter ? after : before;     // folds straight back
+        else offset = offset * (1.0f / length);
+        // The mitre: as far out as keeps each side `half` from its segment,
+        // at most four times that at a sharp bend.
+        const Vec3 reference = hasAfter ? after : before;
+        const float cosine = std::max(0.25f, offset.x * reference.x + offset.y * reference.y);
+        const float reach = half / cosine;
+        left[i] = Vec3{ line[i].x + offset.x * reach, line[i].y + offset.y * reach, line[i].z };
+        right[i] = Vec3{ line[i].x - offset.x * reach, line[i].y - offset.y * reach, line[i].z };
+    }
+    if (closed) { left.back() = left.front(); right.back() = right.front(); }
+
+    run(left);                                         // faces left, outward
+    std::vector<Vec3> back(right.rbegin(), right.rend());
+    run(back);                                         // runs backwards: faces right, outward
+    if (!closed) {
+        face(left.back(), right.back());               // across the far end, facing on
+        face(right.front(), left.front());             // across the near end, facing back
     }
 }
 

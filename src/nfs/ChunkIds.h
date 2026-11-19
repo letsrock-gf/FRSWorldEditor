@@ -68,7 +68,12 @@ enum ChunkId : u32 {
     // them), and in L4Rx.BUN the library that defines them.
     kChunkEmitters           = 0x00035020,
     kChunkEmitterLibrary     = 0x00035021,
-    kChunkAfterEmitters      = 0x80036000,  // follows the emitters in every section that has them
+    kChunkAfterEmitters      = 0x80036000,
+    // The section's street-light flares (drive/fx/WorldFlaresU2.h): a pack
+    // header (0x60 bytes) and 0x30-byte flares, each 16-byte aligned.
+    kChunkFlarePack          = 0x80135100,
+    kChunkFlareHeader        = 0x00135101,
+    kChunkFlares             = 0x00135102,  // follows the emitters in every section that has them
 };
 
 inline bool IsContainer(u32 id) { return (id & 0x80000000u) != 0; }

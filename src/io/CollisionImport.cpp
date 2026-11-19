@@ -1,6 +1,7 @@
 #include "io/CollisionImport.h"
 
 #include "core/Log.h"
+#include "io/CollisionEdit.h"
 #include "io/MeshOverlay.h"
 #include "io/SectionRebuild.h"
 #include "io/SectionEdits.h"
@@ -449,9 +450,11 @@ bool PlanCollisionImport(const nfs::World& world, const std::wstring& objPath,
     std::wostringstream report;
 
     // The encoder below writes Underground 2 packs. NFS World collision
-    // (0x3B801) is read only until its index chunk 0x3B802 is understood.
+    // (0x3B801) is edited with the collision tools and written by Save
+    // (nfs/WorldCollision.cpp); an import of a whole pack is not.
     if (nfs::IsWorld()) {
-        plan.report = L"NFS World collision can be viewed and exported, not written back yet.\n\n";
+        plan.report = L"Collision cannot be imported into NFS World yet. Edit it with the collision "
+                      L"tools: Save writes those edits.\n\n";
         return false;
     }
 
@@ -566,42 +569,47 @@ bool PlanCollisionImport(const nfs::World& world, const std::wstring& objPath,
         for (const ObjFace& face : object.faces)
             FaceToPolygons(face, manifest.origin, fallback, faces, stats);
 
-        // A barrier only stops a car on one side: across every shipped region
-        // the road lies to the left of the segment's direction in 98% of them.
-        // A wall drawn in Blender is meant to stop cars from wherever they come,
-        // so each one goes in both directions. Segments already present in
-        // either direction -- an export of walls made this way -- are kept once.
+        // A barrier stops a car on its front side only: the game gives every
+        // face a solid 1 m deep behind it and pushes a car that touches it out
+        // along the face's normal (SPEED2 0x7A1878). A barrier is kept as it
+        // comes -- the game's own face the road, 98% of them on the left of
+        // the segment's direction. A pair on the same line facing both ways
+        // (how earlier versions wrote a wall for both sides) throws a car
+        // through to the far side, so it becomes a closed box instead
+        // (collision::AppendWall, both sides). Exact repeats are kept once.
         std::vector<nfs::CollisionPolygon> replacements;
         size_t twinned = 0;
         {
-            std::vector<std::pair<std::pair<long, long>, std::pair<long, long>>> seen;
             const auto key = [](const Vec3& p) {
                 return std::make_pair(std::lround(p.x * 8.0f), std::lround(p.y * 8.0f));
             };
-            const auto present = [&](const Vec3& a, const Vec3& b) {
-                return std::find(seen.begin(), seen.end(), std::make_pair(key(a), key(b))) !=
-                       seen.end();
+            using Segment = std::pair<std::pair<long, long>, std::pair<long, long>>;
+            std::vector<Segment> segments;
+            for (const nfs::CollisionPolygon& polygon : faces)
+                if (polygon.barrier) segments.push_back({ key(polygon.corners[0]), key(polygon.corners[2]) });
+            const auto has = [&](const Segment& s) {
+                return std::find(segments.begin(), segments.end(), s) != segments.end();
             };
-
+            std::vector<Segment> done;
             for (const nfs::CollisionPolygon& polygon : faces) {
                 if (!polygon.barrier) { replacements.push_back(polygon); continue; }
                 const Vec3 a = polygon.corners[0], b = polygon.corners[2];
-                if (!present(a, b)) {
-                    replacements.push_back(polygon);
-                    seen.push_back({ key(a), key(b) });
+                const Segment forward{ key(a), key(b) }, backward{ key(b), key(a) };
+                if (std::find(done.begin(), done.end(), forward) != done.end()) continue;
+                done.push_back(forward);
+                if (!has(backward)) { replacements.push_back(polygon); continue; }
+                done.push_back(backward);
+                std::vector<nfs::CollisionPolygon> box;
+                collision::WallOptions options;
+                options.kind = collision::WallKind::Barrier;
+                options.surface = polygon.attributes[2];
+                options.bothSides = true;
+                collision::AppendWall({ a, b }, options, box);
+                for (nfs::CollisionPolygon& side : box) {
+                    side.attributes[0] = polygon.attributes[0];
+                    side.SyncFromAttributes();
+                    replacements.push_back(side);
                 }
-            }
-            const size_t count = replacements.size();
-            for (size_t i = 0; i < count; ++i) {
-                const nfs::CollisionPolygon polygon = replacements[i];
-                if (!polygon.barrier) continue;
-                const Vec3 a = polygon.corners[0], b = polygon.corners[2];
-                if (present(b, a)) continue;
-                nfs::CollisionPolygon twin = polygon;
-                twin.corners[0] = twin.corners[1] = b;
-                twin.corners[2] = twin.corners[3] = a;
-                replacements.push_back(twin);
-                seen.push_back({ key(b), key(a) });
                 ++twinned;
             }
         }
@@ -697,7 +705,7 @@ bool PlanCollisionImport(const nfs::World& world, const std::wstring& objPath,
         if (stats.splitNgons) report << L" " << stats.splitNgons << L" faces with more than four corners were split into triangles.";
         if (stats.unknownMaterial) report << L" " << stats.unknownMaterial << L" faces had no collision material and took the section's commonest ground.";
         if (stats.dropped) report << L" " << stats.dropped << L" faces too small to keep were dropped.";
-        if (twinned) report << L" " << twinned << L" walls were doubled to block from both sides.";
+        if (twinned) report << L" " << twinned << L" walls drawn both ways became closed walls that block from both sides.";
         if (replacesEarlierEdit) report << L" This replaces the earlier collision edit of the section.";
         if (offset != section->streamOffset)
             report << L" The section no longer fits where it was and moves past the end of the stream.";

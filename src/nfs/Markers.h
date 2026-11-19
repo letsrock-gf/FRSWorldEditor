@@ -147,6 +147,7 @@ private:
     std::wstring gameFolder_, region_;
     std::vector<FreeRoamZone> zones_;
     std::vector<Marker> markers_;
+    std::vector<Marker> templates_;   // an empty region's shipped shops: not shown, copied from
     std::vector<std::string> careerRaces_;
     // Lines of the file this editor does not place -- markers with an action
     // of their own, from builds that had them -- kept as they are and written

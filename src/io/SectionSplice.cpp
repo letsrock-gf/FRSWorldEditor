@@ -80,19 +80,24 @@ void PlanSectionSpans(const nfs::World& world, const nfs::Section& section,
                       const std::string& label, SectionSpanPlan& out) {
     const ByteSpan stream = world.StreamBytes();
 
-    // Where the next thing in the stream starts after `at`: another section,
-    // or a span some other section was moved into.
-    const auto nextAfter = [&](u64 at) {
-        u64 next = at < stream.size ? stream.size : ~0ull;
+    // Whether [at, at + size) is free: inside the stream it may not cross the
+    // stream's end, and it may not overlap another section where the table now
+    // puts it, nor any span but this section's own. Every range is tested
+    // whole -- a span that starts before `at` and runs into it counts too
+    // (missing that let a grown Q35 and a Q36 sent home share bytes, and the
+    // game crashed reading Q36).
+    const auto isFree = [&](u64 at, u64 size) {
+        const u64 end = at + size;
+        if (at < stream.size && end > stream.size) return false;
         for (const nfs::Section& other : world.Table().Sections()) {
-            if (other.tableEntryOffset == section.tableEntryOffset) continue;
-            if (other.streamOffset > at && other.streamOffset < next) next = other.streamOffset;
+            if (other.tableEntryOffset == section.tableEntryOffset || other.streamSize == 0) continue;
+            if (other.streamOffset < end && other.streamOffset + other.streamSize > at) return false;
         }
-        for (const SpanOverlayInfo& span : existing)
-            if (!span.layoutFile && span.fileOffset != section.streamOffset &&
-                span.fileOffset > at && span.fileOffset < next)
-                next = span.fileOffset;
-        return next;
+        for (const SpanOverlayInfo& span : existing) {
+            if (span.layoutFile || span.fileOffset == section.streamOffset) continue;
+            if (span.fileOffset < end && span.fileOffset + span.byteCount > at) return false;
+        }
+        return true;
     };
     u64 highestEnd = stream.size;
     for (const nfs::Section& other : world.Table().Sections())
@@ -103,10 +108,9 @@ void PlanSectionSpans(const nfs::World& world, const nfs::Section& section,
     // Home first -- where the game shipped it -- then wherever an earlier
     // edit moved it, then somewhere new past the end of everything.
     u64 offset;
-    if (section.originalStreamOffset + bytes.size() <= nextAfter(section.originalStreamOffset))
+    if (isFree(section.originalStreamOffset, bytes.size()))
         offset = section.originalStreamOffset;
-    else if (section.streamOffset >= stream.size &&
-             section.streamOffset + bytes.size() <= nextAfter(section.streamOffset))
+    else if (section.streamOffset >= stream.size && isFree(section.streamOffset, bytes.size()))
         offset = section.streamOffset;
     else
         offset = AlignUp(highestEnd + 4096, 2048);
@@ -155,6 +159,87 @@ void PlanSectionSpans(const nfs::World& world, const nfs::Section& section,
     out.offset = offset;
     out.size = size;
     out.moved = offset != section.streamOffset;
+}
+
+size_t RepairOverlappingSpans(const nfs::World& world, const std::wstring& modelsFolder) {
+    const std::wstring region = world.Region();
+    std::vector<SpanOverlayInfo> spans;
+    ListSpanOverlays(modelsFolder, region, spans);
+    std::vector<SpanOverlayInfo> stream;
+    for (const SpanOverlayInfo& s : spans)
+        if (!s.layoutFile && s.byteCount) stream.push_back(s);
+    std::sort(stream.begin(), stream.end(),
+              [](const SpanOverlayInfo& a, const SpanOverlayInfo& b) { return a.fileOffset < b.fileOffset; });
+
+    u64 highestEnd = world.StreamBytes().size;
+    for (const nfs::Section& s : world.Table().Sections())
+        highestEnd = std::max<u64>(highestEnd, s.streamOffset + s.streamSize);
+    for (const SpanOverlayInfo& s : stream) highestEnd = std::max<u64>(highestEnd, s.fileOffset + s.byteCount);
+
+    size_t moved = 0;
+    u64 reach = 0;   // the end of the furthest span so far, in offset order
+    for (const SpanOverlayInfo& span : stream) {
+        if (span.fileOffset >= reach) {
+            reach = span.fileOffset + span.byteCount;
+            continue;
+        }
+        // Overlaps one before it: this one goes. Its section, by the name
+        // its file carries (<REGION>-<NAME>-stream.frssection).
+        const std::wstring file = span.path.substr(span.path.find_last_of(L"\\/") + 1);
+        const std::wstring prefix = region + L"-", suffix = L"-stream.frssection";
+        const nfs::Section* section = nullptr;
+        if (file.size() > prefix.size() + suffix.size() && file.compare(0, prefix.size(), prefix) == 0) {
+            const std::wstring name = file.substr(prefix.size(), file.size() - prefix.size() - suffix.size());
+            section = world.Table().FindByName(std::string(name.begin(), name.end()));
+        }
+        if (!section) {
+            LOG_WARN("spans: %S overlaps another span and names no section; left as it is", file.c_str());
+            reach = std::max<u64>(reach, span.fileOffset + span.byteCount);
+            continue;
+        }
+        std::vector<u8> whole;
+        {
+            FILE* in = nullptr;
+            if (::_wfopen_s(&in, span.path.c_str(), L"rb") == 0 && in) {
+                std::fseek(in, 0, SEEK_END);
+                const long size = std::ftell(in);
+                std::fseek(in, 0, SEEK_SET);
+                if (size > 0) {
+                    whole.resize((size_t)size);
+                    if (std::fread(whole.data(), 1, whole.size(), in) != whole.size()) whole.clear();
+                }
+                std::fclose(in);
+            }
+        }
+        if (whole.size() < sizeof(SpanOverlayHeader) + span.byteCount) {
+            LOG_WARN("spans: could not read %S to move it", span.path.c_str());
+            continue;
+        }
+        const std::vector<u8> bytes(whole.begin() + sizeof(SpanOverlayHeader),
+                                    whole.begin() + (std::ptrdiff_t)(sizeof(SpanOverlayHeader) + span.byteCount));
+        const u64 offset = AlignUp(highestEnd + 4096, 2048);
+        const std::wstring stem = file.substr(0, file.size() - std::wstring(L".frssection").size());
+        const std::wstring tableKey = prefix + std::wstring(section->name.begin(), section->name.end()) + L"-table";
+        std::vector<u8> entry(12);
+        const u32 offset32 = (u32)offset, size = (u32)bytes.size(), geometry = SectionGeometrySize(bytes);
+        std::memcpy(entry.data(), &offset32, 4);
+        std::memcpy(entry.data() + 4, &size, 4);
+        std::memcpy(entry.data() + 8, &geometry, 4);
+        // The bytes first, then the entry: should the entry fail, the section
+        // is read where it was -- no worse than before.
+        if (!WriteSpanOverlay(modelsFolder, region, span.name, offset, false, bytes, stem) ||
+            !WriteSpanOverlay(modelsFolder, region, "section " + section->name + " in the region table",
+                              section->tableEntryOffset + 0x14, true, entry, tableKey)) {
+            LOG_WARN("spans: could not move %S", file.c_str());
+            continue;
+        }
+        LOG_WARN("spans: %S shared bytes with the span before it (%#llx..%#llx); moved to %#llx",
+                 file.c_str(), (unsigned long long)span.fileOffset,
+                 (unsigned long long)(span.fileOffset + span.byteCount), (unsigned long long)offset);
+        highestEnd = offset + bytes.size();
+        ++moved;
+    }
+    return moved;
 }
 
 size_t WriteSectionSpans(const std::vector<SectionSpan>& spans,

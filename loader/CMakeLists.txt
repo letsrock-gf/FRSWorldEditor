@@ -14,6 +14,8 @@ add_library(FRSWorldLoader SHARED
     src/Main.cpp
     src/FileEdits.cpp
     src/Markers.cpp
+    src/Tracks.cpp
+    src/Limits.cpp
     src/Recorder.cpp
     src/RouteProbe.cpp
     src/Version.rc

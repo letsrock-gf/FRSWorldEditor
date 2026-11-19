@@ -91,24 +91,111 @@ bool RoundTrips(const nfs::CollisionPack& pack) {
     nfs::Chunk top;
     nfs::CollisionPack back;
     if (!reader.Next(top) || !nfs::ParseCollision(top, back)) return false;
-    if (back.polygons.size() != pack.polygons.size()) return false;
+    if (back.polygons.size() != pack.polygons.size()) {
+        LOG_INFO("collision selftest: section %u: %zu polygons written, %zu read back", pack.sectionNumber,
+                 pack.polygons.size(), back.polygons.size());
+        return false;
+    }
     for (size_t i = 0; i < pack.polygons.size(); ++i) {
         const auto &a = pack.polygons[i], &b = back.polygons[i];
-        if (a.attributes[0] != b.attributes[0] || a.attributes[2] != b.attributes[2] ||
-            a.attributes[3] != b.attributes[3] || a.barrier != b.barrier || a.quad != b.quad)
+        const auto fail = [&](const char* what) {
+            LOG_INFO("collision selftest: section %u polygon %zu (flags %02X -> %02X): %s differs; "
+                     "(%.3f %.3f %.3f) (%.3f %.3f %.3f) (%.3f %.3f %.3f) (%.3f %.3f %.3f)", pack.sectionNumber, i,
+                     a.attributes[3], b.attributes[3], what, a.corners[0].x, a.corners[0].y, a.corners[0].z,
+                     a.corners[1].x, a.corners[1].y, a.corners[1].z, a.corners[2].x, a.corners[2].y, a.corners[2].z,
+                     a.corners[3].x, a.corners[3].y, a.corners[3].z);
             return false;
+        };
+        // 0x01 may be added by the encoder to floors stacked over others.
+        if (a.attributes[0] != b.attributes[0] || a.attributes[2] != b.attributes[2] ||
+            ((a.attributes[3] ^ b.attributes[3]) & ~0x01) != 0 || a.barrier != b.barrier || a.quad != b.quad)
+            return fail("kind");
         for (int c = 0; c < 4; ++c) {
             if (std::fabs(a.corners[c].x - b.corners[c].x) > 0.07f ||
                 std::fabs(a.corners[c].y - b.corners[c].y) > 0.07f)
-                return false;
-            if (!a.barrier && std::fabs(a.corners[c].z - b.corners[c].z) > 0.01f) return false;
+                return fail("plan");
+            if (!a.barrier && std::fabs(a.corners[c].z - b.corners[c].z) > 0.01f) return fail("height");
         }
     }
     return true;
 }
 
+// The rules EncodeCollision brings an edited pack to (docs §5a, "Collision
+// the game accepts"), on a one-cell pack made here.
+void CheckAuthoringRules() {
+    const auto encodeBack = [](const nfs::CollisionPack& pack, nfs::CollisionPack& back) {
+        std::vector<u8> chunk;
+        std::wstring error;
+        if (!nfs::EncodeCollision(pack, chunk, error)) return false;
+        nfs::ChunkReader reader(ByteSpan{ chunk.data(), chunk.size() }, 0);
+        nfs::Chunk top;
+        return reader.Next(top) && nfs::ParseCollision(top, back);
+    };
+    const auto rankOf = [](const nfs::CollisionPack& pack, size_t i) {
+        return pack.gridRank.size() == pack.polygons.size() ? pack.gridRank[i] : (u32)i;
+    };
+    const Vec3 o{ 1025.0f, -1023.0f, 10.0f };   // all inside one 32 m cell
+    nfs::CollisionPack pack;
+    pack.sectionNumber = 9999;
+    pack.edited = true;
+    // 0: a wall, listed first.
+    pack.polygons.push_back(collision::MakeVerticalWall(o + Vec3{ 2, 2, 0 }, o + Vec3{ 2, 12, 0 }, 3.0f, nfs::kSurfaceSolidWall));
+    // 1: the flat floor; 2: a ramp falling through it: about 0.9 m over it at
+    // the centre of their overlap, but lower on average.
+    const Vec3 flat[4] = { o + Vec3{ 1, 1, 0 }, o + Vec3{ 20, 1, 0 }, o + Vec3{ 20, 20, 0 }, o + Vec3{ 1, 20, 0 } };
+    const Vec3 ramp[4] = { o + Vec3{ 4, 4, 4 }, o + Vec3{ 30, 4, -6 }, o + Vec3{ 30, 8, -6 }, o + Vec3{ 4, 8, 4 } };
+    pack.polygons.push_back(collision::MakeGround(flat, 4, nfs::kSurfaceRoad));
+    pack.polygons.push_back(collision::MakeGround(ramp, 4, nfs::kSurfaceRoad));
+    pack.polygons[1].attributes[3] &= (u8)~0x01;   // as written before 0x01 was set on new floors
+    pack.polygons[1].SyncFromAttributes();
+    // 3: degenerate once on the 1/8 m grid.
+    const Vec3 sliver[3] = { o + Vec3{ 5, 5, 0 }, o + Vec3{ 5.02f, 5, 0 }, o + Vec3{ 5, 5.03f, 0 } };
+    pack.polygons.push_back(collision::MakeGround(sliver, 3, nfs::kSurfaceRoad));
+    // 4: a concave quad (an arrow head), counter-clockwise.
+    const Vec3 arrow[4] = { o + Vec3{ 22, 22, 0 }, o + Vec3{ 28, 25, 0 }, o + Vec3{ 22, 28, 0 }, o + Vec3{ 24, 25, 0 } };
+    nfs::CollisionPolygon concave = collision::MakeGround(arrow, 4, nfs::kSurfaceRoad);
+    for (int c = 0; c < 4; ++c) concave.corners[c] = arrow[c];
+    pack.polygons.push_back(concave);
+    // 5: a wall leaning 0.1 m over 3 m.
+    nfs::CollisionPolygon lean = collision::MakeVerticalWall(o + Vec3{ 25, 2, 0 }, o + Vec3{ 25, 10, 0 }, 3.0f, nfs::kSurfaceSolidWall);
+    lean.corners[1].x += 0.1f;
+    lean.corners[2].x += 0.1f;
+    pack.polygons.push_back(lean);
+
+    nfs::CollisionPack back;
+    Check(encodeBack(pack, back), "authoring rules: the test pack encodes");
+    // 6 in: the sliver dropped, the arrow split in two.
+    Check(back.polygons.size() == 6, "authoring rules: degenerate dropped, concave quad split");
+    size_t walls = 0, floorsAfterWall = 0, snapped = 0;
+    u32 firstWall = ~0u;
+    for (size_t i = 0; i < back.polygons.size(); ++i)
+        if (back.polygons[i].Vertical()) firstWall = std::min(firstWall, rankOf(back, i));
+    for (size_t i = 0; i < back.polygons.size(); ++i) {
+        const auto& p = back.polygons[i];
+        if (p.Vertical()) {
+            ++walls;
+            snapped += p.corners[0].x == p.corners[1].x && p.corners[2].x == p.corners[3].x;
+        } else if (rankOf(back, i) > firstWall) {
+            ++floorsAfterWall;
+        }
+    }
+    Check(walls == 2 && floorsAfterWall == 0, "authoring rules: floors listed before walls");
+    Check(snapped == 2, "authoring rules: a leaning wall stands upright");
+    int flatAt = -1, rampAt = -1;
+    for (size_t i = 0; i < back.polygons.size(); ++i) {
+        const auto& p = back.polygons[i];
+        if (p.Vertical() || !p.quad) continue;
+        if (std::fabs(p.corners[0].z - p.corners[2].z) < 0.01f) flatAt = (int)i; else rampAt = (int)i;
+    }
+    Check(flatAt >= 0 && rampAt >= 0 && rankOf(back, (size_t)rampAt) < rankOf(back, (size_t)flatAt),
+          "authoring rules: the ramp over the floor is listed first, though lower on average");
+    Check(flatAt >= 0 && (back.polygons[(size_t)flatAt].flags & 0x01) != 0,
+          "authoring rules: a stacked floor gets 0x01");
+}
+
 void RunCollisionSelfTest(nfs::World& world) {
     g_failures = 0;
+    CheckAuthoringRules();
     const auto& loaded = world.Loaded();
     std::vector<std::vector<u32>> before(loaded.size());
     for (size_t s = 0; s < loaded.size(); ++s)
@@ -125,12 +212,29 @@ void RunCollisionSelfTest(nfs::World& world) {
     std::vector<nfs::CollisionPolygon> barrier, wall, ground;
     collision::WallOptions options;
     collision::AppendWall({ { x, y, z }, { x + 20.0f, y, z } }, options, barrier);
-    Check(barrier.size() == 6, "a 20 m barrier makes 3 pieces, both ways");
+    // Both sides: a closed box, never a face and its twin on one line -- the
+    // game's 1 m solid behind the twin would throw a car through the wall.
+    Check(barrier.size() == 8, "a 20 m barrier makes 3 pieces a side and a cap at each end");
+    const auto twinned = [](const std::vector<nfs::CollisionPolygon>& faces) {
+        for (size_t i = 0; i < faces.size(); ++i)
+            for (size_t j = i + 1; j < faces.size(); ++j) {
+                const auto& a = faces[i].corners;
+                const auto& b = faces[j].corners;
+                if (Length(a[0] - b[3]) < 0.05f && Length(a[3] - b[0]) < 0.05f) return true;
+                if (faces[i].barrier && Length(a[0] - b[2]) < 0.05f && Length(a[2] - b[0]) < 0.05f) return true;
+            }
+        return false;
+    };
+    Check(!twinned(barrier), "no barrier has a twin on the same line");
+    Check(barrier.size() == 8 && std::fabs(std::fabs(barrier[0].corners[0].y - barrier[3].corners[0].y) -
+                                           collision::kTwoSidedThickness) < 0.02f,
+          "the two sides of a barrier stand the thickness apart");
     options.kind = collision::WallKind::Vertical;
     options.height = 5.0f;
     collision::AppendWall({ { x, y + 4, z }, { x + 6, y + 4, z }, { x + 6, y + 10, z } }, options, wall);
-    Check(wall.size() == 4 && wall[0].Vertical() && wall[0].corners[1].z - wall[0].corners[0].z > 5.4f,
-          "a vertical wall: one piece a segment, both ways, 5 m above the foot");
+    Check(wall.size() == 6 && wall[0].Vertical() && wall[0].corners[1].z - wall[0].corners[0].z > 5.4f &&
+              !twinned(wall),
+          "a vertical wall: one piece a segment a side, two caps, 5 m above the foot, no twins");
     const std::vector<Vec3> outline = { { x, y - 10, z + 0.3f }, { x + 6, y - 10, z + 0.3f },
                                         { x + 6, y - 4, z + 0.3f }, { x + 3, y - 7, z + 0.3f },
                                         { x, y - 4, z + 0.3f } };

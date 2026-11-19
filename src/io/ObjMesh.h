@@ -29,7 +29,8 @@ struct ObjMesh {
     std::string name;
 
     std::vector<Vec3> positions;
-    // Per-vertex colour, white where the file carries none. The game bakes its
+    // Per-vertex colour: from `v x y z r g b` (0..1 or 0..255) or ZBrush's
+    // #MRGB blocks, mid grey where the file carries none. The game bakes its
     // lighting into these, so a mesh that loses them comes back unlit.
     std::vector<u32>  colors;
     std::vector<Vec3> normals;

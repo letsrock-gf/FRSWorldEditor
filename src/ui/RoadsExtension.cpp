@@ -9,6 +9,7 @@
 // sees the roads once they are baked.
 
 #include "ui/RoadsExtension.h"
+#include "nfs/CustomRegions.h"
 
 #include "core/Log.h"
 #include "io/CollisionEdit.h"
@@ -21,10 +22,14 @@
 #include "roads/RoadBake.h"
 #include "roads/RoadNetwork.h"
 #include "roads/Prefabs.h"
+#include "ui/ProgressWindow.h"
+#include "io/SelectionImport.h"
 #include "roads/RoadRoutes.h"
 #include "terrain/GroundDeform.h"
 #include "terrain/Terrain.h"
 #include "io/SelectionExport.h"
+#include "io/LightFlares.h"
+#include "drive/fx/WorldFlaresU2.h"
 #include "io/ObjMesh.h"
 #include "ui/BlenderLink.h"
 #include "ui/CollisionTools.h"
@@ -122,6 +127,8 @@ constexpr int ID_ROAD_FACE_JUNCTION = ID_ROADS_FIRST + 37;
 constexpr int ID_ROAD_LANE_ADD      = ID_ROADS_FIRST + 38;
 constexpr int ID_ROAD_LANE_DROP     = ID_ROADS_FIRST + 39;
 constexpr int ID_ROAD_LANE_SPLIT    = ID_ROADS_FIRST + 40;
+constexpr int ID_ROAD_LANE_MERGE    = ID_ROADS_FIRST + 90;   // an entrance: a lane joining before the node
+constexpr int ID_ROAD_JOIN_NODES    = ID_ROADS_FIRST + 91;   // join the two nodes picked with Ctrl+click
 constexpr int ID_ROAD_DRAW          = ID_ROADS_FIRST + 41;
 constexpr int ID_ROAD_INSERT_MIDDLE = ID_ROADS_FIRST + 42;
 constexpr int ID_ROAD_DRAW_FROM     = ID_ROADS_FIRST + 43;
@@ -136,6 +143,8 @@ constexpr int ID_ROAD_EXTRUDE_LEFT  = ID_ROADS_FIRST + 51;   // another band of 
 constexpr int ID_ROAD_EXTRUDE_RIGHT = ID_ROADS_FIRST + 52;
 constexpr int ID_ROAD_TRIM_LEFT     = ID_ROADS_FIRST + 53;   // the outermost band taken off
 constexpr int ID_ROAD_TRIM_RIGHT    = ID_ROADS_FIRST + 54;
+constexpr int ID_ROAD_TUNNEL        = ID_ROADS_FIRST + 81;   // the road tool with the Tunnel type
+constexpr int ID_ROAD_WATER         = ID_ROADS_FIRST + 80;   // the water tool (61..79 left to the others)
 constexpr int ID_ROAD_FILL          = ID_ROADS_FIRST + 55;   // ground between roads that close an area
 constexpr int ID_ROAD_GROUND_PATCH  = ID_ROADS_FIRST + 59;   // the ground beside roads made sculptable terrain
 constexpr int ID_TERRAIN_TOOL       = ID_ROADS_FIRST + 60;   // the terrain tool: brushes, extrude, cut
@@ -163,6 +172,8 @@ enum Field {
     kBrush = 80, kBrushRadius, kBrushStrength, kBrushLayer, kLayerCount, kConform, kShoulder, kSink,
     kTerrainAmbient, kMargin,
     kBridge = 90, kDeckThickness, kPillarSpacing, kPillarWidth, kDeckTexture, kPillarTexture,
+    kTunnel = 380, kTunnelHeight, kTunnelShape, kTunnelLights, kTunnelLightColour, kTunnelPortalSize,
+    kTunnelPortalDepth, kTunnelWall, kTunnelRoof, kTunnelPortal,
     kBankMode = 96, kBankMax, kDesignSpeed, kBankAngle,
     kTraffic = 150, kGps, kSpeedLimit,
     kPillarCount = 170, kPillarModel, kPillarModelTurn,
@@ -175,6 +186,8 @@ enum Field {
     kSideRockHeight = 6, kSideMeet = 7, kBandWidth = 10, kBandRise = 11,
     kLightColour = 320, kLightRadius, kLightStrength, kLightHeight, kLightModel, kLightHeading,
     kPropModel = 340, kPropHeading, kPropScale,
+    kWaterLevel = 400, kWaterWidth, kWaterDepth, kWaterShore, kWaterFall, kWaterFoam, kWaterCarve, kWaterDeep,
+    kWaterTexture, kWaterPointHeight,
     kCatsEyes = 360, kCatsEyeSpacing, kCatsEyeModel,
     kMedianType = 130, kMedianWidth, kMedianHeight, kMedianTexture, kWalkLeft, kWalkRight,
     kWallStyle, kWallModel, kWallModelSpacing, kWallModelTurn,
@@ -189,7 +202,7 @@ constexpr int kHandleBits    = kHandleAtStart | kHandleAtEnd;
 
 const wchar_t* const kSideNames[5] = { L"right", L"left", L"both", L"alternating", L"median" };
 const wchar_t* const kMedianNames[5] = { L"none", L"painted", L"concrete", L"grass", L"barrier" };
-const wchar_t* const kWallStyleNames[3] = { L"flat", L"guardrail", L"model" };
+const wchar_t* const kWallStyleNames[4] = { L"flat", L"guardrail", L"model", L"highway wall" };
 
 // A picture for the properties panel: `bgra` (top row first) fitted into a
 // `box`-pixel square on the panel's colour.
@@ -726,7 +739,7 @@ public:
     }
 
     bool ToolActive() const override {
-        return drawTool_ || gridTool_ || lightTool_ || treeTool_ || propTool_ || drawing_ ||
+        return drawTool_ || gridTool_ || lightTool_ || treeTool_ || propTool_ || waterTool_ || drawing_ ||
                brush_ != terrain::Brush::None || wizard_ != kWizardOff;
     }
     void CloseTools() override {
@@ -767,6 +780,8 @@ public:
             case ID_ROAD_LANE_ADD:     ChangeLanesAfterNode(1); return true;
             case ID_ROAD_LANE_DROP:    ChangeLanesAfterNode(-1); return true;
             case ID_ROAD_LANE_SPLIT:   SplitOffOuterLane(); return true;
+            case ID_ROAD_LANE_MERGE:   SplitOffOuterLane(true); return true;
+            case ID_ROAD_JOIN_NODES:   JoinNodes(); return true;
             case ID_ROAD_DRAW:         if (drawTool_) CloseDrawTool(); else StartDrawTool(0); return true;
             case ID_ROAD_DRAW_FROM:
                 if (const roads::Node* node = SelectedNode()) StartDrawTool(node->id);
@@ -798,6 +813,8 @@ public:
                 return true;
             case ID_ROAD_LIGHTS:        if (lightTool_) CloseLightTool(); else StartLightTool(); return true;
             case ID_ROAD_TREES:         if (treeTool_) CloseTreeTool(); else StartTreeTool(); return true;
+            case ID_ROAD_WATER:         if (waterTool_) CloseWaterTool(); else StartWaterTool(); return true;
+            case ID_ROAD_TUNNEL:        StartTunnelTool(); return true;
             case ID_ROAD_PROPS:         if (propTool_) ClosePropTool(); else StartPropTool(); return true;
             case ID_ROAD_EXTRUDE_RIGHT: ExtrudeTerrain(1, true); return true;
             case ID_ROAD_TRIM_LEFT:     ExtrudeTerrain(0, false); return true;
@@ -855,6 +872,7 @@ public:
         ::CheckMenuItem(menu, ID_ROAD_FILL, MF_BYCOMMAND | (network_.FillBetween() ? MF_CHECKED : MF_UNCHECKED));
         ::CheckMenuItem(menu, ID_ROAD_LIGHTS, MF_BYCOMMAND | (lightTool_ ? MF_CHECKED : MF_UNCHECKED));
         ::CheckMenuItem(menu, ID_ROAD_TREES, MF_BYCOMMAND | (treeTool_ ? MF_CHECKED : MF_UNCHECKED));
+        ::CheckMenuItem(menu, ID_ROAD_WATER, MF_BYCOMMAND | (waterTool_ ? MF_CHECKED : MF_UNCHECKED));
         ::CheckMenuItem(menu, ID_ROAD_PROPS, MF_BYCOMMAND | (propTool_ ? MF_CHECKED : MF_UNCHECKED));
         SyncToolbar();
         ::CheckMenuItem(menu, ID_GROUND_FIT, MF_BYCOMMAND | (fitGround_ ? MF_CHECKED : MF_UNCHECKED));
@@ -876,6 +894,7 @@ public:
         meshRevision_ = 0;
         CollectTextureChoices(*world);
         LoadNativeOriginals();
+        lampOffsets_ = flares::LampOffsets(*world);
         if (!demoDone_ && std::getenv("FRS_CITY_DEMO")) {
             demoDone_ = true;
             demoActive_ = true;
@@ -1057,9 +1076,27 @@ public:
     }
 
     bool MouseDown(int x, int y, WPARAM keys) override {
-        (void)keys;
         if (!visible_) return false;
         if (wizard_ != kWizardOff) return WizardMouseDown(x, y);
+        // Ctrl+click on a second node, one being selected: picked to join
+        // (the viewport keeps Ctrl+click for adding the game's objects).
+        if ((keys & MK_CONTROL) && !(keys & MK_SHIFT) && SelectedNode() && !ToolActive()) {
+            int index = -1;
+            float distance = 0.0f;
+            const Ray ray = app_.View().RayAt(x, y);
+            if (Pick(ray, index, distance) && index > 0) {
+                const roads::Node* clicked = network_.FindNode((u32)index);
+                if (clicked && clicked->id != SelectedNode()->id) {
+                    joinPartner_ = SelectedNode()->id;
+                    lastSelectedNode_ = clicked->id;
+                    Select((int)clicked->id);
+                    app_.Status(Fmt(L"Nodes %u and %u picked: Join (J, or Properties) puts them together",
+                                    joinPartner_, clicked->id));
+                    return true;
+                }
+            }
+        }
+        if (waterTool_) return WaterToolMouseDown(x, y);
         if (lightTool_) return LightToolMouseDown(x, y);
         if (propTool_) return PropToolMouseDown(x, y);
         if (treeTool_) {
@@ -1162,6 +1199,7 @@ public:
         (void)repeat;
         if (wizard_ != kWizardOff && WizardKey(key)) return true;
         if (gridTool_ && GridToolKey(key)) return true;
+        if (waterTool_ && WaterToolKey(key)) return true;
         if (lightTool_ && key == VK_ESCAPE) { CloseLightTool(); return true; }
         if (propTool_ && key == VK_ESCAPE) { ClosePropTool(); return true; }
         if (treeTool_) {
@@ -1198,6 +1236,10 @@ public:
             }
             return false;
         }
+        if (key == 'J' && joinPartner_ && SelectedNode() && ::GetKeyState(VK_CONTROL) >= 0) {
+            JoinNodes();
+            return true;
+        }
         if (brush_ == terrain::Brush::None) return false;
         if (key == VK_ESCAPE) { SetBrush(terrain::Brush::None); return true; }
         if (key == VK_OEM_4) { brushRadius_ = std::max(1.0f, brushRadius_ / 1.2f); return true; }    // [
@@ -1206,7 +1248,13 @@ public:
     }
 
     void Tick(float deltaSeconds) override {
+        if (demoCameraTicks_ > 0 && --demoCameraTicks_ == 0) {
+            Camera look = app_.View().GetCamera();
+            look.LookAt(demoEye_, demoCentre_);
+            app_.View().FlyTo(look.Position(), look.Yaw(), look.Pitch(), 0.05f);
+        }
         PollRefine();
+        TrackJoinPick();
         if (treeTool_ && treePainting_) {
             if (!(::GetKeyState(VK_LBUTTON) & 0x8000)) EndTreeStroke();
             else PaintTrees(deltaSeconds);
@@ -1347,7 +1395,7 @@ public:
                     if (chosen.insert(next).second) todo.push_back(next);
         }
         roads::RoadField along;
-        along.Build(network_, [&](const roads::Segment& s) { return chosen.count(s.id) && !s.profile.bridge; });
+        along.Build(network_, [&](const roads::Segment& s) { return chosen.count(s.id) && !s.profile.OffGround(); });
         if (along.Empty()) {
             app_.Status(L"Only bridges there: no ground to make along them");
             return;
@@ -1392,7 +1440,7 @@ public:
 
     size_t SceneSignature() const override {
         return network_.Segments().size() * 7919 + network_.Nodes().size() + network_.Lights().size() * 104729 +
-               network_.Props().size() * 1299709;
+               network_.Props().size() * 1299709 + network_.Waters().size() * 15485863;
     }
 
     void PopulateTree(SceneTreeBuilder& tree) override {
@@ -1405,6 +1453,19 @@ public:
                                               Widen(j.model).c_str(), j.refined.empty() ? L"" : L"  (refined)");
                 if (!tree.matches(text)) continue;
                 tree.insert(branch, text, kFaceJunctionTreeBit | (intptr_t)j.node);
+                ++shown;
+            }
+            tree.finish(branch, shown, false);
+        }
+        if (!network_.Waters().empty()) {
+            HTREEITEM branch = tree.insert(TVI_ROOT, Fmt(L"Water (%zu)", network_.Waters().size()), -1);
+            size_t shown = 0;
+            for (const roads::Water& w : network_.Waters()) {
+                const std::wstring text = w.kind == roads::Water::kLake
+                    ? Fmt(L"Lake %u  -  %zu points, level %.1f", w.id, w.points.size(), w.level)
+                    : Fmt(L"Stream %u  -  %zu points, %.1f wide", w.id, w.points.size(), w.width);
+                if (!tree.matches(text)) continue;
+                tree.insert(branch, text, (intptr_t)w.id);
                 ++shown;
             }
             tree.finish(branch, shown, false);
@@ -1493,6 +1554,10 @@ public:
             Vec3 at;
             bool found = false;
             if (const roads::Light* l = network_.FindLight((u32)code)) { at = l->position; found = true; }
+            else if (const roads::Water* w = network_.FindWater((u32)code)) {
+                at = w->points.empty() ? Vec3{} : w->points.front();
+                found = true;
+            }
             else if (const roads::Prop* p = network_.FindProp((u32)code)) { at = p->position; found = true; }
             if (found) {
                 visible_ = true;
@@ -1601,6 +1666,19 @@ public:
         const int id = Selected();
         if (id < 0) return false;
         if (id & kGraphBit) return true;   // the game's graph is shown, not edited
+        if (roads::Water* w = SelectedWaterMutable()) {
+            const int point = SelectedWaterPoint();
+            const size_t least = w->kind == roads::Water::kLake ? 3 : 2;
+            if (point >= 0 && (size_t)point < w->points.size() && w->points.size() > least) {
+                w->points.erase(w->points.begin() + point);
+                Select((int)w->id);
+            } else {
+                network_.RemoveWater(w->id);
+                app_.Renderer().ClearSelection();
+            }
+            Changed(true);
+            return true;
+        }
         if (SelectedProp()) {
             network_.RemoveProps([id](const roads::Prop& p) { return p.id == (u32)id; });
             app_.Renderer().ClearSelection();
@@ -1644,6 +1722,17 @@ public:
     }
 
     bool GetPoint(Vec3& position, float& heading) override {
+        if (const roads::Water* w = SelectedWater()) {
+            const int point = SelectedWaterPoint();
+            if (point >= 0 && (size_t)point < w->points.size()) position = w->points[(size_t)point];
+            else {
+                Vec3 sum{};
+                for (const Vec3& q : w->points) sum = sum + q;
+                position = sum * (1.0f / (float)std::max<size_t>(1, w->points.size()));
+            }
+            heading = 0.0f;
+            return true;
+        }
         if (const roads::Light* light = SelectedLight()) {
             position = light->position;
             heading = light->heading;
@@ -1681,6 +1770,23 @@ public:
 
     bool SetPoint(const Vec3& position, float heading, bool commit) override {
         if (commit && wizard_ == kWizardPreview) wizardRefresh_ = true;   // once the move is in
+        if (roads::Water* w = SelectedWaterMutable()) {
+            (void)heading;
+            const int point = SelectedWaterPoint();
+            if (point >= 0 && (size_t)point < w->points.size()) {
+                w->points[(size_t)point] = position;
+                if (w->kind == roads::Water::kLake) w->points[(size_t)point].z = w->level;
+            } else {
+                Vec3 sum{};
+                for (const Vec3& q : w->points) sum = sum + q;
+                const Vec3 delta = position - sum * (1.0f / (float)std::max<size_t>(1, w->points.size()));
+                for (Vec3& q : w->points) q = q + delta;
+                if (w->kind == roads::Water::kLake) w->level += delta.z;
+            }
+            network_.SetDirty();
+            if (commit) Changed(true);
+            return true;
+        }
         if (roads::Light* light = SelectedLightMutable()) {
             light->position = position;
             light->heading = heading;
@@ -1821,6 +1927,11 @@ public:
         index = -1;
         {
             float hit = 0.0f;
+            if (const int point = WaterPointUnder(ray); point >= 0) {
+                index = point;
+                distance = 0.0f;
+                return true;
+            }
             if (const u32 light = LightUnder(ray, hit)) {
                 index = (int)light;
                 distance = 0.0f;
@@ -2227,7 +2338,25 @@ private:
         std::swap(p.lanesForward, p.lanesBackward);
         std::swap(p.sidewalkLeft, p.sidewalkRight);
         std::swap(p.wallLeft, p.wallRight);
+        if (p.shoulderSides == 1) p.shoulderSides = 2;
+        else if (p.shoulderSides == 2) p.shoulderSides = 1;
+        if (p.poleSides == 0) p.poleSides = 1;
+        else if (p.poleSides == 1) p.poleSides = 0;
+        std::swap(p.zoneLeft, p.zoneRight);
+        std::swap(p.terrain[0], p.terrain[1]);
         return p;
+    }
+
+    // The same road drawn the other way: ends, handles and every side swapped,
+    // so it looks and drives exactly as before.
+    static void Reverse(roads::Segment& s) {
+        std::swap(s.a, s.b);
+        std::swap(s.handleA, s.handleB);
+        std::swap(s.liftSetA, s.liftSetB);
+        std::swap(s.liftA, s.liftB);
+        std::swap(s.dirA, s.dirB);
+        s.shift = -s.shift;
+        s.profile = Flipped(s.profile);
     }
 
     // The road going on from the selected node: with two, the one drawn
@@ -2285,10 +2414,17 @@ private:
                                 : L""));
     }
 
-    void SplitOffOuterLane() {
+    // The outer lane of the road going on from the selected node leaves as a
+    // road of its own (an exit) -- or, with `entrance`, the outer lane of the
+    // road coming into it arrives as a road of its own and joins there. An
+    // entrance is an exit seen the other way: built along the road coming in,
+    // looking back from the node, where the lanes towards the node are its
+    // backward ones, on the left.
+    void SplitOffOuterLane(bool entrance = false, int count = 1) {
         const roads::Node* selected = SelectedNode();
         if (!selected) {
-            app_.Message(L"Select a node first: the outer lane of the road going on from it leaves there.");
+            app_.Message(entrance ? L"Select a node first: a lane joins the road coming into it there."
+                                  : L"Select a node first: the outer lane of the road going on from it leaves there.");
             return;
         }
         const u32 nodeId = selected->id;
@@ -2296,6 +2432,17 @@ private:
         bool leaving = false;
         roads::Segment* found = RoadOnFrom(*selected, leaving);
         if (!found) return;
+        if (entrance && around.size() == 2) {
+            // The road coming in: the one drawn arriving at the node.
+            for (u32 id : around) {
+                roads::Segment* s = network_.FindSegment(id);
+                if (s && s->b == nodeId) { found = s; break; }
+            }
+            if (found->b != nodeId)
+                found = network_.FindSegment(around[0] == found->id ? around[1] : around[0]);
+            if (!found) return;
+            leaving = found->a == nodeId;
+        }
         const roads::Segment road = *found;
         const bool alone = around.size() == 1;
         // With one road the lanes go on past its end; with two, the road
@@ -2312,28 +2459,49 @@ private:
             flip = !leaving;
         }
         const roads::RoadProfile p = flip ? Flipped(road.profile) : road.profile;
-        if (p.lanesForward < 2) {
-            app_.Message(L"The road has a single lane going on from that node: there is no outer lane to split off.");
+        if ((entrance ? p.lanesBackward : p.lanesForward) < count + 1) {
+            app_.Message(entrance ? L"The road coming into that node has a single lane: give it one more first "
+                                    L"(+ Lane), and that lane joins here."
+                                  : L"The road has a single lane going on from that node: there is no outer lane "
+                                    L"to split off.");
             return;
         }
         const Vec3 right{ away.y, -away.x, 0.0f };
         roads::RoadProfile main = p, exit = p;
-        main.lanesForward -= 1;
-        main.sidewalkRight = false;      // the side the exit leaves from
-        exit.lanesForward = 1;
-        exit.lanesBackward = 0;
-        exit.medianType = 0;
-        exit.medianTexture.clear();
-        exit.sidewalkLeft = false;
-        // Walls on both sides of both when the road had one there: between
-        // them they start where the two roads have parted (the gore).
-        main.wallRight = p.wallRight;
-        exit.wallLeft = p.wallRight;
-        if (exit.poleSides == 4) exit.poleSides = 0;
         const float half = p.HalfRoad();
         const float shiftAway = flip ? -road.shift : road.shift;   // the road's cross-section off its curve
-        const float mainOffset = -half + main.HalfRoad() + shiftAway;
-        const float exitOffset = half - exit.HalfRoad() + shiftAway;
+        float mainOffset = 0.0f, exitOffset = 0.0f;
+        if (!entrance) {
+            main.lanesForward -= count;
+            main.sidewalkRight = false;      // the side the exit leaves from
+            exit.lanesForward = count;
+            exit.lanesBackward = 0;
+            exit.medianType = 0;
+            exit.medianTexture.clear();
+            exit.sidewalkLeft = false;
+            // Walls on both sides of both when the road had one there: between
+            // them they start where the two roads have parted (the gore).
+            main.wallRight = p.wallRight;
+            exit.wallLeft = p.wallRight;
+            if (exit.poleSides == 4) exit.poleSides = 0;
+            mainOffset = -half + main.HalfRoad() + shiftAway;
+            exitOffset = half - exit.HalfRoad() + shiftAway;
+        } else {
+            // Mirrored: the joining lane is the outer one towards the node,
+            // on the left looking back along the road.
+            main.lanesBackward -= count;
+            main.sidewalkLeft = false;
+            exit.lanesBackward = count;
+            exit.lanesForward = 0;
+            exit.medianType = 0;
+            exit.medianTexture.clear();
+            exit.sidewalkRight = false;
+            main.wallLeft = p.wallLeft;
+            exit.wallRight = p.wallLeft;
+            if (exit.poleSides == 4) exit.poleSides = 0;
+            mainOffset = half - main.HalfRoad() + shiftAway;
+            exitOffset = -half + exit.HalfRoad() + shiftAway;
+        }
 
         roads::Node* node = network_.FindNode(nodeId);
         node->hasHeading = true;
@@ -2368,14 +2536,93 @@ private:
             }
             network_.RemoveSegment(road.id);
         }
-        // The exit: away and out to the right.
-        const Vec3 exitTip = exitAt + away * 60.0f + right * 14.0f;
+        // The exit: away and out to the right (an entrance: back and out on
+        // the side it comes from).
+        const Vec3 exitTip = exitAt + away * 60.0f + right * (entrance ? -14.0f : 14.0f);
         const u32 tip = network_.AddNode({ exitTip.x, exitTip.y, exitAt.z });
         network_.AddSegment(exitStart, tip, exit);
         Changed(true);
         Select((int)tip);
-        app_.Status(L"The outer lane leaves as a road of its own: move its end with the gizmo and pull more road out "
-                    L"of it (Ctrl+Shift+R); drop an end on another node to join them.");
+        app_.Status(entrance
+                        ? L"A lane joins the road here: move the ramp's far end with the gizmo, or Ctrl+click "
+                          L"another node and Join (J) to connect it."
+                        : L"The outer lane leaves as a road of its own: move its end with the gizmo and pull more road "
+                          L"out of it (Ctrl+Shift+R); Ctrl+click another node and Join (J) to connect them.");
+    }
+
+    // ---- joining two nodes
+    //
+    // A node selected, then another Ctrl+clicked: the first is remembered
+    // (joinPartner_). Join puts them together -- merged when they nearly
+    // touch, otherwise linked by a new road with the profile of the first
+    // one's road, running on from it.
+    u32 joinPartner_ = 0;
+    u32 lastSelectedNode_ = 0;
+
+    void TrackJoinPick() {
+        const roads::Node* node = SelectedNode();
+        const u32 now = node ? node->id : 0;
+        if (now == lastSelectedNode_) return;
+        const bool ctrl = ::GetKeyState(VK_CONTROL) < 0;
+        joinPartner_ = (ctrl && now && lastSelectedNode_ && network_.FindNode(lastSelectedNode_)) ? lastSelectedNode_ : 0;
+        lastSelectedNode_ = now;
+        if (joinPartner_)
+            app_.Status(Fmt(L"Nodes %u and %u picked: Join (J, or Properties) puts them together", joinPartner_, now));
+    }
+
+    void JoinNodes() {
+        const roads::Node* second = SelectedNode();
+        const roads::Node* first = joinPartner_ ? network_.FindNode(joinPartner_) : nullptr;
+        if (!first || !second || first->id == second->id) {
+            app_.Message(L"Select a node, then Ctrl+click the node to join it to, and Join (J).");
+            return;
+        }
+        if (first->follow || second->follow) {
+            app_.Message(L"One of the nodes follows another (a lane's start at an exit or a split): join the road's "
+                         L"other end instead.");
+            return;
+        }
+        const u32 a = first->id, b = second->id;
+        for (const roads::Segment& s : network_.Segments())
+            if ((s.a == a && s.b == b) || (s.a == b && s.b == a)) {
+                app_.Message(L"Those two nodes are already joined by a road.");
+                return;
+            }
+        joinPartner_ = 0;
+        if (FlatDistance(first->position, second->position) < 1.0f) {
+            network_.MergeNodes(a, b);
+            Changed(true);
+            Select((int)b);
+            lastSelectedNode_ = b;
+            app_.Status(Fmt(L"Node %u merged into node %u", a, b));
+            return;
+        }
+        // The road on from the first node's road, the way its lanes run.
+        roads::RoadProfile profile;
+        bool have = false;
+        for (u32 id : network_.SegmentsAt(a))
+            if (const roads::Segment* s = network_.FindSegment(id)) {
+                profile = s->b == a ? s->profile : Flipped(s->profile);
+                have = true;
+                break;
+            }
+        if (!have)
+            for (u32 id : network_.SegmentsAt(b))
+                if (const roads::Segment* s = network_.FindSegment(id)) {
+                    profile = s->a == b ? s->profile : Flipped(s->profile);
+                    have = true;
+                    break;
+                }
+        roads::Segment* made = network_.AddSegment(a, b, profile);
+        if (!made) {
+            app_.Message(L"The two nodes could not be joined.");
+            return;
+        }
+        const u32 madeId = made->id;
+        Changed(true);
+        Select((int)madeId);
+        lastSelectedNode_ = 0;
+        app_.Status(Fmt(L"Nodes %u and %u joined by road %u (Ctrl+Z takes it back)", a, b, madeId));
     }
 
     void Extend() {
@@ -2455,6 +2702,10 @@ private:
             const roads::Segment& s = *network_.FindSegment(id);
             neighbours.insert(s.a == moved ? s.b : s.a);
         }
+        if (PortJoinOnDrop(moved)) {
+            pulling_ = 0;
+            return;
+        }
         float snap = 3.0f;
         for (u32 id : network_.SegmentsAt(moved))
             snap = std::max(snap, network_.FindSegment(id)->profile.HalfRoad() * 0.75f);
@@ -2489,6 +2740,10 @@ private:
                 hitDistance = d;
             }
         }
+        if (hitSegment && LaneJoinOnDrop(moved, hitSegment, hitT)) {
+            pulling_ = 0;
+            return;
+        }
         if (hitSegment) {
             const u32 middle = network_.SplitSegment(hitSegment, hitT);
             if (middle) {
@@ -2500,6 +2755,178 @@ private:
             }
         }
         pulling_ = 0;
+    }
+
+    // ---- one node per direction at a two-way road's end
+    //
+    // Each free end of a two-way road shows a port per direction: where the
+    // lanes coming in to the road start, and where the lanes going out of it
+    // end. A one-way road's end dropped on (or near) one joins that direction
+    // only: the road's two directions are split there (as Split the Two
+    // Directions does) and the dropped road goes on from its half; the other
+    // half gets a short one-way stub to join the next road to.
+    struct DirectionPort {
+        u32 node = 0;          // the road's end node
+        u32 segment = 0;
+        Vec3 at;               // the middle of the direction's lanes
+        Vec3 way;              // the way its traffic runs there
+        bool intoRoad = false; // traffic enters the two-way road here
+        float offset = 0.0f;   // across the road, right of the way it was drawn
+    };
+
+    std::vector<DirectionPort> DirectionPorts() const {
+        std::vector<DirectionPort> out;
+        for (const roads::Node& n : network_.Nodes()) {
+            if (n.follow) continue;
+            const std::vector<u32> around = network_.SegmentsAt(n.id);
+            if (around.size() != 1) continue;
+            const roads::Segment* r = network_.FindSegment(around[0]);
+            if (!r || r->profile.lanesForward < 1 || r->profile.lanesBackward < 1) continue;
+            const roads::RoadProfile& p = r->profile;
+            const bool atEnd = r->b == n.id;
+            const roads::Curve curve = network_.CurveOf(*r);
+            const Vec3 along = HorizontalDirection(atEnd ? curve.Tangent(1.0f) : curve.Tangent(0.0f));
+            const Vec3 onward = atEnd ? along : along * -1.0f;      // out of the road at this end
+            const Vec3 right{ along.y, -along.x, 0.0f };
+            const float h = p.HalfRoad();
+            const float back = -h + p.ShoulderAt(-1) + p.lanesBackward * p.laneWidth * 0.5f;
+            const float fore = p.MedianLeft() + p.MedianWidth() + p.lanesForward * p.laneWidth * 0.5f;
+            for (int k = 0; k < 2; ++k) {
+                DirectionPort port;
+                port.node = n.id;
+                port.segment = r->id;
+                port.offset = k ? fore : back;
+                port.way = k ? along : along * -1.0f;
+                port.intoRoad = Dot(port.way, onward) < 0.0f;
+                port.at = n.position + right * port.offset;
+                out.push_back(port);
+            }
+        }
+        return out;
+    }
+
+    bool PortJoinOnDrop(u32 moved) {
+        const std::vector<u32> mine = network_.SegmentsAt(moved);
+        const roads::Node* node = network_.FindNode(moved);
+        if (mine.size() != 1 || !node) return false;
+        const roads::Segment* dragged = network_.FindSegment(mine[0]);
+        if (!dragged) return false;
+        const roads::RoadProfile& dp = dragged->profile;
+        if (dp.lanesForward > 0 && dp.lanesBackward > 0) return false;
+        const bool arrives = (dragged->b == moved) == (dp.lanesForward > 0);
+        const Vec3 at = node->position;
+        // The nearest end within reach (its ports or its node), not the road's own.
+        const DirectionPort* best = nullptr;
+        float bestDistance = 1e30f;
+        const std::vector<DirectionPort> ports = DirectionPorts();
+        for (const DirectionPort& port : ports) {
+            if (port.node == moved || port.segment == dragged->id) continue;
+            const roads::Segment* r = network_.FindSegment(port.segment);
+            const float reach = std::max(4.0f, r ? r->profile.HalfRoad() + 2.0f : 4.0f);
+            const float d = FlatDistance(at, port.at);
+            if (d > reach || std::fabs(port.at.z - at.z) > 4.0f) continue;
+            // The port whose traffic matches: into the road when the dropped
+            // road's lanes arrive at its end, out of it when they leave.
+            if (port.intoRoad != arrives) continue;
+            if (d < bestDistance) { bestDistance = d; best = &port; }
+        }
+        if (!best) return false;
+        const DirectionPort port = *best;
+        Select((int)port.node);
+        lastSelectedNode_ = port.node;
+        SplitCarriageways();
+        // The half that matches: its joint (following the end node), and the
+        // stub road just pulled out of it, which the dropped road replaces.
+        u32 joint = 0;
+        for (const roads::Node& n : network_.Nodes())
+            if (n.follow == port.node && std::fabs(n.followOffset - port.offset) < 0.05f) joint = n.id;
+        if (!joint) return true;
+        for (u32 id : network_.SegmentsAt(joint)) {
+            const roads::Segment* stub = network_.FindSegment(id);
+            if (!stub) continue;
+            const u32 tip = stub->a == joint ? stub->b : stub->a;
+            network_.RemoveSegment(id);
+            if (network_.SegmentsAt(tip).empty()) network_.RemoveNode(tip);
+            break;
+        }
+        network_.MergeNodes(moved, joint);
+        Changed(true);
+        Select((int)joint);
+        lastSelectedNode_ = joint;
+        app_.Status(arrives ? L"Joined to the lanes coming in to the road; the other direction goes on as a short "
+                              L"one-way road -- drop the next road's end on its end"
+                            : L"Joined to the lanes going out of the road; the other direction goes on as a short "
+                              L"one-way road -- drop the next road's end on its end");
+        LOG_INFO("roads: node %u joined to the %s direction of the road end %u", moved,
+                 arrives ? "incoming" : "outgoing", port.node);
+        return true;
+    }
+
+    // A one-way road's free end dropped on a road whose lanes run the same
+    // way: not a junction but a lane. When the dropped road's lanes arrive at
+    // that end, they join the road there (an entrance); when they leave from
+    // it, the road's outer lane leaves into it (an exit). The road gains the
+    // lane it takes: one more lane on both sides of the point, then the
+    // outer one is split off as for Entrance / Exit, and the split-off lane
+    // is joined to the dropped end. False (nothing changed) otherwise: the
+    // usual junction is made.
+    bool LaneJoinOnDrop(u32 moved, u32 roadId, float t) {
+        const std::vector<u32> mine = network_.SegmentsAt(moved);
+        if (mine.size() != 1) return false;
+        const roads::Segment* ramp = network_.FindSegment(mine[0]);
+        const roads::Segment* road = network_.FindSegment(roadId);
+        if (!ramp || !road) return false;
+        const roads::RoadProfile& rp = ramp->profile;
+        if (rp.lanesForward > 0 && rp.lanesBackward > 0) return false;     // two-way: a junction
+        const int count = std::max(1, std::max(rp.lanesForward, rp.lanesBackward));
+        // The ramp's way of travel at the dropped end, and whether it arrives there.
+        const roads::Curve rc = network_.CurveOf(*ramp);
+        const bool endIsB = ramp->b == moved;
+        const Vec3 drawnAtEnd = HorizontalDirection(endIsB ? rc.Tangent(1.0f) : rc.Tangent(0.0f));
+        const bool rampForward = rp.lanesForward > 0;
+        const bool arrives = endIsB == rampForward;
+        // Travel direction at the end: arriving -> into the end; leaving -> out of it.
+        const Vec3 travel = rampForward ? drawnAtEnd : drawnAtEnd * -1.0f;
+        // The road's lanes the same way: only along its drawn direction (the
+        // exit and entrance are built that way).
+        Vec3 roadWay = HorizontalDirection(network_.CurveOf(*road).Tangent(t));
+        if (road->profile.lanesBackward > 0 && Dot(roadWay, travel) < -0.5f) {
+            // The lanes running this way are the ones against the way the
+            // road was drawn: it is drawn the other way round first.
+            roads::Segment* flip = network_.FindSegment(roadId);
+            Reverse(*flip);
+            network_.SetDirty();
+            road = flip;
+            t = 1.0f - t;
+            roadWay = roadWay * -1.0f;
+        }
+        if (road->profile.lanesForward < 1 || Dot(roadWay, travel) < 0.5f) return false;
+        const u32 node = network_.SplitSegment(roadId, t);
+        if (!node) return false;
+        // One more lane each side of the point, on the outside (the inner
+        // edge stays where it was).
+        for (u32 id : network_.SegmentsAt(node)) {
+            roads::Segment* s = network_.FindSegment(id);
+            if (!s || s->id == ramp->id) continue;
+            const float before = s->profile.HalfRoad();
+            s->profile.lanesForward = std::min(8, s->profile.lanesForward + count);
+            s->shift += s->profile.HalfRoad() - before;
+        }
+        Select((int)node);
+        lastSelectedNode_ = node;
+        SplitOffOuterLane(arrives, count);
+        const roads::Node* tip = SelectedNode();
+        if (!tip || tip->id == node) return true;
+        const u32 tipId = tip->id;
+        network_.MergeNodes(tipId, moved);
+        if (roads::Node* end = network_.FindNode(moved)) end->hasHeading = false;
+        Changed(true);
+        Select((int)node);
+        lastSelectedNode_ = node;
+        app_.Status(arrives ? L"The road's lane joins here (an entrance): the road has one more lane from here on"
+                            : L"A lane leaves the road here into this road (an exit)");
+        LOG_INFO("roads: node %u joined to road %u as %s", moved, roadId, arrives ? "an entrance" : "an exit");
+        return true;
     }
 
     // A mesh's triangles as the viewport draws them.
@@ -2527,7 +2954,7 @@ private:
     void RebuildTerrain(const terrain::Patch& patch) {
         std::vector<DrawBatch>& list = terrainBatches_[patch.id];
         list.clear();
-        for (const roads::MeshPiece& piece : terrain_.BuildMesh(patch, &field_, poles_, network_.Lighting()))
+        for (const roads::MeshPiece& piece : OpenPortals(terrain_.BuildMesh(patch, &field_, poles_, network_.Lighting())))
             AddBatches(piece, kTerrainBit | patch.id, list, *this);
     }
 
@@ -2557,11 +2984,13 @@ private:
     void RebuildRoads() {
         if (meshRevision_ == network_.Revision()) return;
         meshRevision_ = network_.Revision();
-        field_.Build(network_, [](const roads::Segment& segment) { return !segment.profile.bridge; });
+        field_.Build(network_, [](const roads::Segment& segment) { return !segment.profile.OffGround(); });
+        field_.AddWaters(network_);
         batches_.clear();
         poles_.clear();
         BuildFaceRemainder();
         const std::vector<roads::MeshPiece> pieces = network_.BuildMesh(&poles_);
+        PreviewFlares();
         for (const roads::MeshPiece& piece : pieces) {
             for (const roads::MeshGroup& group : piece.groups) {
                 if (group.vertices.empty() || group.vertices.size() > 65535) continue;
@@ -2835,6 +3264,7 @@ private:
             if (wizard_ != kWizardOff) EndFaceWizard(nullptr);
             if (drawTool_) { drawTool_ = false; EndDrawChain(); }
             gridTool_ = lightTool_ = treeTool_ = propTool_ = false;
+            waterTool_ = false;
             treePainting_ = false;
         }
         brush_ = brush;
@@ -2911,6 +3341,7 @@ private:
         const bool wasOpen = drawTool_;
         if (gridTool_) CloseGridTool();
         lightTool_ = treeTool_ = propTool_ = false;
+        waterTool_ = false;
         if (brush_ != terrain::Brush::None) SetBrush(terrain::Brush::None);
         drawTool_ = true;
         drawFrom_ = from;
@@ -3025,10 +3456,11 @@ private:
     }
 
     // The road types offered, from the last profile's textures and lights.
-    static constexpr int kPresets = 6;
+    static constexpr int kPresets = 7;
     static const char* PresetName(int k) {
         static const char* const names[kPresets] = { "Two-lane street", "Four-lane road", "Avenue",
-                                                     "Six-lane avenue", "One-way street", "Highway" };
+                                                     "Six-lane avenue", "One-way street", "Highway",
+                                                     "Tunnel" };
         return names[std::clamp(k, 0, kPresets - 1)];
     }
 
@@ -3053,12 +3485,21 @@ private:
                 p.medianType = 3; p.medianWidth = 4.0f; p.medianTexture.clear();
                 break;
             case 4: p.lanesForward = 2; p.lanesBackward = 0; p.sidewalkWidth = 3.0f; break;
-            default:
+            case 5:
                 p.lanesForward = 3; p.lanesBackward = 0; p.sidewalkWidth = 0.0f;
                 p.shoulderType = 2; p.shoulderSides = 0; p.shoulderTexture.clear();
                 p.wallLeft = p.wallRight = true;
                 p.zoneLeft = p.zoneRight = 0;
                 p.speedLimit = 100.0f;
+                break;
+            default:
+                // Two lanes, a kerb of wall each side, through the hill.
+                p.lanesForward = p.lanesBackward = 1; p.sidewalkWidth = 1.0f;
+                p.wallLeft = p.wallRight = true;
+                p.zoneLeft = p.zoneRight = 0;
+                p.terrain[0].on = p.terrain[1].on = false;
+                p.poleModel.clear();
+                p.tunnel = true;
                 break;
         }
         return p;
@@ -3448,6 +3889,15 @@ private:
             {
                 bool fill = network_.FillBetween();
                 if (ImGui::Checkbox("Ground between roads that close an area", &fill)) ToggleFill();
+                bool solid = network_.TerrainCollision();
+                if (ImGui::Checkbox("Collision on the ground and terrain", &solid)) {
+                    network_.SetTerrainCollision(solid);
+                    Changed(true);
+                    app_.Status(solid ? L"The ground and terrain get collision when baked"
+                                      : L"The ground and terrain are baked without collision");
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Off: only roads, sidewalks, medians and walls can be driven on or hit.");
             }
             ImGui::Separator();
             PlannedRoad plan;
@@ -3840,6 +4290,50 @@ private:
         BuildGrid(g, false);
         Vec3 centre = corner + Vec3{ sizeU * 0.5f, sizeV * 0.5f, 0.0f };
         Vec3 eye = corner + Vec3{ -90.0f, -110.0f, 110.0f };
+        if (const char* mode = std::getenv("FRS_CITY_DEMO"); mode && std::string(mode) == "water") {
+            // A stepped hillside of terrain, a stream coming down it in two
+            // falls, and a lake at its foot. Heights by x across the patch.
+            const auto hill = [](float x) {
+                const auto step = [](float x0, float x1, float v) {
+                    const float t = std::clamp((v - x0) / (x1 - x0), 0.0f, 1.0f);
+                    return t * t * (3.0f - 2.0f * t);
+                };
+                return 18.0f - 8.0f * step(88.0f, 100.0f, x) - 1.5f * step(100.0f, 150.0f, x) -
+                       8.5f * step(152.0f, 168.0f, x);
+            };
+            const Vec3 o = corner + Vec3{ sizeU + 120.0f, 0.0f, 0.0f };
+            const u32 patchId = terrain_.Add(o + Vec3{ 140.0f, 150.0f, 0.0f }, 280.0f, 4.0f);
+            if (terrain::Patch* patch = terrain_.Find(patchId)) {
+                for (int j = 0; j <= patch->rows; ++j)
+                    for (int i = 0; i <= patch->columns; ++i)
+                        patch->heights[(size_t)j * (patch->columns + 1) + i] =
+                            o.z + hill(patch->origin.x + i * patch->cell - o.x);
+                patch->autoRock = true;
+                std::string grass = "TRN_GRASSA_KT";
+                patch->layers[0].texture = grass;
+                terrainBuilt_ = 0;
+            }
+            const auto at = [&](float x, float y) { return o + Vec3{ x, y, hill(x) - 0.3f }; };
+            roads::Water stream;
+            stream.kind = roads::Water::kStream;
+            stream.width = 6.0f;
+            stream.depth = 1.2f;
+            stream.points = { at(30.0f, 150.0f), at(70.0f, 140.0f), at(100.0f, 150.0f), at(130.0f, 158.0f),
+                              at(150.0f, 152.0f), at(170.0f, 150.0f), at(200.0f, 150.0f) };
+            network_.AddWater(stream);
+            roads::Water lake;
+            lake.kind = roads::Water::kLake;
+            lake.level = o.z - 0.3f;
+            lake.depth = 2.5f;
+            for (int k = 0; k < 16; ++k) {
+                const float a = k * 6.2831853f / 16;
+                lake.points.push_back(o + Vec3{ 225.0f + 38.0f * std::cos(a), 150.0f + 30.0f * std::sin(a), lake.level });
+            }
+            network_.AddWater(lake);
+            Changed(false);
+            centre = o + Vec3{ 130.0f, 150.0f, 6.0f };
+            eye = o + Vec3{ 215.0f, 60.0f, 45.0f };
+        } else
         if (const char* mode = std::getenv("FRS_CITY_DEMO"); mode && std::string(mode) == "terrain") {
             // A road curving away from the grid, hill on its left, falling away on its right.
             roads::RoadProfile p = PresetProfile(1);
@@ -3957,11 +4451,17 @@ private:
         Camera look = app_.View().GetCamera();
         look.LookAt(eye, centre);
         app_.View().FlyTo(look.Position(), look.Yaw(), look.Pitch(), 0.05f);
+        // Again a moment later: the region's opening puts the camera back.
+        demoEye_ = eye;
+        demoCentre_ = centre;
+        demoCameraTicks_ = 60;
         if (HWND root = ::GetAncestor(app_.View().Handle(), GA_ROOT))
             if (!app_.View().GetRenderer().GameLook()) ::PostMessageW(root, WM_COMMAND, 44603, 0);
     }
     bool demoDone_ = false;
-    bool demoActive_ = false;      // a demo is shown: nothing of the roads or terrain is saved
+    bool demoActive_ = false;
+    Vec3 demoEye_, demoCentre_;
+    int  demoCameraTicks_ = 0;      // a demo is shown: nothing of the roads or terrain is saved
 
     void ToggleFill() {
         network_.SetFillBetween(!network_.FillBetween());
@@ -4310,6 +4810,244 @@ private:
         app_.ImportEdited(objPath);
     }
 
+    // ---- water: lakes, streams and waterfalls
+    //
+    // Click by click as the road tool is: a lake's outline (Enter closes it)
+    // or a stream's path (Enter ends it), on the ground. The water stands a
+    // little under the ground clicked; a stream's points carry their own
+    // height, and where it drops by the fall height between two of them it
+    // falls. Once made, a body of water is selected by clicking it; its points
+    // are handles (G moves one, Delete removes one), its card has the rest.
+
+    static constexpr int kWaterPointBit = 0x08000000;   // | water id << 12 | point
+
+    void StartWaterTool() {
+        if (!app_.World()) { app_.Message(L"Open a region first."); return; }
+        CloseOtherTools();
+        visible_ = true;
+        waterTool_ = true;
+        waterDraft_.clear();
+        ::SetFocus(app_.View().Handle());
+        app_.UpdateMenuChecks();
+        app_.Status(L"Water: click the ground round a lake (Enter closes it) or along a stream (Enter ends it); "
+                    L"Backspace takes the last point back, Esc closes the tool.");
+    }
+
+    void CloseWaterTool() {
+        waterTool_ = false;
+        waterDraft_.clear();
+        app_.UpdateMenuChecks();
+        app_.Status(L"Water tool closed");
+    }
+
+    // The draft as a body of water.
+    void FinishWater() {
+        const size_t needed = waterKind_ == roads::Water::kLake ? 3 : 2;
+        if (waterDraft_.size() < needed) {
+            app_.Status(waterKind_ == roads::Water::kLake ? L"A lake needs three points or more"
+                                                          : L"A stream needs two points or more");
+            return;
+        }
+        roads::Water w = waterSettings_;
+        w.kind = waterKind_;
+        w.points = waterDraft_;
+        if (w.kind == roads::Water::kLake) {
+            // Level a little under the lowest of the shore clicked, so the
+            // banks stand round it.
+            float lowest = 1e30f;
+            for (const Vec3& q : w.points) lowest = std::min(lowest, q.z);
+            w.level = lowest - 0.3f;
+            for (Vec3& q : w.points) q.z = w.level;
+        } else {
+            for (Vec3& q : w.points) q.z -= 0.3f;
+            // Never running uphill: each point at most as high as the one before.
+            for (size_t k = 1; k < w.points.size(); ++k) w.points[k].z = std::min(w.points[k].z, w.points[k - 1].z);
+        }
+        const u32 id = network_.AddWater(w);
+        waterDraft_.clear();
+        Changed(true);
+        Select((int)id);
+        app_.Status(Fmt(L"%s made -- its card sets its depth, banks and falls; Roads > Bake hands it to the game",
+                        w.kind == roads::Water::kLake ? L"Lake" : L"Stream"));
+    }
+
+    bool WaterToolMouseDown(int x, int y) {
+        Vec3 point;
+        if (!AnythingUnder(x, y, point)) return true;
+        waterDraft_.push_back(point);
+        return true;
+    }
+
+    bool WaterToolKey(WPARAM key) {
+        if (key == VK_ESCAPE) {
+            if (!waterDraft_.empty()) waterDraft_.clear();
+            else CloseWaterTool();
+            return true;
+        }
+        if (key == VK_BACK) {
+            if (!waterDraft_.empty()) waterDraft_.pop_back();
+            return true;
+        }
+        if (key == VK_RETURN) {
+            FinishWater();
+            return true;
+        }
+        return false;
+    }
+
+    void WaterToolHud(float x, float y, float width) {
+        ImGui::SetNextWindowPos(ImVec2(x + width * 0.5f, y + 52.0f), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+        ImGui::SetNextWindowBgAlpha(0.9f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f, 10.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f);
+        if (ImGui::Begin("##water", nullptr, HudFlags())) {
+            const ImVec4 accent = ImGui::GetStyleColorVec4(ImGuiCol_CheckMark);
+            ImGui::TextColored(accent, "Water");
+            ImGui::SameLine();
+            ImGui::TextDisabled("%zu made, %zu points drawn", network_.Waters().size(), waterDraft_.size());
+            ImGui::Separator();
+            ImGui::RadioButton("Lake", &waterKind_, roads::Water::kLake);
+            ImGui::SameLine();
+            ImGui::RadioButton("Stream (with waterfalls)", &waterKind_, roads::Water::kStream);
+            roads::Water& w = waterSettings_;
+            ImGui::PushItemWidth(110.0f);
+            if (waterKind_ == roads::Water::kStream) {
+                ImGui::DragFloat("Depth", &w.depth, 0.05f, 0.2f, 30.0f, "%.1f m");
+                ImGui::SameLine();
+            }
+            ImGui::DragFloat("Under the banks", &w.shore, 0.1f, 0.0f, 20.0f, "%.1f m");
+            if (waterKind_ == roads::Water::kStream) {
+                ImGui::DragFloat("Width", &w.width, 0.1f, 1.0f, 60.0f, "%.1f m");
+                ImGui::SameLine();
+                ImGui::DragFloat("Falls from", &w.fallHeight, 0.1f, 0.3f, 50.0f, "%.1f m drop");
+            }
+            ImGui::PopItemWidth();
+            ImGui::Checkbox("Foam", &w.foam);
+            if (waterKind_ == roads::Water::kStream) {
+                ImGui::SameLine();
+                ImGui::Checkbox("Carve the ground", &w.carve);
+            }
+            ImGui::SameLine();
+            ImGui::Checkbox("Deep (the game's deep water)", &w.deep);
+            ImGui::Separator();
+            ImGui::TextUnformatted(waterKind_ == roads::Water::kLake
+                                       ? "Click round the lake on its shore; Enter closes it."
+                                       : "Click along the stream, downhill; a drop of the fall height between two "
+                                         "points is a waterfall. Enter ends it.");
+            ImGui::TextDisabled("Backspace takes the last point back. The water's height follows the ground "
+                                "clicked; edit it on its card.");
+            ImGui::BeginDisabled(waterDraft_.empty());
+            if (ImGui::Button("Finish  (Enter)")) FinishWater();
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (ImGui::Button("Close the tool  (Esc)")) CloseWaterTool();
+        }
+        ImGui::End();
+        ImGui::PopStyleVar(2);
+    }
+
+    const roads::Water* SelectedWater() const {
+        const int id = Selected();
+        if (id <= 0 || (id & (kHandleBits | kTerrainBit | kGraphBit))) return nullptr;
+        if (id & kWaterPointBit) return network_.FindWater((u32)((id & ~kWaterPointBit) >> 12));
+        return network_.FindWater((u32)id);
+    }
+    roads::Water* SelectedWaterMutable() {
+        return const_cast<roads::Water*>(static_cast<const RoadsExtension*>(this)->SelectedWater());
+    }
+    // The point selected, or -1 for the whole body.
+    int SelectedWaterPoint() const {
+        const int id = Selected();
+        return id > 0 && (id & kWaterPointBit) && !(id & (kHandleBits | kTerrainBit | kGraphBit)) ? (id & 0xFFF) : -1;
+    }
+
+    // A point of the selected water under a ray.
+    int WaterPointUnder(const Ray& ray) const {
+        const roads::Water* w = SelectedWater();
+        if (!w || w->id >= 0x8000) return -1;
+        int best = -1;
+        float bestHit = 1e30f;
+        for (size_t k = 0; k < w->points.size() && k < 0x1000; ++k) {
+            Aabb box;
+            box.Add(w->points[k] - Vec3{ 1.2f, 1.2f, 1.2f });
+            box.Add(w->points[k] + Vec3{ 1.2f, 1.2f, 1.2f });
+            const float hit = IntersectRayAabb(ray, box);
+            if (hit >= 0.0f && hit < bestHit) { bestHit = hit; best = (int)k; }
+        }
+        return best < 0 ? -1 : kWaterPointBit | (int)(w->id << 12) | best;
+    }
+
+    void FillWaterCard(PropertiesPanel::View& view, const roads::Water& w) {
+        const bool lake = w.kind == roads::Water::kLake;
+        view.title = Fmt(lake ? L"Lake %u" : L"Stream %u", w.id);
+        view.moveLabel = L"";
+        view.removeLabel = lake ? L"Delete lake" : L"Delete stream";
+        view.actions.push_back({ L"Water tool", ID_ROAD_WATER, L"Water", L"Draw lakes and streams." });
+        const std::vector<std::wstring> yesNo = { L"yes", L"no" };
+        const int point = SelectedWaterPoint();
+        if (point >= 0 && (size_t)point < w.points.size())
+            AddRow(view, L"Point", Fmt(L"Point %d height", point + 1).c_str(), Number(w.points[(size_t)point].z),
+                   lake ? L"A lake is flat: its level sets every point." : L"The water's height at this point.",
+                   lake ? 0 : kWaterPointHeight);
+        if (lake)
+            AddRow(view, L"Water", L"Level", Number(w.level), L"The lake's surface height.", kWaterLevel);
+        else
+            AddRow(view, L"Water", L"Width", Number(w.width), L"Across the stream.", kWaterWidth);
+        if (!lake)
+            AddRow(view, L"Water", L"Depth", Number(w.depth), L"The bed under the surface, cut into the ground.",
+                   kWaterDepth);
+        AddRow(view, L"Water", L"Under the banks", Number(w.shore),
+               L"How far the surface runs on under the ground at its edge, so no gap shows.", kWaterShore);
+        if (!lake)
+            AddRow(view, L"Water", L"Falls from", Number(w.fallHeight),
+                   L"A drop this big between two points is a waterfall; less flows down as a slope.", kWaterFall);
+        AddRow(view, L"Water", L"Foam", w.foam ? L"yes" : L"no",
+               L"White water at the foot of falls and on steep stretches.", kWaterFoam, yesNo);
+        if (!lake)
+            AddRow(view, L"Water", L"Carve the ground", w.carve ? L"yes" : L"no",
+                   L"Cut the terrain and the game's ground down under it, the banks eased.", kWaterCarve, yesNo);
+        AddRow(view, L"Water", L"Deep", w.deep ? L"yes" : L"no",
+               L"The game's deep-water surface on top (check in the game what it does to the car).", kWaterDeep,
+               yesNo);
+        AddRow(view, L"Water", L"Texture", w.texture.empty() ? L"(the game's water)" : Widen(w.texture),
+               L"The surface's texture.", kWaterTexture,
+               { L"(the game's water)", L"TRN_OCEANA_DM", L"TRN_WATER_SURFACE_A_LL", L"ARC_POOL_A_DM" }, true);
+    }
+
+    void ApplyWaterCard(roads::Water& w) {
+        PropertiesPanel& properties = app_.Properties();
+        std::wstring text;
+        float value = 0.0f;
+        const auto yes = [](const std::wstring& t) { return !t.empty() && (t[0] == L'y' || t[0] == L'Y'); };
+        const int point = SelectedWaterPoint();
+        if (point >= 0 && (size_t)point < w.points.size() && properties.ReadNumber(kWaterPointHeight, value))
+            w.points[(size_t)point].z = value;
+        if (properties.ReadNumber(kWaterLevel, value)) {
+            w.level = value;
+            for (Vec3& q : w.points) q.z = value;
+        }
+        if (properties.ReadNumber(kWaterWidth, value)) w.width = std::clamp(value, 1.0f, 60.0f);
+        if (properties.ReadNumber(kWaterDepth, value)) w.depth = std::clamp(value, 0.2f, 30.0f);
+        if (properties.ReadNumber(kWaterShore, value)) w.shore = std::clamp(value, 0.0f, 20.0f);
+        if (properties.ReadNumber(kWaterFall, value)) w.fallHeight = std::clamp(value, 0.3f, 50.0f);
+        if (properties.ReadText(kWaterFoam, text)) w.foam = yes(text);
+        if (properties.ReadText(kWaterCarve, text)) w.carve = yes(text);
+        if (properties.ReadText(kWaterDeep, text)) w.deep = yes(text);
+        if (properties.ReadText(kWaterTexture, text) && !text.empty())
+            w.texture = text[0] == L'(' ? std::string() : Narrow(text);
+        Changed(true);
+    }
+
+    // The water's beds, for the game's ground: only ever cut down.
+    float CarveWater(float x, float y, float h) const {
+        float bed = 0.0f, outside = 0.0f;
+        if (waterField_.Empty() || !waterField_.Query(x, y, kGroundShoulder, bed, outside)) return h;
+        if (h <= bed || h - bed > 40.0f) return h;
+        if (outside <= 0.0f) return bed;
+        const float t = std::clamp(outside / kGroundShoulder, 0.0f, 1.0f);
+        return bed + (h - bed) * (t * t * (3.0f - 2.0f * t));
+    }
+
     // ---- trees (painted) and props (placed)
     //
     // The tree brush paints the game's trees where the ground is, up to a
@@ -4348,6 +5086,8 @@ private:
         if (drawTool_) CloseDrawTool();
         if (gridTool_) CloseGridTool();
         lightTool_ = treeTool_ = propTool_ = false;
+        waterTool_ = false;
+        waterDraft_.clear();
         treePainting_ = false;
         SetBrush(terrain::Brush::None);
     }
@@ -4373,7 +5113,7 @@ private:
         // records, the class name first).
         std::vector<std::string> classes;
         {
-            const std::wstring path = app_.GameFolder() + L"\\TRACKS\\" + world.Region() + L".BUN";
+            const std::wstring path = nfs::ShippedTrackFile(app_.GameFolder(), world.Region(), world.Region() + L".BUN");
             std::ifstream in(path, std::ios::binary);
             std::vector<char> data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
             size_t off = 0;
@@ -4914,6 +5654,116 @@ private:
         ImGui::PopStyleVar(2);
     }
 
+    // ---- street-light flares
+    //
+    // The game keeps a street light's flare in its section's flare pack, not
+    // in the model (io/LightFlares.h): the lamps of the street lights the
+    // editor places are shown by the flare pass before the bake and written
+    // into the packs at it. A model's lamps are where the game has them on its
+    // own copies; a lamp of a model with none known, or a light with no post,
+    // is at the light's head.
+
+    std::vector<Vec3> LampFlares(const std::vector<roads::Pole>& poles) const {
+        std::vector<Vec3> out;
+        for (const roads::Pole& pole : poles) {
+            if (pole.strength <= 0.0f || pole.building) continue;
+            if (!pole.model.empty()) {
+                const auto found = lampOffsets_.find(TextureNameHash(Upper(pole.model)));
+                if (found != lampOffsets_.end()) {
+                    const Mat4 placed = PoleTransform(pole);
+                    for (const Vec3& lamp : found->second) out.push_back(placed.TransformPoint(lamp));
+                    continue;
+                }
+            }
+            out.push_back(pole.lamp);
+        }
+        return out;
+    }
+
+    static std::string Upper(std::string text) {
+        for (char& c : text) c = (char)::toupper((unsigned char)c);
+        return text;
+    }
+
+    // The flare pass shows them while they are not baked yet.
+    void PreviewFlares() {
+        std::vector<bb::LightFlareU2> list;
+        if (visible_ && NeedsBake())
+            for (const Vec3& p : LampFlares(poles_)) {
+                bb::LightFlareU2 f;
+                f.X = p.x; f.Y = p.y; f.Z = p.z;
+                f.ReflectPosZ = 999.0f;
+                f.DirX = 0.0f; f.DirY = 0.0f; f.DirZ = -1.0f;
+                f.Type = 9;
+                f.Flags = 2;
+                list.push_back(f);
+            }
+        bb::WorldFlaresU2::SetExtraFlares(std::move(list));
+    }
+
+    // Writes the lamps' flares into the sections (none: takes them out).
+    void WriteFlares(const std::vector<Vec3>& lamps) {
+        nfs::World* world = app_.World();
+        if (!world) return;
+        flares::Plan plan;
+        std::wstring error;
+        if (!flares::PlanFlares(*world, app_.ModelsFolder(), lamps, plan, error)) {
+            LOG_WARN("light flares: %S", error.c_str());
+            return;
+        }
+        if (!plan.sections) return;
+        const size_t written = WriteSectionSpans(plan.spans, plan.superseded, app_.ModelsFolder(), world->Region());
+        LOG_INFO("light flares: %zu written in %zu sections (%zu of %zu spans)", plan.flares, plan.sections, written,
+                 plan.spans.size());
+        app_.ReopenRegionKeepingView();
+    }
+
+    // ---- tunnels
+    //
+    // A road with its Tunnel on (or drawn with the Tunnel type) gets walls, a
+    // roof, lights and portals (roads::BuildTunnel); the ground is not fitted
+    // to it, and at its portals the game's ground and the terrain made here
+    // are opened as high as the tunnel (Network::TunnelCuts).
+
+    // The terrain made here without what stands in a tunnel's portal.
+    std::vector<roads::MeshPiece> OpenPortals(std::vector<roads::MeshPiece> pieces) const {
+        const std::vector<roads::GameCut> cuts = network_.TunnelCuts();
+        if (cuts.empty()) return pieces;
+        const auto inside = [&](const Vec3& p) {
+            for (const roads::GameCut& cut : cuts)
+                if (cut.InHeight(p.z) && cut.Inside(p)) return true;
+            return false;
+        };
+        for (roads::MeshPiece& piece : pieces) {
+            for (roads::MeshGroup& group : piece.groups) {
+                std::vector<u32> kept;
+                for (size_t k = 0; k + 2 < group.indices.size(); k += 3) {
+                    const Vec3 c = (group.vertices[group.indices[k]].position + group.vertices[group.indices[k + 1]].position +
+                                    group.vertices[group.indices[k + 2]].position) * (1.0f / 3.0f);
+                    if (inside(c)) continue;
+                    kept.insert(kept.end(), { group.indices[k], group.indices[k + 1], group.indices[k + 2] });
+                }
+                group.indices = std::move(kept);
+            }
+            piece.areas.erase(std::remove_if(piece.areas.begin(), piece.areas.end(), [&](const roads::CollisionArea& a) {
+                                  if (a.outline.empty()) return false;
+                                  Vec3 c{};
+                                  for (const Vec3& q : a.outline) c = c + q;
+                                  return inside(c * (1.0f / (float)a.outline.size()));
+                              }),
+                              piece.areas.end());
+        }
+        return pieces;
+    }
+
+    // The road tool with the Tunnel type.
+    void StartTunnelTool() {
+        StartDrawTool(0);
+        drawProfile_ = PresetProfile(kPresets - 1);
+        app_.Status(L"Tunnel: draw it as a road, from portal to portal through the hill -- its ground is opened "
+                    L"at the portals only");
+    }
+
     // Another band of ground beside the selected roads, or the outermost one off.
     void ExtrudeTerrain(int side, bool add) {
         std::vector<u32> ids = SelectedRoadIds();
@@ -4997,6 +5847,10 @@ private:
     // do now, and buttons for the keys.
     void DrawHud(float x, float y, float width, float height) override {
         (void)height;
+        if (waterTool_ && wizard_ == kWizardOff) {
+            WaterToolHud(x, y, width);
+            return;
+        }
         if (lightTool_ && wizard_ == kWizardOff) {
             LightToolHud(x, y, width);
             return;
@@ -5652,6 +6506,8 @@ private:
             return !Bridged(segment) && !segment.profile.keepGround && segment.profile.groundAuto &&
                    !fitted_.count(Fingerprint(segment));
         });
+        waterField_.Build(network_, [](const roads::Segment&) { return false; });
+        waterField_.AddWaters(network_);
     }
 
     // The game's terrain meshes that can be moved: each drawn in one place
@@ -5752,6 +6608,14 @@ private:
     // lights where there is none.
     void SetGameLight(const nfs::World& world) {
         auto sources = std::make_shared<roads::Network::LightSources>();
+        // An empty region (nfs/CustomRegions.h): the city's ground and lamps are
+        // not there, so they light nothing -- the ambient alone.
+        if (world.EmptyCity()) {
+            LOG_INFO("roads: an empty region -- no game light to take");
+            network_.SetLightSources(sources);
+            light_ = sources;
+            return;
+        }
         sources->sample = [this](const Vec3& p, u32& colour) { return GameLightAt(p, colour); };
         for (const auto& loaded : world.Loaded())
             for (const nfs::SceneryInstance& instance : loaded->scenery.instances) {
@@ -5790,13 +6654,14 @@ private:
                 h = bed + (h - bed) * (t * t * (3.0f - 2.0f * t));
             }
         }
-        return h;
+        return CarveWater(x, y, h);
     }
 
     // Draws the moved ground: every mesh in `area` (all when null).
     void RefreshGround(const Aabb* area) {
         const auto& cuts = cutsCache_;
-        const bool any = !ground_.Empty() || (fitGround_ && !groundField_.Empty()) || !cuts.empty();
+        const bool any = !ground_.Empty() || (fitGround_ && !groundField_.Empty()) || !cuts.empty() ||
+                         !waterField_.Empty();
         for (GroundModel& g : groundModels_) {
             if (area && (g.bounds.max.x < area->min.x || g.bounds.min.x > area->max.x ||
                          g.bounds.max.y < area->min.y || g.bounds.min.y > area->max.y))
@@ -5895,7 +6760,7 @@ private:
         nfs::World* world = app_.World();
         if (!world) return false;
         const std::wstring region = world->Region();
-        const std::wstring shipped = app_.GameFolder() + L"\\TRACKS\\ROUTES" + region + L"\\RoutesFreeRoam.bin";
+        const std::wstring shipped = nfs::ShippedTrackFile(app_.GameFolder(), region, L"ROUTES" + region + L"\\RoutesFreeRoam.bin");
         const std::wstring folder = app_.ModelsFolder() + L"\\files\\TRACKS\\ROUTES" + region;
         const std::wstring served = folder + L"\\RoutesFreeRoam.bin";
         std::vector<u8> bytes;
@@ -5994,7 +6859,7 @@ private:
         if (graphBuilt_ == network_.Revision() && graphRegion_ == world->Region()) return;
         if (graphRegion_ != world->Region() || graphShipped_.empty()) {
             graphShipped_.clear();
-            std::ifstream in(app_.GameFolder() + L"\\TRACKS\\ROUTES" + world->Region() + L"\\RoutesFreeRoam.bin",
+            std::ifstream in(nfs::ShippedTrackFile(app_.GameFolder(), world->Region(), L"ROUTES" + world->Region() + L"\\RoutesFreeRoam.bin"),
                              std::ios::binary);
             if (in) graphShipped_.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
             graphRegion_ = world->Region();
@@ -6404,7 +7269,7 @@ private:
     // scale: they are tools of the same kind, and only one is on at a time.
     static constexpr struct { int id; const wchar_t* text; } kToolButtons[] = {
         { ID_ROAD_DRAW, L"Roads" }, { ID_ROAD_GRID, L"Grid" }, { ID_ROAD_TREES, L"Trees" },
-        { ID_TERRAIN_TOOL, L"Terrain" },
+        { ID_TERRAIN_TOOL, L"Terrain" }, { ID_ROAD_WATER, L"Water" },
     };
 
     void AddToolbarButton() {
@@ -6431,7 +7296,7 @@ private:
     void SyncToolbar() const {
         HWND toolbar = app_.Toolbar();
         if (!toolbar) return;
-        const bool on[] = { drawTool_, gridTool_, treeTool_, brush_ != terrain::Brush::None };
+        const bool on[] = { drawTool_, gridTool_, treeTool_, brush_ != terrain::Brush::None, waterTool_ };
         for (size_t k = 0; k < std::size(kToolButtons); ++k)
             ::SendMessageW(toolbar, TB_CHECKBUTTON, kToolButtons[k].id, MAKELPARAM(on[k] ? 1 : 0, 0));
     }
@@ -6449,6 +7314,8 @@ private:
         ::AppendMenuW(toolsMenu, MF_STRING, ID_ROAD_DRAW, L"&Roads (draw, curve, upgrade, bulldoze)\tCtrl+Shift+D");
         ::AppendMenuW(toolsMenu, MF_STRING, ID_ROAD_GRID, L"Street &Grid with Zoned Blocks\tCtrl+Shift+U");
         ::AppendMenuW(toolsMenu, MF_STRING, ID_ROAD_TREES, L"&Tree Brush\tCtrl+Shift+A");
+        ::AppendMenuW(toolsMenu, MF_STRING, ID_ROAD_WATER, L"&Water: Lakes, Streams, Waterfalls\tCtrl+Shift+Y");
+        ::AppendMenuW(toolsMenu, MF_STRING, ID_ROAD_TUNNEL, L"T&unnel (a road through the hill)");
         ::AppendMenuW(toolsMenu, MF_STRING, ID_TERRAIN_TOOL, L"T&errain (sculpt, paint, extrude, cut)");
         ::AppendMenuW(toolsMenu, MF_SEPARATOR, 0, nullptr);
         ::AppendMenuW(toolsMenu, MF_STRING, ID_ROAD_FACE_JUNCTION, L"&Junction into a Game Road...\tCtrl+Shift+J");
@@ -6464,6 +7331,8 @@ private:
         ::AppendMenuW(lanesMenu, MF_STRING, ID_ROAD_LANE_ADD, L"Add a &Lane after the Selected Node");
         ::AppendMenuW(lanesMenu, MF_STRING, ID_ROAD_LANE_DROP, L"Drop a La&ne after the Selected Node");
         ::AppendMenuW(lanesMenu, MF_STRING, ID_ROAD_LANE_SPLIT, L"Split the &Outer Lane off Here (an exit)");
+        ::AppendMenuW(lanesMenu, MF_STRING, ID_ROAD_LANE_MERGE, L"A Lane &Joins Here (an entrance)");
+        ::AppendMenuW(lanesMenu, MF_STRING, ID_ROAD_JOIN_NODES, L"Join the Two Picked Nodes (Ctrl+click)\tJ");
         ::AppendMenuW(lanesMenu, MF_STRING, ID_ROAD_SPLIT_WAYS, L"Split the Two &Directions at This Road End");
         ::AppendMenuW(lanesMenu, MF_STRING, ID_ROAD_AUTO_HEADING, L"Node Direction &Automatic");
         ::AppendMenuW(roadsMenu, MF_POPUP, (UINT_PTR)lanesMenu, L"&Lanes and Nodes");
@@ -6522,6 +7391,7 @@ private:
             { FVIRTKEY | FCONTROL | FSHIFT, 'D', (WORD)ID_ROAD_DRAW },
             { FVIRTKEY | FCONTROL | FSHIFT, 'U', (WORD)ID_ROAD_GRID },
             { FVIRTKEY | FCONTROL | FSHIFT, 'A', (WORD)ID_ROAD_TREES },
+            { FVIRTKEY | FCONTROL | FSHIFT, 'Y', (WORD)ID_ROAD_WATER },
         };
         for (const ACCEL& key : added) {
             const bool taken = std::any_of(keys.begin(), keys.end(), [&](const ACCEL& k) {
@@ -6580,6 +7450,12 @@ private:
     u32   dragObject_ = 0;
     // The tree brush and the prop tool.
     bool  treeTool_ = false, propTool_ = false;
+    // The water tool: what kind, the settings of the next body, its points so far.
+    bool  waterTool_ = false;
+    int   waterKind_ = roads::Water::kLake;
+    roads::Water waterSettings_;
+    std::vector<Vec3> waterDraft_;
+    roads::RoadField waterField_;       // the beds alone, cutting the game's ground
     bool  treePainting_ = false, treeStrokeChanged_ = false, treeBrushHit_ = false, treeErase_ = false;
     Vec3  treeBrushPoint_;
     float treeRadius_ = 15.0f, treeDensity_ = 6.0f, treeSpacing_ = 5.0f, treeClock_ = 0.0f;
@@ -6594,6 +7470,7 @@ private:
     roads::Light lightDraft_;
     bool  lightShared_ = false;
     std::map<u32, std::vector<u32>> nativeOriginal_;   // shipped colours of the game's models lit
+    std::map<u32, std::vector<Vec3>> lampOffsets_;     // street-light model -> its lamps, model space
     std::set<u32> nativeLit_, nativeWritten_;
     u64   nativeRevision_ = 0;
     int   gridStep_ = 0;
@@ -6668,7 +7545,7 @@ private:
     mutable Vec3 lastPick_{};
 };
 
-bool RoadsExtension::Bridged(const roads::Segment& segment) const { return segment.profile.bridge; }
+bool RoadsExtension::Bridged(const roads::Segment& segment) const { return segment.profile.OffGround(); }
 
 bool RoadsExtension::FillProperties(PropertiesPanel::View& view) {
     if (const nfs::routes::Node* n = SelectedGraphNode()) {
@@ -6724,6 +7601,10 @@ bool RoadsExtension::FillProperties(PropertiesPanel::View& view) {
                        typeName(sp.flags >> 4 & 0xF), (sp.flags >> 23 & 1) ? L", turns round" : L""),
                    L"", 0);
         }
+        return true;
+    }
+    if (const roads::Water* w = SelectedWater()) {
+        FillWaterCard(view, *w);
         return true;
     }
     if (const roads::Prop* prop = SelectedProp()) {
@@ -6836,7 +7717,14 @@ bool RoadsExtension::FillProperties(PropertiesPanel::View& view) {
                                      L"away before it." });
             view.actions.push_back({ L"Exit", ID_ROAD_LANE_SPLIT, L"Split here",
                                      L"The outer lane leaves as a road of its own (an exit); the other lanes go on." });
+            view.actions.push_back({ L"Entrance", ID_ROAD_LANE_MERGE, L"Split here",
+                                     L"The outer lane of the road coming in arrives as a road of its own and joins "
+                                     L"here (an entrance)." });
         }
+        if (joinPartner_ && joinPartner_ != node->id && network_.FindNode(joinPartner_))
+            view.actions.push_back({ Fmt(L"Join with node %u", joinPartner_), ID_ROAD_JOIN_NODES, L"Join",
+                                     L"Merges the two nodes when they nearly touch; otherwise a new road links them, "
+                                     L"going on from the first one's road (J)." });
         if (count == 1)
             view.actions.push_back({ L"Two directions", ID_ROAD_SPLIT_WAYS, L"Split here",
                                      L"The two directions go on as two one-way roads (a divided highway)." });
@@ -7039,10 +7927,11 @@ void RoadsExtension::FillRoad(PropertiesPanel::View& view, const roads::Segment&
            walks_, true);
     AddRow(view, L"Walls", L"Left wall", p.wallLeft ? L"yes" : L"no", L"Along the left edge.", kWallLeft, yesNo);
     AddRow(view, L"Walls", L"Right wall", p.wallRight ? L"yes" : L"no", L"Along the right edge.", kWallRight, yesNo);
-    AddRow(view, L"Walls", L"Style", kWallStyleNames[std::clamp(p.wallStyle, 0, 2)],
+    AddRow(view, L"Walls", L"Style", kWallStyleNames[std::clamp(p.wallStyle, 0, 3)],
            L"flat: a straight wall; guardrail: a steel W-beam on posts; model: a game model repeated along the "
-           L"edge, turned to follow its curve. Every style collides as a wall nothing gets over.", kWallStyle,
-           { kWallStyleNames[0], kWallStyleNames[1], kWallStyleNames[2] });
+           L"edge, turned to follow its curve; highway wall: the game's own freeway wall, a concrete barrier with "
+           L"a wavy panel on it (its own size and textures). Every style collides as a wall nothing gets over.",
+           kWallStyle, { kWallStyleNames[0], kWallStyleNames[1], kWallStyleNames[2], kWallStyleNames[3] });
     if (p.wallStyle == 2) {
         AddRow(view, L"Walls", L"Model", p.wallModel.empty() ? L"-" : Widen(p.wallModel),
                L"Rails, fences and barriers of the region. Its length sets the spacing when picked.", kWallModel,
@@ -7151,6 +8040,27 @@ void RoadsExtension::FillRoad(PropertiesPanel::View& view, const roads::Segment&
                    kBankAngle);
         }
     }
+    AddRow(view, L"Tunnel", L"Tunnel", p.tunnel ? L"yes" : L"no",
+           L"Walls and a roof round the road, lights along it, a portal at each open end; the ground is left over "
+           L"it and opened only at the portals, as high as the tunnel.", kTunnel, { L"yes", L"no" });
+    if (p.tunnel) {
+        AddRow(view, L"Tunnel", L"Height", Number(p.tunnelHeight), L"From the road to the top of the roof.",
+               kTunnelHeight);
+        AddRow(view, L"Tunnel", L"Shape", p.tunnelShape == 1 ? L"box" : L"arch", L"An arched roof, or a flat one.",
+               kTunnelShape, { L"arch", L"box" });
+        AddRow(view, L"Tunnel", L"Light spacing", Number(p.tunnelLightSpacing),
+               L"Between the lights along the roof; 0 for none.", kTunnelLights);
+        AddRow(view, L"Tunnel", L"Light colour (RRGGBB)", Fmt(L"%06X", p.tunnelLightColor & 0xFFFFFF),
+               L"The lights' colour.", kTunnelLightColour);
+        AddRow(view, L"Tunnel", L"Portal border", Number(p.tunnelPortalSize),
+               L"How far the concrete portal reaches round the opening.", kTunnelPortalSize);
+        AddRow(view, L"Tunnel", L"Wall texture", p.tunnelWall.empty() ? L"ARC_CONCRETE_LIGHT2" : Widen(p.tunnelWall),
+               L"The walls.", kTunnelWall, walls_, true);
+        AddRow(view, L"Tunnel", L"Roof texture", p.tunnelRoof.empty() ? L"ARC_CONCRETEA_VK" : Widen(p.tunnelRoof),
+               L"The roof.", kTunnelRoof, walls_, true);
+        AddRow(view, L"Tunnel", L"Portal texture", p.tunnelPortal.empty() ? L"ARC_A51CONCRETE2" : Widen(p.tunnelPortal),
+               L"The portals.", kTunnelPortal, walls_, true);
+    }
     AddRow(view, L"Bridge", L"Bridge", p.bridge ? L"yes" : L"no",
            L"A deck on pillars: the ground is not fitted under it. Raise its nodes (gizmo Z) for the height; "
            L"the roads leading up to it make embankments.", kBridge, { L"yes", L"no" });
@@ -7200,6 +8110,10 @@ void RoadsExtension::FillRoad(PropertiesPanel::View& view, const roads::Segment&
 bool RoadsExtension::ApplyProperties() {
     if (Selected() < 0) return false;
     PropertiesPanel& properties = app_.Properties();
+    if (roads::Water* w = SelectedWaterMutable()) {
+        ApplyWaterCard(*w);
+        return true;
+    }
     if (roads::Prop* prop = SelectedPropMutable()) {
         std::wstring text;
         float value = 0.0f;
@@ -7393,6 +8307,17 @@ void RoadsExtension::ApplyRoad(roads::RoadProfile& p, int only) {
         if (!name.empty() && name != p.ShoulderTexture()) p.shoulderTexture = name;
     }
     if (readNumber(kWallTextureLength, value)) p.wallTextureLength = std::clamp(value, 0.5f, 500.0f);
+    if (readText(kTunnel, text)) p.tunnel = !text.empty() && (text[0] == L'y' || text[0] == L'Y');
+    if (readNumber(kTunnelHeight, value)) p.tunnelHeight = std::clamp(value, 3.0f, 40.0f);
+    if (readText(kTunnelShape, text)) p.tunnelShape = text == L"box" ? 1 : 0;
+    if (readNumber(kTunnelLights, value)) p.tunnelLightSpacing = std::clamp(value, 0.0f, 200.0f);
+    if (readText(kTunnelLightColour, text) && !text.empty())
+        p.tunnelLightColor = (u32)std::wcstoul((text[0] == L'#' ? text.substr(1) : text).c_str(), nullptr, 16) & 0xFFFFFF;
+    if (readNumber(kTunnelPortalSize, value)) p.tunnelPortalSize = std::clamp(value, 0.0f, 20.0f);
+    if (readNumber(kTunnelPortalDepth, value)) p.tunnelPortalDepth = std::clamp(value, 2.0f, 60.0f);
+    if (readText(kTunnelWall, text) && !text.empty()) p.tunnelWall = Narrow(text);
+    if (readText(kTunnelRoof, text) && !text.empty()) p.tunnelRoof = Narrow(text);
+    if (readText(kTunnelPortal, text) && !text.empty()) p.tunnelPortal = Narrow(text);
     if (readText(kBridge, text)) {
         const bool bridge = !text.empty() && (text[0] == L'y' || text[0] == L'Y');
         if (bridge && !p.bridge) p.wallLeft = p.wallRight = true;    // railings
@@ -7458,7 +8383,7 @@ void RoadsExtension::ApplyRoad(roads::RoadProfile& p, int only) {
     if (readText(kWalkLeft, text)) p.sidewalkLeft = !text.empty() && (text[0] == L'y' || text[0] == L'Y');
     if (readText(kWalkRight, text)) p.sidewalkRight = !text.empty() && (text[0] == L'y' || text[0] == L'Y');
     if (readText(kWallStyle, text))
-        for (int k = 0; k < 3; ++k)
+        for (int k = 0; k < 4; ++k)
             if (text == kWallStyleNames[k]) p.wallStyle = k;
     if (readText(kWallModel, text)) {
         const std::string name = Narrow(text);
@@ -7600,7 +8525,8 @@ void RoadsExtension::DrawOverlay(IDirect3DDevice9* device, const Camera& camera,
     if (graphView_) DrawRouteGraph(device, camera, renderer);
     if (wizard_ != kWizardOff) DrawWizard(device, renderer);
     if (!visible_ || (network_.Nodes().empty() && network_.Lights().empty() && brush_ == terrain::Brush::None &&
-                      network_.Props().empty() && !drawing_ && !drawTool_ && !gridTool_ && !lightTool_ &&
+                      network_.Props().empty() && network_.Waters().empty() && !drawing_ && !drawTool_ &&
+                      !gridTool_ && !lightTool_ && !waterTool_ &&
                       !treeTool_ && !propTool_ && !SelectedPatch()))
         return;
     struct Vertex { float x, y, z; D3DCOLOR colour; };
@@ -7624,6 +8550,37 @@ void RoadsExtension::DrawOverlay(IDirect3DDevice9* device, const Camera& camera,
             line(previous, p, c);
             previous = p;
         }
+        // Which way each lane runs: a chevron on every lane, a few along
+        // the road (brighter on the selected one).
+        {
+            const roads::RoadProfile& p = s.profile;
+            const float halfRoad = p.HalfRoad();
+            std::vector<std::pair<float, bool>> lanes;   // lateral centre, runs along the curve
+            for (int k = 0; k < p.lanesBackward; ++k)
+                lanes.push_back({ -halfRoad + p.ShoulderAt(-1) + (k + 0.5f) * p.laneWidth, false });
+            const float firstForward = p.MedianLeft() + p.MedianWidth();
+            for (int k = 0; k < p.lanesForward; ++k)
+                lanes.push_back({ firstForward + (k + 0.5f) * p.laneWidth, true });
+            const roads::Curve& c2 = curve;
+            const float length = Length(c2.p1 - c2.p0) + Length(c2.p2 - c2.p1) + Length(c2.p3 - c2.p2);
+            const int marks = std::clamp((int)(length / 25.0f), 1, 12);
+            const D3DCOLOR arrow = chosen ? 0xFFFFFFFF : 0x90FFFFFF;
+            for (int m = 0; m < marks; ++m) {
+                const float t = (m + 0.5f) / marks;
+                const Vec3 d = HorizontalDirection(c2.Tangent(t));
+                const Vec3 r{ d.y, -d.x, 0.0f };
+                const Vec3 base = c2.At(t) + r * s.Offset() + Vec3{ 0, 0, 0.35f };
+                const float size = std::min(1.4f, p.laneWidth * 0.35f);
+                for (const auto& [x, along] : lanes) {
+                    const Vec3 way = along ? d : d * -1.0f;
+                    const Vec3 side{ way.y, -way.x, 0.0f };
+                    const Vec3 tip = base + r * x + way * size;
+                    line(tip, tip - way * size * 1.2f + side * size * 0.8f, arrow);
+                    line(tip, tip - way * size * 1.2f - side * size * 0.8f, arrow);
+                    line(tip, tip - way * size * 2.2f, arrow);
+                }
+            }
+        }
         if (chosen) {
             // The edges of the selected road.
             const float half = s.profile.HalfWidth();
@@ -7639,6 +8596,24 @@ void RoadsExtension::DrawOverlay(IDirect3DDevice9* device, const Camera& camera,
                 right0 = rr;
             }
         }
+    }
+
+    // One node per direction at each two-way road's free end: green where the
+    // lanes come in to the road, orange where they go out of it.
+    for (const DirectionPort& port : DirectionPorts()) {
+        const D3DCOLOR c = port.intoRoad ? 0xFF40FF60 : 0xFFFF9030;
+        const Vec3 at = port.at + Vec3{ 0, 0, 0.45f };
+        const float r = 1.1f;
+        for (int k = 0; k < 16; ++k) {
+            const float a0 = k * 6.2831853f / 16, a1 = (k + 1) * 6.2831853f / 16;
+            line(at + Vec3{ r * std::cos(a0), r * std::sin(a0), 0 }, at + Vec3{ r * std::cos(a1), r * std::sin(a1), 0 }, c);
+        }
+        const Vec3 side{ port.way.y, -port.way.x, 0.0f };
+        const Vec3 tip = at + port.way * 1.8f;
+        line(at - port.way * 1.8f, tip, c);
+        line(tip, tip - port.way * 0.9f + side * 0.7f, c);
+        line(tip, tip - port.way * 0.9f - side * 0.7f, c);
+        line(at, at + Vec3{ 0, 0, 2.0f }, c);
     }
 
     // The drawing tool: what a click would do, and the road it would draw.
@@ -7783,6 +8758,30 @@ void RoadsExtension::DrawOverlay(IDirect3DDevice9* device, const Camera& camera,
                 if (j < patch->rows && filled(i, j) != filled(i - 1, j))
                     line(patch->Corner(i, j) + lift, patch->Corner(i, j + 1) + lift, colour);
             }
+    }
+
+    // Water: the outline or path being drawn, and the selected body's points.
+    if (waterTool_ && !waterDraft_.empty()) {
+        const Vec3 lift{ 0, 0, 0.5f };
+        for (size_t k = 0; k + 1 < waterDraft_.size(); ++k) line(waterDraft_[k] + lift, waterDraft_[k + 1] + lift, 0xFF40A0FF);
+        if (waterKind_ == roads::Water::kLake && waterDraft_.size() >= 3)
+            line(waterDraft_.back() + lift, waterDraft_.front() + lift, 0x8040A0FF);
+        for (const Vec3& q : waterDraft_) line(q, q + Vec3{ 0, 0, 3.0f }, 0xFFFFFFFF);
+    }
+    if (const roads::Water* w = SelectedWater()) {
+        const int chosen = SelectedWaterPoint();
+        const size_t n = w->points.size();
+        for (size_t k = 0; k < n; ++k) {
+            const Vec3 q = w->points[k] + Vec3{ 0, 0, 0.3f };
+            const D3DCOLOR c = (int)k == chosen ? 0xFFFFFFFF : 0xFF40A0FF;
+            const float r = (int)k == chosen ? 1.2f : 0.8f;
+            line(q + Vec3{ -r, 0, 0 }, q + Vec3{ 0, r, 0 }, c);
+            line(q + Vec3{ 0, r, 0 }, q + Vec3{ r, 0, 0 }, c);
+            line(q + Vec3{ r, 0, 0 }, q + Vec3{ 0, -r, 0 }, c);
+            line(q + Vec3{ 0, -r, 0 }, q + Vec3{ -r, 0, 0 }, c);
+            if (k + 1 < n) line(q, w->points[k + 1] + Vec3{ 0, 0, 0.3f }, 0x8040A0FF);
+            else if (w->kind == roads::Water::kLake) line(q, w->points[0] + Vec3{ 0, 0, 0.3f }, 0x8040A0FF);
+        }
     }
 
     // The tree brush where it would paint.
@@ -8048,7 +9047,16 @@ bool RoadsExtension::BakeGroundCollision(size_t& moved) {
     if (!world || !tools) return false;
     cutsCache_ = network_.Cuts();
     const auto& cuts = cutsCache_;
-    if (ground_.Empty() && !(fitGround_ && !groundField_.Empty()) && cuts.empty()) return true;
+    // Bridges of ours may stand over the game's barriers (see below), so they count too.
+    const bool bridges = std::any_of(network_.Segments().begin(), network_.Segments().end(),
+                                     [](const roads::Segment& seg) { return seg.profile.bridge; });
+    // Our roads on the ground: the game's walls and barriers standing on them
+    // are taken off the road (below).
+    roads::RoadField onRoad;
+    onRoad.Build(network_, [](const roads::Segment& seg) { return !seg.profile.OffGround() && !seg.profile.keepGround; });
+    if (ground_.Empty() && !(fitGround_ && !groundField_.Empty()) && cuts.empty() && !bridges &&
+        waterField_.Empty() && onRoad.Empty())
+        return true;
     collision::Editor& editor = tools->Editor();
     if (editor.World() != world) editor.SetWorld(world);
     // The bake's polygons are the roads' own edit (the "Roads baked" row),
@@ -8105,6 +9113,68 @@ bool RoadsExtension::BakeGroundCollision(size_t& moved) {
         m.wall[1] = p.Wall(1) && p.wallHeight >= 0.05f;
         mouths.push_back(m);
     }
+    // Where a bridge of ours passes over one of the game's barriers: those
+    // are walls of unbounded height, so a car on the deck would hit one in
+    // mid air. Under the deck the barrier becomes a wall of real height, up
+    // to just below the deck -- it still stops a car on the road beneath --
+    // and either side of the deck it stays a barrier.
+    struct DeckPiece {
+        Vec3 corner[4];          // in plan, anticlockwise
+        float top = 0.0f;        // the deck's surface there
+        float bottom = 0.0f;     // its underside
+    };
+    std::vector<DeckPiece> decks;
+    for (const roads::Segment& seg : network_.Segments()) {
+        if (!seg.profile.bridge) continue;
+        const roads::Curve curve = network_.CurveOf(seg);
+        const float half = std::max(seg.profile.Edge(-1), seg.profile.Edge(1)) + 0.5f;
+        const float length = Length(curve.p1 - curve.p0) + Length(curve.p2 - curve.p1) + Length(curve.p3 - curve.p2);
+        const int steps = std::clamp((int)(length / 2.0f), 2, 400);
+        Vec3 prevL{}, prevR{};
+        float prevZ = 0.0f;
+        for (int k = 0; k <= steps; ++k) {
+            const float t = (float)k / steps;
+            const Vec3 d = HorizontalDirection(curve.Tangent(t));
+            const Vec3 right{ d.y, -d.x, 0.0f };
+            const Vec3 c = curve.At(t) + right * seg.Offset();
+            const Vec3 l = c - right * half, r = c + right * half;
+            if (k > 0) {
+                DeckPiece piece;
+                piece.corner[0] = prevL; piece.corner[1] = prevR; piece.corner[2] = r; piece.corner[3] = l;
+                if (Cross(piece.corner[1] - piece.corner[0], piece.corner[2] - piece.corner[0]).z < 0.0f) {
+                    std::swap(piece.corner[1], piece.corner[3]);
+                }
+                piece.top = std::min(prevZ, c.z);
+                piece.bottom = piece.top - std::max(0.2f, seg.profile.deckThickness);
+                decks.push_back(piece);
+            }
+            prevL = l; prevR = r; prevZ = c.z;
+        }
+    }
+    // The part of a line a->b inside a deck piece (convex): t0..t1, or false.
+    const auto underDeck = [](const DeckPiece& piece, const Vec3& a, const Vec3& b, float& t0, float& t1) {
+        t0 = 0.0f;
+        t1 = 1.0f;
+        const Vec3 d{ b.x - a.x, b.y - a.y, 0.0f };
+        for (int e = 0; e < 4; ++e) {
+            const Vec3& p0 = piece.corner[e];
+            const Vec3& p1 = piece.corner[(e + 1) % 4];
+            const Vec3 inward{ -(p1.y - p0.y), p1.x - p0.x, 0.0f };     // left of an anticlockwise edge
+            const float start = Dot(Vec3{ a.x - p0.x, a.y - p0.y, 0.0f }, inward), step = Dot(d, inward);
+            if (std::fabs(step) < 1e-7f) {
+                if (start < 0.0f) return false;
+                continue;
+            }
+            const float t = -start / step;
+            if (step > 0.0f) t0 = std::max(t0, t);
+            else t1 = std::min(t1, t);
+            if (t0 >= t1) return false;
+        }
+        return t1 - t0 > 1e-4f;
+    };
+    size_t barriersUnderBridges = 0;
+    size_t wallsOffRoads = 0;
+
     std::vector<nfs::CollisionPolygon> connectors;
     size_t barriersOpened = 0;
     // The part of a barrier's line inside a mouth: t0..t1 of a->b, or false.
@@ -8179,6 +9249,110 @@ bool RoadsExtension::BakeGroundCollision(size_t& moved) {
                     }
                     if (opened) continue;
                 }
+                if (p.barrier && !decks.empty()) {
+                    // Under our bridges: the stretches beneath a deck, high enough over the ground.
+                    const Vec3 a = p.corners[0], b = p.corners[2];
+                    struct Span { float t0, t1, base, height; };
+                    std::vector<Span> spans;
+                    for (const DeckPiece& piece : decks) {
+                        float t0 = 0.0f, t1 = 0.0f;
+                        if (!underDeck(piece, a, b, t0, t1)) continue;
+                        // A piece left by an earlier bake ends on the deck's edge: nothing under it.
+                        if ((t1 - t0) * Length(Vec3{ b.x - a.x, b.y - a.y, 0.0f }) < 0.1f) continue;
+                        const Vec3 mid = a + (b - a) * ((t0 + t1) * 0.5f);
+                        float base = 0.0f;
+                        if (!GroundBelow(mid.x, mid.y, piece.bottom - 0.5f, base)) continue;
+                        const float height = piece.bottom - 0.3f - base;
+                        if (height < 2.0f) continue;      // the deck is down on the ground: a barrier there is meant
+                        spans.push_back({ t0, t1, base, height });
+                    }
+                    if (!spans.empty()) {
+                        refs.push_back({ (u32)s, (u32)k, (u32)i });
+                        if (seen.insert(key).second) {
+                            ++barriersUnderBridges;
+                            std::sort(spans.begin(), spans.end(), [](const Span& x, const Span& y) { return x.t0 < y.t0; });
+                            const auto barrier = [&](float from, float to) {
+                                if ((to - from) * Length(Vec3{ b.x - a.x, b.y - a.y, 0.0f }) < 0.05f) return;
+                                nfs::CollisionPolygon q = p;
+                                const nfs::CollisionPolygon shape =
+                                    collision::MakeBarrier(a + (b - a) * from, a + (b - a) * to, p.surface);
+                                for (int c = 0; c < 4; ++c) q.corners[c] = shape.corners[c];
+                                replacements.push_back(q);
+                            };
+                            float at = 0.0f;
+                            for (const Span& span : spans) {
+                                const float from = std::max(at, span.t0);
+                                if (span.t1 <= from) continue;
+                                barrier(at, from);
+                                Vec3 w0 = a + (b - a) * from, w1 = a + (b - a) * span.t1;
+                                w0.z = w1.z = span.base - 0.2f;
+                                nfs::CollisionPolygon wall = collision::MakeVerticalWall(w0, w1, span.height + 0.2f, p.surface);
+                                wall.raceGroup = p.raceGroup;
+                                wall.attributes[0] = p.attributes[0];
+                                replacements.push_back(wall);
+                                at = span.t1;
+                            }
+                            barrier(at, 1.0f);
+                        }
+                        continue;
+                    }
+                }
+                if ((p.barrier || p.Vertical()) && !onRoad.Empty()) {
+                    // A wall of the game's standing across one of our roads (an
+                    // old kerb or road edge the new road was laid over): the
+                    // stretches on the road go, the rest stays as it was. A
+                    // vertical wall counts only where it reaches the road's
+                    // height; a barrier has no height, so it always does.
+                    const Vec3 a = p.corners[0], b = p.corners[p.barrier ? 2 : 3];   // foot to foot
+                    const float length = Length(Vec3{ b.x - a.x, b.y - a.y, 0.0f });
+                    float wallLow = 1e30f, wallHigh = -1e30f;
+                    for (int c = 0; c < (p.quad ? 4 : 3); ++c) {
+                        wallLow = std::min(wallLow, p.corners[c].z);
+                        wallHigh = std::max(wallHigh, p.corners[c].z);
+                    }
+                    const auto onIt = [&](float t) {
+                        const Vec3 q = a + (b - a) * t;
+                        float z = 0.0f, outside = 0.0f;
+                        if (!onRoad.Query(q.x, q.y, 1.0f, z, outside) || outside > -0.3f) return false;
+                        return p.barrier || (wallHigh > z + 0.05f && wallLow < z + 1.5f);
+                    };
+                    const int steps = std::max(2, (int)std::ceil(length / 0.5f));
+                    std::vector<std::pair<float, float>> keep;   // t ranges off the road
+                    bool any = false;
+                    float from = -1.0f;
+                    for (int k = 0; k <= steps; ++k) {
+                        const float t = (float)k / steps;
+                        const bool inside = onIt(t);
+                        any |= inside;
+                        if (!inside && from < 0.0f) from = t;
+                        if (inside && from >= 0.0f) { keep.push_back({ from, t }); from = -1.0f; }
+                    }
+                    if (from >= 0.0f) keep.push_back({ from, 1.0f });
+                    if (any && length >= 0.25f) {
+                        refs.push_back({ (u32)s, (u32)k, (u32)i });
+                        if (seen.insert(key).second) {
+                            ++wallsOffRoads;
+                            for (const auto& [t0, t1] : keep) {
+                                if ((t1 - t0) * length < 0.1f) continue;
+                                nfs::CollisionPolygon q = p;
+                                if (p.barrier) {
+                                    const nfs::CollisionPolygon shape =
+                                        collision::MakeBarrier(a + (b - a) * t0, a + (b - a) * t1, p.surface);
+                                    for (int c = 0; c < 4; ++c) q.corners[c] = shape.corners[c];
+                                } else {
+                                    // corners 0,1 at a (foot, top) and 3,2 at b
+                                    const Vec3 c0 = p.corners[0], c1 = p.corners[1], c2 = p.corners[2], c3 = p.corners[3];
+                                    q.corners[0] = c0 + (c3 - c0) * t0;
+                                    q.corners[1] = c1 + (c2 - c1) * t0;
+                                    q.corners[2] = c1 + (c2 - c1) * t1;
+                                    q.corners[3] = c0 + (c3 - c0) * t1;
+                                }
+                                replacements.push_back(q);
+                            }
+                        }
+                        continue;
+                    }
+                }
                 if (p.barrier || p.Vertical()) {
                     // A wall goes when its middle stands inside a cut.
                     const Vec3 middle = (p.corners[0] + p.corners[2]) * 0.5f;
@@ -8240,6 +9414,10 @@ bool RoadsExtension::BakeGroundCollision(size_t& moved) {
     if (barriersOpened)
         LOG_INFO("ground: %zu game barriers opened at junction mouths, %zu links to the roads' own", barriersOpened,
                  connectors.size() / 2);
+    if (wallsOffRoads)
+        LOG_INFO("ground: %zu game walls and barriers standing on our roads cut back to the road edge", wallsOffRoads);
+    if (barriersUnderBridges)
+        LOG_INFO("ground: %zu game barriers under our bridges made walls up to the deck", barriersUnderBridges);
     if (!replacements.empty()) editor.Add(replacements, L"Sculpt the ground");
     tools->RefreshAfterEdit();
     moved = replacements.size() + removedInCuts;
@@ -8543,6 +9721,26 @@ bool RoadsExtension::BakeCollision(const std::vector<roads::MeshPiece>& pieces, 
     // The new ones.
     std::vector<nfs::CollisionPolygon> polygons;
     for (const roads::MeshPiece& piece : pieces) {
+        // Ground beside a road (ROAD_G<segment>, ROAD_GJ<node>: grass; a
+        // ROAD_G<node> junction into a game road is road), between roads
+        // (ROAD_F<area>_<n>) and terrain patches (ROAD_T...) get collision
+        // only when it is asked for.
+        if (!network_.TerrainCollision()) {
+            const std::string& n = piece.name;
+            const bool patch = n.rfind("ROAD_T", 0) == 0 && n.rfind("ROAD_TREES", 0) != 0;
+            const bool between = n.rfind("ROAD_F", 0) == 0 && n.find('_', 6) != std::string::npos;
+            if (patch || between) continue;
+            if (n.rfind("ROAD_G", 0) == 0) {
+                for (const roads::CollisionStrip& strip : piece.strips)
+                    if (strip.surface != roads::kSurfaceGrass && strip.left.size() >= 2 &&
+                        strip.left.size() == strip.right.size())
+                        collision::AppendStrip(strip.left, strip.right, strip.surface, polygons);
+                for (const roads::CollisionArea& area : piece.areas)
+                    if (area.surface != roads::kSurfaceGrass && area.outline.size() >= 3)
+                        collision::AppendGround(area.outline, area.surface, polygons);
+                continue;
+            }
+        }
         for (const roads::CollisionStrip& strip : piece.strips)
             if (strip.left.size() >= 2 && strip.left.size() == strip.right.size())
                 collision::AppendStrip(strip.left, strip.right, strip.surface, polygons);
@@ -8597,6 +9795,7 @@ void RoadsExtension::Unbake() {
         app_.Message(L"The baked roads could not be taken out. The log has why.", MB_ICONWARNING);
         return;
     }
+    WriteFlares({});    // and their flares
     WriteBakeStamp();   // unbaked on purpose: the game start leaves it so until the source changes
     app_.Status(Fmt(L"%zu baked road pieces and %zu collision polygons removed from the game; the road network "
                     L"is kept in the editor (Ctrl+Z puts them back)", removed, collisionRemoved));
@@ -8621,9 +9820,13 @@ void RoadsExtension::Bake() {
     const std::wstring region = world->Region();
     // Ctrl+Z takes the whole bake back: the world's files as they are now.
     DiskStep step(this, L"bake the roads");
+    // The bake runs on the editor's thread, so the window cannot redraw: a
+    // progress window says what it is doing.
+    ProgressWindow progress(app_.Window(), L"Baking into the game", 10);
 
     SaveTerrain();
     std::wstring routes;
+    progress.Step(L"Writing the traffic and GPS routes...");
     if (!WriteRoutes(routes)) {
         app_.Message(L"The roads' traffic and GPS could not be written, so nothing was baked: " + routes,
                      MB_ICONWARNING);
@@ -8631,34 +9834,41 @@ void RoadsExtension::Bake() {
     }
     LOG_INFO("roads: %S", routes.c_str());
     std::vector<roads::Pole> poles;
+    progress.Step(L"Building the roads, buildings and ground...");
     std::vector<roads::MeshPiece> pieces = network_.BuildMesh(&poles);
     // The terrain bakes with the roads: the same prefix, the same removal.
     {
         roads::RoadField field;
-        field.Build(network_, [](const roads::Segment& segment) { return !segment.profile.bridge; });
+        field.Build(network_, [](const roads::Segment& segment) { return !segment.profile.OffGround(); });
+        field.AddWaters(network_);
         for (const terrain::Patch& patch : terrain_.Patches())
-            for (roads::MeshPiece& piece : terrain_.BuildMesh(patch, &field, poles, network_.Lighting())) pieces.push_back(std::move(piece));
+            for (roads::MeshPiece& piece : OpenPortals(terrain_.BuildMesh(patch, &field, poles, network_.Lighting())))
+                pieces.push_back(std::move(piece));
     }
 
     // Street lights and collision first, written by the edits' save, which
     // reloads the region. The mesh import after it keeps them: every write
     // rebuilds a section from the game's bytes with every edit in force.
     size_t polesAdded = 0, polesRemoved = 0;
+    progress.Step(Fmt(L"Placing %zu street lights, trees, props and buildings...", poles.size()));
     if (!BakePoles(poles, polesAdded, polesRemoved)) {
         app_.Message(L"The street lights could not be placed, so nothing was baked. The log has why.", MB_ICONWARNING);
         return;
     }
     size_t collisionAdded = 0, collisionRemoved = 0;
+    progress.Step(L"Making the roads' collision...");
     if (app_.Collision() && !BakeCollision(pieces, collisionAdded, collisionRemoved)) {
         app_.Message(L"The road collision could not be made, so nothing was baked. The log has why.", MB_ICONWARNING);
         return;
     }
     size_t groundPolygons = 0;
+    progress.Step(L"Fitting the ground's collision...");
     if (app_.Collision() && !BakeGroundCollision(groundPolygons)) {
         app_.Message(L"The ground's collision could not be moved, so nothing was baked. The log has why.",
                      MB_ICONWARNING);
         return;
     }
+    progress.Step(L"Writing the placements and collision (the region reloads)...");
     if (!app_.SaveEdits()) {
         app_.Message(L"The street lights and road collision could not be written, so nothing was baked. "
                      L"The log has why.", MB_ICONWARNING);
@@ -8669,6 +9879,7 @@ void RoadsExtension::Bake() {
     size_t groundMeshes = 0;
     {
         std::wstring error;
+        progress.Step(L"Writing the sculpted ground...");
         if (!BakeGroundModels(groundMeshes, error)) {
             app_.Message(L"The sculpted ground could not be written: " + error, MB_ICONWARNING);
             return;
@@ -8685,6 +9896,7 @@ void RoadsExtension::Bake() {
 
     // What the last bake made goes first, so the network is the only source.
     size_t removed = 0;
+    progress.Step(L"Taking out the last bake...");
     if (!RemoveBaked(removed)) {
         app_.Message(L"The roads baked before could not be taken out, so nothing was baked. The log has why.",
                      MB_ICONWARNING);
@@ -8775,7 +9987,11 @@ void RoadsExtension::Bake() {
 
     // The import makes each piece a model in the section under it and
     // reloads the region.
+    progress.Step(Fmt(L"Writing %zu road and ground pieces into the game (the region reloads)...", pieces.size()));
+    // Hundreds of pieces take a while: the window keeps answering through them.
+    ImportProgress() = [&progress](size_t done, size_t) { if (done % 4 == 0) progress.Pump(); };
     app_.ImportObj(obj, origin);
+    ImportProgress() = nullptr;
 
     size_t baked = 0;
     if (nfs::World* reloaded = app_.World())
@@ -8792,7 +10008,11 @@ void RoadsExtension::Bake() {
                     groundPolygons, routes.c_str()));
     LOG_INFO("roads: baked %zu of %zu pieces from %S", baked, meshes, obj.c_str());
     // The game's own objects the lights placed by hand reach.
+    progress.Step(L"Lighting the game's own objects...");
     WriteNativeLights();
+    // The street lights' flares, in the sections' flare packs.
+    WriteFlares(LampFlares(poles));
+    progress.Close();
     WriteBakeStamp();
     if (baked < meshes)
         app_.Message(Fmt(L"%zu of %zu road pieces could not be made into models (the log has why: usually a "

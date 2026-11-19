@@ -2,7 +2,9 @@
 
 Research notes, 2026-11-13. Game files were only read. Scripts are in `tools/paths/`.
 Addresses are SPEED2.EXE (v1.2 US). Tags: **[V]** verified (how is given), **[I]** inferred,
-**[?]** unknown.
+**[?]** unknown. Findings taken from porting other maps into the game (§6a) say how they
+were verified: "code" (read from the exe), "in game" (seen in the running game) or "files"
+(counted over the shipped data).
 
 ## 0. Answers in short
 
@@ -19,12 +21,15 @@ Addresses are SPEED2.EXE (v1.2 US). Tags: **[V]** verified (how is given), **[I]
   intersections `[0x883DBC]`. The traffic and AI path code at `0x5D3000..0x5EA000` reads the
   same tables. **[V]** by cross-references. The BUN chunks are something else. `0x80034020`
   holds moving props (`ZCV_DrawBridgeA`...), `0x8003B200` is animation tracks ("Track 0"),
-  and `0x8003B600` holds bucketed records loaded by `0x60B810`. None of them is read by the
-  route code. **[V]** (no references; content checked)
+  and `0x8003B600` holds bucketed records loaded by `0x60B810` (the parameter maps: fog,
+  screen tint, rain, wind and reverb by place, see `docs/NFSU2-FORMATS.md` §5d). None of them
+  is read by the route code. **[V]** (no references; content checked)
 - **During a race the game loads `Routes<n>F.bin` or `Routes<n>B.bin` instead**: `B` when
   the race runs backwards, `F` otherwise (`0x57F4F0..0x57F579`). In free roam it loads
   `RoutesFreeRoam.bin`. A new road only gets traffic in races if it is also added to those
-  files. **[V]** code.
+  files. **[V]** code. Quick Race Free Run reads `Routes<n>F.bin` too (§6a).
+- **Traffic needs a TRAFFIC_TYPE zone** under the player, or the street empties after the
+  start (§6a). **[V]** code, in game.
 - **Writing is possible.** Records are reached by route id and node index, never by file
   offset. The file is read whole into a heap buffer whose size comes from the file. The game
   keeps pointers into that buffer (`0x5DE1C0`). Growing the file is fine within these limits
@@ -81,7 +86,7 @@ The chunks are top level and back to back: `0x34121`, `0x34122`, `0x34123`. Ther
 | 0x54 | f32 | 0 on 721 routes; on the other 134 it sits near the route's lowest height (6, 15, 19...), at overpasses and stacked roads | [I] |
 | 0x58 | u8 ×8 | 0 | |
 | 0x60 | f32 ×4 | **box** of both road edges: min x, min y, max x, max y, using node ± right × `+0x16` and node ∓ right × `+0x14` | [V] exact on all routes |
-| 0x70 | u32 | flags, `0x007FE141` in the file (`0x007FE541` on 215 laneless routes; bits 2 and 3 on a few). Bit 6 = active (recomputed from `+0x44`). Bits 1, 3, 4, 7, 9, 11 and 12 are rewritten at load | [V] `0x5D9650`, `0x5E4220`, `0x5EA020`, `0x5D9882` |
+| 0x70 | u32 | flags, `0x007FE141` in the file (`0x007FE541` on 215 laneless routes; bits 2 and 3 on a few). Bit 6 (`0x40`) = active (recomputed from `+0x44`); with `0x40` and without `0x200` the racing lines and speeds are computed at load. `0x200` keeps the file's lines and speeds and makes the route one way along it; `0x80` is the other way (§6a). Bits 1, 3, 4, 7, 9, 11 and 12 are rewritten at load | [V] `0x5D9650`, `0x5E4220`, `0x5EA020`, `0x5D9882`; `0x40`/`0x80`/`0x200` [V] code `0x5DDFC0`, `0x5E19E0` |
 | 0x74 | u32, f32, u32, f32 | `0x100, 999.0, 0x100, 999.0` | [?] constant |
 | 0x84 | u8 ×8 | **lane slot present**: 1 if any node has lane slot j, slots 0..3 forward and 4..7 backward. The nearest-road query `0x40F1B0` filters on "has any lane" (`0x5D4460`) | [V] 855/855; code `0x40F5B4` |
 
@@ -105,10 +110,10 @@ travel is `(dy, −dx)` (Z up, x east, y north).
 | 0x1C | u16 ×2 | **signpost slots**: index into `0x34122`, `0xFFFF` = empty; slot 1 always filled first. Values ≥ count are ignored | [V] 3289/3289 slots match their signpost's source; `0x5DE360` |
 | 0x20 | i8 | cross slope, probably ×1/128 | [I] |
 | 0x21 | i8 | slope along the road = 128·Δz/Δs to the next node | [V] all nodes within 2 units |
-| 0x22 | i8 ×2 | racing line, forward and backward: lateral offset / 128 × max(half-widths). Read like lane index 0/1 | [V] read by `0x401C40` index 0/1; meaning [I] |
+| 0x22 | i8 ×2 | racing line, forward and backward: lateral offset / 128 × max(half-widths). Read like lane index 0/1. On retail circuits line 0 is on the inside of corners and line 1 is its mirror (positive = right of travel) | [V] read by `0x401C40` index 0/1; meaning [I]; circuits [V] files |
 | 0x24 | i8 ×4 | **forward lanes**: offset = v/128 × max(`+0x14`, `+0x16`) m, positive = right of travel; `−1` = no lane | [V] `0x401C40`; edges contain 99.9% |
 | 0x28 | i8 ×4 | **backward lanes**, same units, measured in the reversed direction (positive = left of the node direction) | [V] fits the left half-width |
-| 0x2C | u8 ×2 | 100, 100 (racing-line speed) | [I] |
+| 0x2C | u8 ×2 | **racing-line speed** in m/s, the speed AI aims at on that line; 100 = no limit. 100, 100 in the free-roam files. Recomputed at load on routes with `0x40` and without `0x200`; kept from the file on `0x200` routes (§6a) | [V] code `sub_41C380`, `sub_40A6E0`; in game |
 | 0x2E | u8 ×8 | **lane speed**, per lane slot: 6 = unused, 6..20 used, lower on bends (mean 18 straight → 7 at 3°/m). Probably m/s | [V] read `0x401CA0`; unit [I] |
 | 0x36 | u16 | 0 (one node 0xC1) | |
 
@@ -201,14 +206,20 @@ following.
   | BANK | 59 |
 
   The four TRAFFIC_TYPE zones are large areas with parameters at `+0x30` (e.g. 0, 3, 6, 2).
-  A new road inside them gets that area's traffic setting [I].
+  A new road inside them gets that area's traffic setting [I]. A region needs at least one:
+  without a TRAFFIC_TYPE zone under the player, traffic is not re-placed after the start
+  (§6a). Full type list and what reads each type: `docs/NFSU2-FORMATS.md`, *Zone types*.
 - `0x3414D` barrier lines, 36 B: {f32 x0, y0, x1, y1; u8 0; u8 count 1..4; u8 flag (1, 0 on
   45); u8 0; u32 group-hash[4]}. The hashes are barrier group names, the same as L4RA.BUN
   `0x3412F`. L4RA has 1,788 lines and 125 groups. These are the race-only walls that AI
   steers around. **[V]** layout, byte-exact rebuild.
-- Race files only: `0x34148` race-path nodes (24 B), `0x34149` path segments (220 B),
-  `0x3414C` race outlines (272 B). They give the race distance (`+0x08` of route nodes, signpost
-  `+0`), not road topology. Byte-accounted as opaque records.
+- Race files only: `0x34148` path points (24 B), `0x34149` splines (220 B), `0x3414C`
+  courses (272 B, one per race). They give the race distance (`+0x08` of route nodes, signpost
+  `+0`), not road topology. Earlier byte-accounted as opaque records; their layouts and how the
+  course, laps and splits are built from them are now in `docs/NFSU2-FORMATS.md`, *Race routes
+  and track maps*. The `0x34148` links are indices into the point table itself, not into this
+  road graph. Without a `0x3414C` record for the race, `0x5E9E80` resets the signposts from the
+  authored nibbles (see §6a, crash `0x5E28FB`).
 
 ## 6. What the game recomputes at load (so the file need not be exact)
 
@@ -226,7 +237,80 @@ The post-load sequence is `0x5E9E80 → 0x5E9F2C..0x5EA0CF`. Each step **[V]**:
    region overlap are refreshed.
 
 Lengths, directions, slopes, box and lane flags are **not** recomputed. They must be right
-in the file, and `finish_route()` computes them.
+in the file, and `finish_route()` computes them. Racing lines and their speeds are, on most
+routes (§6a).
+
+## 6a. AI speed, racing lines and traffic at run time
+
+From porting other maps into the game; each item says how it was verified.
+
+### Racing lines and AI speed
+
+- AI aims at the speed byte of its line at node `+0x2C` (m/s), times `DifficultyInfo +0x538
+  + 104 * skill` (0.74 up to 1.0), times Car `+0x770` (catch-up; `sub_41C380` and its twins).
+  `FuturePoints` read the bytes and brake ahead of slow points (`sub_40A6E0`). **[V]** code.
+- **A route with flag `0x40` and without `0x200` gets its lines and speeds computed at load**
+  (`sub_5DDFC0`, `sub_5E8780`), whatever the file holds **[V]** code, in game:
+  1. the speeds start at the top speed of the slowest AI car's class (a table of 4 at
+     `0x88E990`; the class is at `0x88E994`);
+  2. they fall to `sqrt(grip * 9.8 / curvature)` (`sub_5D8F00`, grip 3.7 down to 2.8 by
+     class);
+  3. braking and acceleration limit them (`sub_5D4B80`, `sub_5D9070`).
+
+  With stock cars that plateaus at about 47 m/s, so AI holds about 125 km/h on any street.
+- **Flag `0x200` keeps the file's lines and speeds** and makes the route one way along it
+  (`sub_5E19E0`); `0x80` is the other way. Retail has `0x200` on fast roads with speed 100,
+  which means no limit: retail 4001 runs 170-200 km/h there. (The free-roam files counted in
+  §2 carry no `0x200`.) **[V]** code, in game.
+- Retail circuits: racing line 0 is on the inside of corners and line 1 is its mirror
+  (positive = right of travel). **[V]** files.
+- **Do not clear `0x40`.** Clearing it on a route crashed the game at load. Treat `0x40` as
+  required. **[V]** in game.
+
+### Crash `0x5E3F12`: racer links on traffic routes
+
+`sub_5E8780` gives every point of a traffic route a 400-byte record, with room for three
+racing lines per direction. Signposts that racers may take merge more lines into a point
+than that, and the record overflows. In free roam, keep the racer nibble (A) at 7 (never) on
+links that are only for traffic. **[V]** in game, code.
+
+### Traffic needs a TRAFFIC_TYPE zone
+
+After the start placement, traffic cars are re-placed only by
+`TrafficTeleporter::TryToTeleportCar`. It needs a TRAFFIC_TYPE zone (type 16, in
+`PathsFreeRoam.bin` `0x3414A`) under the player **[V]** code, in game:
+
+- Without one, `GetMinDistanceBetweenCars` returns 99999 and the teleporter gives up. Each car
+  then goes "off" (controller `+1916`) as it falls behind, and the street empties after the
+  start.
+- The teleporter places cars 250-500 m ahead, walking the route graph from the player's route
+  point (controller `+12`).
+- A new region needs at least one TRAFFIC_TYPE zone over its roads; one rectangle with
+  parameters 2, 5, 8, 1, like retail's small regions, works.
+
+Dead-end lane directions are normal: retail L4RA has 34, and the teleporter recycles cars the
+player cannot see. **[V]** files.
+
+### Which route file the game reads
+
+| Situation | File |
+|---|---|
+| Free roam (track 4000) | `RoutesFreeRoam.bin` |
+| A race | `Routes<n>F.bin` or `B` |
+| **Quick Race Free Run** | `Routes<n>F.bin`: `SetupFreeRun` makes a race of every track but 4000 |
+| FastTest / SkipFE dev races | `RoutesFreeRoam.bin` |
+
+**[V]** code, in game. So:
+
+- A new free-roam track listed in Quick Race needs copies of `RoutesFreeRoam.bin` as
+  `Routes<n>F.bin` and `B`, or it has no AI routes and no traffic.
+- A race file must hold every route its course and its signposts use. With no course record
+  (`0x3414C`), `sub_5E9E80` resets the signposts from the authored nibbles, and `sub_5E27D0`
+  follows them into routes the file lacks: crash at `0x5E28FB` reading `+0x70` of a null
+  route. (This narrows §3: race files may keep links into routes they leave out only while a
+  course record keeps the game off them. [I])
+- The game's autopilot (F6) crashes at `0x41C113` on a track with no routes (an AI controller
+  without route state).
 
 ## 7. How to write it
 
@@ -273,7 +357,10 @@ Use `tools/paths/nfsroutes.py`. Each step below names the helper that does it.
 7. **Rebuild** with `Network.to_bytes()`. The three chunk headers carry the new sizes and
    nothing else needs patching: no offsets, counts or grids outside the chunks. Run
    `Network.check()`.
-8. For race traffic, repeat in `Routes<n>F.bin` and `Routes<n>B.bin`. Optional.
+8. For race traffic, repeat in `Routes<n>F.bin` and `Routes<n>B.bin`. Optional, except that
+   Quick Race Free Run on a track also reads `Routes<n>F.bin` (§6a).
+9. Keep route flag `0x40` set (clearing it crashed the game at load), and keep the racer
+   nibble at 7 on links meant only for traffic (§6a).
 
 ### Splitting an existing edge
 
@@ -308,8 +395,8 @@ second (`road-paths-demo-junction.png`). **Not yet tried in game.**
 2. Node flag bits 12..17 and signpost bits 24..27: no reader found in the route code. The
    writer copies the common values (bit 12 = 1, others 0).
 3. A=4 links and the `+0x18` extras (lane-change windows?). The writer never makes type 4.
-4. Lane speed unit (m/s assumed) and the `+0x20` cross slope; header `+0x30`, `+0x54`,
-   `+0x74..+0x83`.
+4. Lane speed unit (m/s assumed; the racing-line speed `+0x2C` is m/s, §6a) and the `+0x20`
+   cross slope; header `+0x30`, `+0x54`, `+0x74..+0x83`.
 5. Whether the load-time pruning (`0x5E2130` loop, `0x5E15F0`) turns links into a new road
    into type 7 if it has a dead end. Avoid dead ends.
 

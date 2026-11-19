@@ -7,8 +7,7 @@ Chrystian Farias (FRS Mods). The editor opens the game's map, Palmont
 into the map's own files.
 
 - Branch: `nfsw-port`.
-- Based on upstream **0.2.1** (commit `af3e7c6`). Upstream has moved on to
-  0.2.7; those changes are **not merged** here.
+- Based on upstream **0.2.7** (tag `v0.2.7`, merged on 19 Nov 2026).
 - Licence: the same as upstream, [CC BY-NC 4.0](LICENSE). This file is the
   record of what the fork changed.
 - No game file is in this repository. You need your own copy of the game.
@@ -35,7 +34,8 @@ the game's files and keeps the shipped ones:
   files again from the two.
 - A section whose edits are all undone gets its shipped file back.
 - Save refuses while `nfsw.exe` runs: the game holds these files open.
-- The setup installs nothing for an NFS World folder.
+- The setup's "Your games" page has a row for Need for Speed World. Nothing is
+  installed into its folder.
 
 The readers branch on `nfs::IsWorld()` (`src/nfs/GameFormat.h`): NFS World keeps
 Underground 2's chunk ids but lays the records out differently.
@@ -86,7 +86,7 @@ source file give the offsets and the addresses.
 
 ### Tools
 
-`tools/nfsw` holds 103 scripts: format measurements (`*_stats.py`,
+`tools/nfsw` holds the scripts: format measurements (`*_stats.py`,
 `col_check.py`, `table_*.py`), scripted editor runs (`test_*.ps1`) and readers
 of what was written (`verify_*.py`). `verify_table.py` checks every written
 section against the section table of `L5RA.BUN`.
@@ -109,7 +109,8 @@ size of the entry, and `verify_table.py` checks it.
 
 ## Limitations
 
-- **Old base.** Upstream 0.2.1, not 0.2.7.
+- **Upstream 0.2.7's new tools on NFS World** (new regions, region import, the
+  model library across games) were not tried on an NFS World folder.
 - **Not written to NFS World:** roads, terrain, markers, traffic and GPS
   routes. Those tools show on the map but their bake is Underground 2's format.
 - **Publish World, `.frsworld` files and the game plugin** do not carry NFS
@@ -127,18 +128,17 @@ size of the entry, and `verify_table.py` checks it.
 - **Fast test** relies on `editor-fast-test.asi` to skip the title and the
   driver select. That ASI is not in this repository.
 - **Game look and sky** on NFS World were not compared with the game.
-- **Underground and Underground 2** were not run after the port's changes:
-  there was no copy of those games on the machine. The port branches on the
-  game, but regressions there are possible.
+- **Underground and Underground 2** were not run after the port's changes or
+  after the merge of 0.2.7: there was no copy of those games on the machine.
+  The port branches on the game, but regressions there are possible.
 - **One game build.** The addresses in the comments are from one `nfsw.exe`
   (32-bit, image base `0x400000`). Other builds were not checked.
 - **Weight.** The region takes about half a minute to load and about 3.5 GB of
   memory on the development machine.
-- **Stale text.** The setup wizard still says that new objects are not written
-  to NFS World. They are.
 - **Test scripts** have the development machine's paths in them
   (`D:\NFS World\...`). Change them before use.
-- **No release build.** Build from source as the README says.
+- **No release build.** This fork has no releases, so the README's download
+  links lead nowhere here. Build from source as the README says.
 
 ## Credits
 

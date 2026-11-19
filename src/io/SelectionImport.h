@@ -5,6 +5,7 @@
 #include "io/SectionEdits.h"
 #include "io/SectionSplice.h"
 
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -111,6 +112,11 @@ struct ImportSummary {
 // new; without one either, the import is refused.
 bool PlanImport(const nfs::World& world, const std::wstring& objPath, ImportPlan& plan,
                 const Vec3* newOrigin = nullptr);
+
+// Called by PlanImport before each object (done so far, of how many) when
+// set: a long import (a bake's hundreds of pieces) keeps a progress window
+// answering through it. Whoever sets it clears it.
+std::function<void(size_t, size_t)>& ImportProgress();
 
 // Writes the plan as overlay files under `gameFolder`\models.
 bool ApplyImport(const ImportPlan& plan, const std::wstring& gameFolder,

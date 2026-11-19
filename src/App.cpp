@@ -2,10 +2,13 @@
 #include "ui/DarkTheme.h"
 #include "ui/MainWindow.h"
 #include "ui/SetupWizard.h"
+#include "ui/U1Library.h"
 
 #include <windows.h>
 
 #include <algorithm>
+#include <string>
+#include <shellapi.h>
 
 // Opt in to the version 6 common controls so the tree view and status bar use
 // the current visual style instead of the Windows 95 look.
@@ -43,6 +46,20 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCommand) {
     if (RunInstallCommand(installResult)) {
         ::CoUninitialize();
         return installResult;
+    }
+
+    // A check of Need for Speed Underground's models, with no window.
+    {
+        int count = 0;
+        LPWSTR* args = ::CommandLineToArgvW(::GetCommandLineW(), &count);
+        const bool selfTest = args && count >= 3 && ::lstrcmpiW(args[1], L"--u1-selftest") == 0;
+        const std::wstring folder = selfTest ? args[2] : L"";
+        if (args) ::LocalFree(args);
+        if (selfTest) {
+            const int result = RunU1SelfTest(folder);
+            ::CoUninitialize();
+            return result;
+        }
     }
 
     MainWindow window;

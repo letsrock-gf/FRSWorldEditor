@@ -451,9 +451,300 @@ bool Quantise(float value, float scale, i16& out) {
     return true;
 }
 
+// --- rules for collision the editor writes ----------------------------------
+//
+// The game's ground lookup (TopologyCoordinate::NewGetElevation 0x5E72E0)
+// reads what retail's tool always writes and nothing else. These hold for
+// every shipped polygon; the editor's own polygons (drawn, imported, baked)
+// are brought to them on every encode of an edited pack. See
+// docs/NFSU2-FORMATS.md §5a, "Collision the game accepts".
+
+struct Plan { long x, y; };
+
+Plan PlanOf(const Vec3& v) { return { std::lround(v.x * 8.0f), std::lround(v.y * 8.0f) }; }
+bool SamePlanQ(const Plan& a, const Plan& b) { return a.x == b.x && a.y == b.y; }
+
+long long TwiceArea(const std::vector<Plan>& p) {
+    long long twice = 0;
+    for (size_t i = 0; i < p.size(); ++i) {
+        const Plan& a = p[i];
+        const Plan& b = p[(i + 1) % p.size()];
+        twice += (long long)a.x * b.y - (long long)b.x * a.y;
+    }
+    return twice;
+}
+
+long long Turn(const Plan& o, const Plan& a, const Plan& b) {
+    return (long long)(a.x - o.x) * (b.y - o.y) - (long long)(a.y - o.y) * (b.x - o.x);
+}
+
+void SetShape(CollisionPolygon& polygon, const Vec3* corners, int n) {
+    for (int c = 0; c < 4; ++c) polygon.corners[c] = corners[std::min(c, n - 1)];
+    polygon.quad = n == 4;
+    polygon.attributes[3] = (u8)((polygon.attributes[3] & ~kFlagQuad) | (polygon.quad ? kFlagQuad : 0));
+    polygon.SyncFromAttributes();
+}
+
+struct SanitiseCounts { size_t dropped = 0, snapped = 0, split = 0; };
+
+// A copy of `in` with:
+//  * no degenerate polygon once quantised (1/8 in plan, 1/256 in height):
+//    repeated corners go
+//    (a quad that loses one becomes a triangle, its third corner repeated),
+//    and a floor with no area left, or a wall or barrier with no length, is
+//    dropped -- retail has none, and a car touching one gets a NaN normal
+//    (random resets at walls);
+//  * walls standing upright: the corners of a rising edge that lie within
+//    0.15 m of each other in plan share x and y -- the contact normal comes
+//    from the polygon, so a wall leaning a few degrees launches the car (98 %
+//    of retail walls are exactly vertical; rounding alone leans thin ones);
+//  * floors convex: the inside test (max of the edge values <= 0) fails
+//    everywhere on a concave quad, so one is split at its reflex corner.
+// The grid ranks follow their polygons.
+CollisionPack Sanitise(const CollisionPack& in, SanitiseCounts& counts) {
+    CollisionPack out;
+    out.sectionNumber = in.sectionNumber;
+    out.gridWidth = in.gridWidth;
+    out.gridHeight = in.gridHeight;
+    out.gridOrigin = in.gridOrigin;
+    out.bounds = in.bounds;
+    out.edited = in.edited;
+    const bool ranked = in.gridRank.size() == in.polygons.size();
+    out.polygons.reserve(in.polygons.size());
+    const auto keep = [&](const CollisionPolygon& polygon, size_t from) {
+        out.polygons.push_back(polygon);
+        if (ranked) out.gridRank.push_back(in.gridRank[from]);
+    };
+
+    for (size_t i = 0; i < in.polygons.size(); ++i) {
+        CollisionPolygon polygon = in.polygons[i];
+        if (polygon.barrier) {
+            if (SamePlanQ(PlanOf(polygon.corners[0]), PlanOf(polygon.corners[2]))) { ++counts.dropped; continue; }
+            keep(polygon, i);
+            continue;
+        }
+        const int n = polygon.quad ? 4 : 3;
+
+        if (polygon.Vertical()) {
+            bool moved = false;
+            for (int a = 0; a < n; ++a)
+                for (int b = a + 1; b < n; ++b) {
+                    // A rising edge: the two ends far apart in height, close in plan.
+                    const Vec3 d = polygon.corners[b] - polygon.corners[a];
+                    const float plan2 = d.x * d.x + d.y * d.y;
+                    if (std::fabs(d.z) < 0.25f || plan2 > 0.15f * 0.15f) continue;
+                    // The top goes over the foot.
+                    const int foot = d.z > 0.0f ? a : b, top = d.z > 0.0f ? b : a;
+                    const Plan pf = PlanOf(polygon.corners[foot]), pt = PlanOf(polygon.corners[top]);
+                    if (!SamePlanQ(pf, pt)) {
+                        polygon.corners[top].x = pf.x / 8.0f;
+                        polygon.corners[top].y = pf.y / 8.0f;
+                        moved = true;
+                    }
+                }
+            counts.snapped += moved;
+            bool length = false;
+            for (int c = 1; c < n; ++c) length |= !SamePlanQ(PlanOf(polygon.corners[c]), PlanOf(polygon.corners[0]));
+            if (!length) { ++counts.dropped; continue; }
+            keep(polygon, i);
+            continue;
+        }
+
+        // A floor (or a ceiling, or a 0x08 face): its distinct corners as
+        // stored. (Two corners on one spot in plan at different heights are
+        // not repeated: retail has quads like that, a step folded into them.)
+        Vec3 corners[4];
+        Plan plans[4];
+        long heights[4];
+        int m = 0;
+        const auto same = [&](int i, const Plan& q, long z) { return SamePlanQ(plans[i], q) && heights[i] == z; };
+        for (int c = 0; c < n; ++c) {
+            const Plan q = PlanOf(polygon.corners[c]);
+            const long z = std::lround(polygon.corners[c].z * 256.0f);
+            if (m > 0 && same(m - 1, q, z)) continue;
+            corners[m] = polygon.corners[c];
+            plans[m] = q;
+            heights[m++] = z;
+        }
+        while (m > 1 && same(0, plans[m - 1], heights[m - 1])) --m;
+        const std::vector<Plan> outline(plans, plans + m);
+        const long long twice = m >= 3 ? TwiceArea(outline) : 0;
+        if (m < 3 || twice == 0) { ++counts.dropped; continue; }
+
+        if (m == 4) {
+            int reflex = -1;
+            for (int c = 0; c < 4; ++c) {
+                const long long t = Turn(plans[(c + 3) % 4], plans[c], plans[(c + 1) % 4]);
+                if ((twice > 0 && t < 0) || (twice < 0 && t > 0)) { reflex = c; break; }
+            }
+            if (reflex >= 0) {
+                // Two triangles from the reflex corner: both convex, same facing.
+                const Vec3 first[3]  = { corners[reflex], corners[(reflex + 1) % 4], corners[(reflex + 2) % 4] };
+                const Vec3 second[3] = { corners[reflex], corners[(reflex + 2) % 4], corners[(reflex + 3) % 4] };
+                CollisionPolygon a = polygon, b = polygon;
+                SetShape(a, first, 3);
+                SetShape(b, second, 3);
+                keep(a, i);
+                keep(b, i);
+                ++counts.split;
+                continue;
+            }
+        }
+        if (m != n) SetShape(polygon, corners, m);
+        keep(polygon, i);
+    }
+    return out;
+}
+
+// A floor in plan, counter-clockwise, for finding where two of them overlap.
+struct FloorOutline {
+    std::vector<Point2> ccw;
+    double x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    bool made = false;
+};
+
+const FloorOutline& OutlineOf(const CollisionPolygon& polygon, FloorOutline& slot) {
+    if (slot.made) return slot;
+    slot.made = true;
+    const int n = polygon.quad ? 4 : 3;
+    for (int c = 0; c < n; ++c) slot.ccw.push_back({ polygon.corners[c].x, polygon.corners[c].y });
+    double twice = 0.0;
+    for (size_t i = 0; i < slot.ccw.size(); ++i) {
+        const Point2& a = slot.ccw[i];
+        const Point2& b = slot.ccw[(i + 1) % slot.ccw.size()];
+        twice += a.x * b.y - b.x * a.y;
+    }
+    if (twice < 0.0) std::reverse(slot.ccw.begin(), slot.ccw.end());
+    slot.x0 = slot.y0 = 1e30;
+    slot.x1 = slot.y1 = -1e30;
+    for (const Point2& p : slot.ccw) {
+        slot.x0 = std::min(slot.x0, p.x); slot.x1 = std::max(slot.x1, p.x);
+        slot.y0 = std::min(slot.y0, p.y); slot.y1 = std::max(slot.y1, p.y);
+    }
+    return slot;
+}
+
+// Sutherland-Hodgman of one convex counter-clockwise polygon by another.
+std::vector<Point2> ClipConvex(const std::vector<Point2>& subject, const std::vector<Point2>& clip) {
+    std::vector<Point2> result = subject;
+    for (size_t e = 0; e < clip.size() && !result.empty(); ++e) {
+        const Point2 a = clip[e], b = clip[(e + 1) % clip.size()];
+        const auto side = [&](const Point2& p) { return (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x); };
+        std::vector<Point2> input;
+        input.swap(result);
+        for (size_t i = 0; i < input.size(); ++i) {
+            const Point2 p = input[i], q = input[(i + 1) % input.size()];
+            const double sp = side(p), sq = side(q);
+            if (sp >= 0.0) result.push_back(p);
+            if ((sp >= 0.0) != (sq >= 0.0)) {
+                const double t = sp / (sp - sq);
+                result.push_back({ p.x + (q.x - p.x) * t, p.y + (q.y - p.y) * t });
+            }
+        }
+    }
+    return result;
+}
+
+float FloorHeightAt(const CollisionPolygon& polygon, const Vec3& at) {
+    const Vec3* c = polygon.corners;
+    float z = 0.0f;
+    if (TriangleHeight(c[0], c[1], c[2], at, 0.0f, z)) return z;
+    if (polygon.quad && TriangleHeight(c[0], c[2], c[3], at, 0.0f, z)) return z;
+    if (TriangleHeight(c[0], c[1], c[2], at, 1e9f, z)) return z;
+    return c[0].z;
+}
+
+// Orders a cell's run of floors so that, wherever two overlap, the higher one
+// comes first. The game's walk ends at the first floor within 4 m under the
+// car (z + 1), so a lower floor listed first pulls a car on the upper one down
+// through it. One height per floor cannot decide this -- a ramp passing 1.5 m
+// over a flat floor can be lower on average -- so each overlapping pair is
+// compared at the centre of its overlap and the run sorted topologically,
+// keeping the present order wherever nothing overlaps. Floors stacked more
+// than 0.5 m apart are marked in `stacked`: they need flag 0x01 to compete by
+// height (without it the first one the point is strictly inside wins, at any
+// height -- a bridge deck becomes the ground of the street under it).
+template <typename It>
+void OrderStacked(It begin, It end, const CollisionPack& pack, std::vector<FloorOutline>& outlines,
+                  std::vector<char>& stacked) {
+    const size_t m = (size_t)(end - begin);
+    if (m < 2) return;
+    std::vector<std::vector<u32>> after(m);
+    std::vector<u32> incoming(m, 0);
+    bool any = false;
+    for (size_t i = 0; i < m; ++i) {
+        const u16 a = begin[i].first;
+        const FloorOutline& fa = OutlineOf(pack.polygons[a], outlines[a]);
+        for (size_t j = i + 1; j < m; ++j) {
+            const u16 b = begin[j].first;
+            const FloorOutline& fb = OutlineOf(pack.polygons[b], outlines[b]);
+            if (fa.x1 <= fb.x0 || fb.x1 <= fa.x0 || fa.y1 <= fb.y0 || fb.y1 <= fa.y0) continue;
+            const std::vector<Point2> overlap = ClipConvex(fa.ccw, fb.ccw);
+            if (overlap.size() < 3) continue;
+            double twice = 0.0, cx = 0.0, cy = 0.0;
+            for (size_t k = 0; k < overlap.size(); ++k) {
+                const Point2& p = overlap[k];
+                const Point2& q = overlap[(k + 1) % overlap.size()];
+                twice += p.x * q.y - q.x * p.y;
+                cx += p.x;
+                cy += p.y;
+            }
+            if (std::fabs(twice) < 0.02) continue;   // touching along an edge
+            const Vec3 centre{ (float)(cx / overlap.size()), (float)(cy / overlap.size()), 0.0f };
+            const float za = FloorHeightAt(pack.polygons[a], centre);
+            const float zb = FloorHeightAt(pack.polygons[b], centre);
+            if (std::fabs(za - zb) > 0.5f) stacked[a] = stacked[b] = 1;
+            if (std::fabs(za - zb) < 0.01f) continue;   // one surface: as listed
+            const size_t hi = za > zb ? i : j, lo = za > zb ? j : i;
+            after[hi].push_back((u32)lo);
+            ++incoming[lo];
+            any = true;
+        }
+    }
+    if (!any) return;
+
+    // Kahn's sort, the earliest listed first among the free ones; a cycle
+    // (three ramps crossing each other) is broken at its earliest member.
+    std::vector<typename std::iterator_traits<It>::value_type> sorted;
+    sorted.reserve(m);
+    std::vector<char> done(m, 0);
+    std::priority_queue<u32, std::vector<u32>, std::greater<u32>> ready;
+    for (u32 i = 0; i < m; ++i)
+        if (!incoming[i]) ready.push(i);
+    while (sorted.size() < m) {
+        if (ready.empty()) {
+            for (u32 i = 0; i < m; ++i)
+                if (!done[i]) { incoming[i] = 0; ready.push(i); break; }
+        }
+        const u32 i = ready.top();
+        ready.pop();
+        if (done[i]) continue;
+        done[i] = 1;
+        sorted.push_back(begin[i]);
+        for (u32 j : after[i])
+            if (!done[j] && incoming[j] > 0 && --incoming[j] == 0) ready.push(j);
+    }
+    std::copy(sorted.begin(), sorted.end(), begin);
+}
+
+bool EncodeChecked(const CollisionPack& pack, bool authored, std::vector<u8>& chunk, std::wstring& error);
+
 } // namespace
 
 bool EncodeCollision(const CollisionPack& pack, std::vector<u8>& chunk, std::wstring& error) {
+    // A pack read from the file and untouched is written exactly as it was.
+    // Any other -- edited here, or made from nothing -- is brought to the rules
+    // the game's lookup relies on first.
+    const bool authored = pack.edited || pack.gridRank.size() != pack.polygons.size();
+    if (!authored || pack.polygons.empty()) return EncodeChecked(pack, false, chunk, error);
+    SanitiseCounts counts;
+    const CollisionPack clean = Sanitise(pack, counts);
+    return EncodeChecked(clean, true, chunk, error);
+}
+
+namespace {
+
+bool EncodeChecked(const CollisionPack& pack, bool authored, std::vector<u8>& chunk, std::wstring& error) {
     const size_t count = pack.polygons.size();
 
     // An empty pack is a real thing the game ships: a one-cell grid at the
@@ -627,33 +918,27 @@ bool EncodeCollision(const CollisionPack& pack, std::vector<u8>& chunk, std::wst
         if (polygon.attributes[3] & 0x02) return 1;   // the bytes the encoder writes
         return (polygon.attributes[3] & 0x08) ? 3 : 0;
     };
-    // Within its ground, the game's wheel takes the FIRST face of the list
-    // that lies under it (or less than 1 m over it) and stops looking (MW's
-    // WWorldPos::FindClosestFace, the same scheme). Where two grounds overlap
-    // -- a new road over the old one, the start of a ramp -- the lower one
-    // listed first wins, and the wheel sinks through the upper one. Listed
-    // highest first, a wheel on the upper one finds it, and a wheel under it
-    // (a road under a bridge, more than 1 m below) skips it to the next.
-    const auto groundHeight = [&](u16 index) {
-        const CollisionPolygon& polygon = pack.polygons[index];
-        const int n = polygon.quad ? 4 : 3;
-        float sum = 0.0f;
-        for (int c = 0; c < n; ++c) sum += polygon.corners[c].z;
-        return sum / (float)n;
-    };
-    const auto byKindThenHeight = [&](const auto& a, const auto& b) {
-        const int ka = kind(a.first), kb = kind(b.first);
-        if (ka != kb) return ka < kb;
-        if (ka == 0 || ka == 3) return groundHeight(a.first) > groundHeight(b.first);
-        return false;
-    };
+    // The game's walk of a cell (NewGetElevation 0x5E72E0) ENDS at the first
+    // wall or 0x08 face (0x5E7554 test cl,0Ah / jnz to the end of the walk):
+    // every floor listed after one does not exist for the game. Within the
+    // floors, it ends at the first one within 4 m under the car (z + 1), so
+    // where two overlap the higher must come first (OrderStacked).
+    std::vector<FloorOutline> floorOutlines;
+    std::vector<char> stacked;
+    if (authored) {
+        floorOutlines.resize(count);
+        stacked.assign(count, 0);
+    }
     for (auto& cell : cells) {
-        if (pack.edited) {
+        if (authored) {
             if (ranked)
                 std::stable_sort(cell.begin(), cell.end(), [&](const auto& a, const auto& b) {
                     return pack.gridRank[a.first] < pack.gridRank[b.first];
                 });
-            std::stable_sort(cell.begin(), cell.end(), byKindThenHeight);
+            std::stable_sort(cell.begin(), cell.end(),
+                             [&](const auto& a, const auto& b) { return kind(a.first) < kind(b.first); });
+            const auto floorsEnd = std::find_if(cell.begin(), cell.end(), [&](const auto& e) { return kind(e.first) != 0; });
+            OrderStacked(cell.begin(), floorsEnd, pack, floorOutlines, stacked);
             continue;
         }
         if (ranked) {
@@ -668,6 +953,14 @@ bool EncodeCollision(const CollisionPack& pack, std::vector<u8>& chunk, std::wst
             std::stable_sort(cell.begin(), cell.end(),
                              [&](const auto& a, const auto& b) { return kind(a.first) < kind(b.first); });
     }
+
+    // Floors stacked over each other compete by height only with flag 0x01;
+    // retail sets it on 99 % of such floors, and on a floor alone at a point
+    // it changes nothing. (0x40 is left as it is: written on overlapping
+    // floors it lets a car step onto a floor 10-50 cm higher in one frame and
+    // launches it -- it is for deliberate painted overlays only.)
+    for (size_t i = 0; i < stacked.size(); ++i)
+        if (stacked[i]) records[i * kPolygonSize + kPolygonFlags] |= 0x01;
 
     std::vector<u8> refs, table((size_t)(width * height) * 4, 0);
     size_t first = 0;
@@ -712,5 +1005,7 @@ bool EncodeCollision(const CollisionPack& pack, std::vector<u8>& chunk, std::wst
     AppendChunk(chunk, kChunkCollisionPack, children);
     return true;
 }
+
+} // namespace
 
 } // namespace nfs

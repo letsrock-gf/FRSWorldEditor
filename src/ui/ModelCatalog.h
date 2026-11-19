@@ -33,6 +33,10 @@ public:
         bool mine = false;          // made in this editor (FRS_)
         bool used = false;          // placed somewhere by the map
         bool library = false;       // stored in the library, so placeable anywhere
+        // The game the model comes from ("Underground 2"); `foreign` when
+        // that is not the region's own (nfs/ForeignModels.h).
+        std::wstring game;
+        bool foreign = false;
         // A row an extension added (ui/EditorExtension.h): not a region
         // model but something of the extension's own, named by `key`. Its
         // shelf, when not one of the region's, is listed first.
@@ -59,6 +63,12 @@ public:
     void SetExtraRows(std::function<void(std::vector<Row>&)> rows) { extraRows_ = std::move(rows); }
     void Refresh() { SetWorld(world_); }
     void ShowShelf(const std::wstring& group);
+
+    // Only the models of one game ("Underground 1"); empty for every game.
+    void SetGameFilter(const std::wstring& game);
+    const std::wstring& GameFilter() const { return gameFilter_; }
+    // The games the catalogue has models of, the region's first.
+    std::vector<std::wstring> Games() const;
 
     // Messages from the attached controls. True when the catalogue used it.
     bool OnCommand(HWND control, int notification);
@@ -92,6 +102,7 @@ private:
     std::vector<size_t> shown_;
     std::vector<Shelf>  shelfList_;
     std::wstring        wantedShelf_;
+    std::wstring        gameFilter_;
 
     ModelThumbnailFn thumbnail_;
     HIMAGELIST images_ = nullptr;
