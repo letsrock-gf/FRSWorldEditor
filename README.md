@@ -140,8 +140,9 @@ the entry, and `verify_table.py` checks it.
 
 ## Limitations
 
-- **One game build.** The addresses the port was matched against are from one
-  `nfsw.exe` (32-bit, image base `0x400000`). Other builds were not checked.
+- **One game build.** The port was matched against one `nfsw.exe` (32-bit, MD5
+  `4c32936debffcbdc208d39502b79a56f`). The setup says so when yours is another
+  build; no other build was checked.
 - **Not written to NFS World:** roads, terrain, markers, traffic and GPS
   routes. Those tools show on the map but their bake is Underground 2's format.
 - **Publish World, `.frsworld` files and the game plugin** do not carry NFS

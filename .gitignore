@@ -2,6 +2,8 @@ build/
 build-*/
 out/
 dist/
+# captures the test scripts leave beside themselves
+tools/nfsw/*.png
 third_party/asi-loader/
 *.log
 *.user

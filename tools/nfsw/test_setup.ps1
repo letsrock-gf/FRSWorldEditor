@@ -1,6 +1,6 @@
 # Captures the setup wizard's first page (build-test copy, posted messages, no focus) to check the row of each
 # game. The wizard is never finished: the editor is closed while the page is up, so nothing is stored.
-param([string]$Out)
+param([string]$Out, [string]$World)
 $d = "$(Split-Path (Split-Path $PSScriptRoot))\build-test\bin\Release"
 $log = "$d\FRSWorldEditor.log"
 Add-Type -AssemblyName System.Drawing
@@ -21,6 +21,14 @@ public static class Setup {
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr h, System.Text.StringBuilder b, int n);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessageW(IntPtr h, uint msg, IntPtr w, System.Text.StringBuilder l);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "SendMessageW")] public static extern IntPtr SetText(IntPtr h, uint msg, IntPtr w, string l);
+    [DllImport("user32.dll")] public static extern int GetDlgCtrlID(IntPtr h);
+    // The control with that id anywhere under `top` (the page is a child dialog of the wizard).
+    public static IntPtr Child(IntPtr top, int id) {
+        IntPtr found = IntPtr.Zero;
+        EnumChildWindows(top, (h, l) => { if (GetDlgCtrlID(h) == id) { found = h; return false; } return true; }, IntPtr.Zero);
+        return found;
+    }
     public static List<IntPtr> Tops(uint pid) {
         var found = new List<IntPtr>();
         EnumWindows((h, l) => { uint owner; GetWindowThreadProcessId(h, out owner);
@@ -67,5 +75,12 @@ if (-not $wizard) { "no wizard window" } else {
     $g.ReleaseHdc($dc); $g.Dispose()
     $bmp.Save("$Out\setup-games.png", [System.Drawing.Imaging.ImageFormat]::Png); $bmp.Dispose()
     "saved $Out\setup-games.png"
+    # -World <folder>: that folder typed into Need for Speed World's row, and what the row then says.
+    if ($World) {
+        [Setup]::SetText([Setup]::Child($h, 2720), 0x000C, [IntPtr]::Zero, $World) | Out-Null   # IDC_SETUP_NFSW_PATH
+        Start-Sleep -Seconds 2
+        "with ${World}:"
+        [Setup]::Texts($h) | Where-Object { $_ -match 'Found|Not this|Not set\.$' } | ForEach-Object { "  | $_" }
+    }
 }
 Stop-Process -Id $p.Id -Force

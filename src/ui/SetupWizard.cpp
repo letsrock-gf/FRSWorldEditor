@@ -96,6 +96,15 @@ bool SupportedExecutable(const std::wstring& folder) {
     return md5 == expected;
 }
 
+// The nfsw.exe the NFS World port was made on: the layouts it writes were
+// matched against this build's loaders. Another build may read them the same
+// way, but nobody has checked.
+constexpr wchar_t kWorldMd5[] = L"4c32936debffcbdc208d39502b79a56f";
+
+bool MatchedWorldExecutable(const std::wstring& folder) {
+    return ::_wcsicmp(Md5OfFile(folder + L"\\nfsw.exe").c_str(), kWorldMd5) == 0;
+}
+
 // The ASI loader already in the game folder, or empty.
 std::wstring AsiLoaderIn(const std::wstring& folder) {
     for (const wchar_t* name : kAsiLoaderNames)
@@ -396,7 +405,10 @@ std::wstring DescribeRow(int row, const std::wstring& folder) {
     }
     if (row == kRowUnderground1) return L"Found. Its models are in the library; its worlds open to look at and export.";
     if (row == kRowMostWanted) return L"Found. Its worlds open to look at and export.";
-    if (row == kRowWorld) return L"Found. It needs no plugin: Save writes your edits into the map's own files.";
+    if (row == kRowWorld)
+        return MatchedWorldExecutable(folder)
+                   ? L"Found. It needs no plugin: Save writes your edits into the map's own files."
+                   : L"Found, but another nfsw.exe build than the port was made on: back up TRACKS before saving.";
     std::wstring text = SupportedExecutable(folder) ? L"Found, v1.2." : L"Found, not v1.2: the plugins leave it alone.";
     std::vector<std::wstring> present;
     if (WorldLoaderInstalled(folder)) present.push_back(L"FRS World Loader");
