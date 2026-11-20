@@ -164,8 +164,12 @@ the entry, and `verify_table.py` checks it.
   game may still show the shipped shape. Models whose vertices are
   integer-packed (effects 8 and 9) are not written.
 - **New textures:** at most 512 px a side, DXT1 or DXT5.
-- **Collision outside every box:** the nearest box grows by 200 m at most. Past
-  that the polygon is left out of the save and the status bar counts it.
+- **Collision outside every box:** the nearest box grows to hold it, anywhere
+  inside the game's collision grid (96 m cells, 7680 m by 11040 m over the
+  map). Outside the grid the game has nowhere to look, so the polygon is left
+  out of the save and the status bar counts it. One box holds about 1600
+  triangles; a save that would pass that is refused with a message. Ground in
+  a grown box has scripted checks only: nobody has driven on it yet.
 - **Culling tree:** the game walks it with a 64-entry stack. A save that would
   pass it is refused, and the message names the section and the object.
 - **Launch Game / Fast test** were tried only on the author's setup. The

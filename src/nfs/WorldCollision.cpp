@@ -53,6 +53,17 @@
 
 namespace nfs {
 namespace {
+// The collision grid of the region (L5RA.BUN CGrd): 96 m cells, 80 across x
+// from -5088 and 115 along z from 0, in collision axes (x = -game y, z = game
+// x). The game finds collision through it, so it is also where collision can be.
+constexpr float kGridOriginX = -5088.0f, kGridOriginZ = 0.0f, kGridCell = 96.0f;
+constexpr int kGridColumns = 80, kGridRows = 115;
+
+bool InCollisionGrid(float x, float z) {
+    return x >= kGridOriginX && x < kGridOriginX + kGridCell * kGridColumns &&
+           z >= kGridOriginZ && z < kGridOriginZ + kGridCell * kGridRows;
+}
+
 
 constexpr u32 kTagPack     = 0x43415250;   // 'CARP'
 constexpr u32 kTagArticles = 0x41727469;   // 'Arti'
@@ -683,13 +694,18 @@ bool RewriteWorldCollision(ByteSpan whole, const CollisionPack& pack, const std:
                     if (!pieces.empty()) jobs.push_back({ (int)i, std::move(pieces) });
                 }
             // Held by no box (a barrier, or ground outside them all): the nearest
-            // box in plan grows to hold it. The grid and the radius follow below
-            // (AddToCollisionGrid, +0x3C), so the game reaches it there.
-            // ponytail: grows at most kGrowLimit; past that it stays left out.
-            constexpr float kGrowLimit = 200.0f;
-            if (jobs.empty() && !foreign) {
+            // box in plan grows to hold it, however far. The grid and the radius
+            // follow below (AddToCollisionGrid, +0x3C), so the game reaches it
+            // there. Outside the grid the game has no cell to look in: such a
+            // polygon cannot be reached and stays left out.
+            // ponytail: one box stretched over the gap; an instance and article of
+            // its own when far-away ground fills an article (about 1600 triangles).
+            bool reachable = true;
+            for (int k = 0; k < count && reachable; ++k)
+                reachable = InCollisionGrid(-points[k].y, points[k].x);
+            if (jobs.empty() && !foreign && reachable) {
                 int nearest = -1;
-                float gap = kGrowLimit;
+                float gap = 1e30f;
                 for (size_t i = 0; i < instanceCount; ++i) {
                     if (!usable(i)) continue;
                     const size_t at = i * kInstanceSize;
@@ -894,8 +910,8 @@ bool RewriteWorldCollision(ByteSpan whole, const CollisionPack& pack, const std:
 // SimSurface::kNull there and is reset). Every cell a grown box touches gets it.
 // Grid origin and size: L5RA.BUN CGrd (x -5088, z 0, 96 m, 80 x 115 cells).
 bool AddToCollisionGrid(ByteSpan raw, const std::vector<GridEntry>& entries, std::vector<u8>& out) {
-    constexpr float kOriginX = -5088.0f, kOriginZ = 0.0f, kCell = 96.0f;
-    constexpr int kColumns = 80, kRowsZ = 115;
+    constexpr float kOriginX = kGridOriginX, kOriginZ = kGridOriginZ, kCell = kGridCell;
+    constexpr int kColumns = kGridColumns, kRowsZ = kGridRows;
     size_t filler = 0;
     while (filler < 16 && filler < raw.size && raw.data[filler] == 0x11) ++filler;
     const ByteSpan data = raw.sub(filler, raw.size);
