@@ -2081,6 +2081,7 @@ bool MainWindow::WriteLaunchPose(const std::wstring& path) {
 // NFS World: no plugin to switch on and no embedded window. The edits are
 // saved into the game's files, the pose goes where editor-fast-test.asi reads
 // it once the car is in free roam, and the game starts through the project's
+// player's own <game>\editor-launch.cmd, or without one through the project's
 // offline launcher (scripts\launch-offline.cjs beside the game folder). The
 // ASI passes the title and the driver select by code whenever the request
 // file is there, so one is always left: the pose, or "menus" without it.
@@ -2123,11 +2124,20 @@ void MainWindow::LaunchWorldGame() {
         return;
     }
 
+    // How the game is started is the player's own business: <game>\editor-launch.cmd
+    // when it is there (their launcher, or nfsw.exe with their server's arguments),
+    // else the offline launcher of the project the port was made in.
     const std::wstring root = gameFolder_.substr(0, gameFolder_.find_last_of(L'\\'));
+    const std::wstring custom = gameFolder_ + L"\\editor-launch.cmd";
     const std::wstring launcher = root + L"\\scripts\\launch-offline.cjs";
-    if (::GetFileAttributesW(launcher.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        ::MessageBoxW(window_, Format(L"The offline launcher was not found:\n%s", launcher.c_str()).c_str(),
-                      kWindowTitle, MB_ICONWARNING | MB_OK);
+    const bool hasCustom = ::GetFileAttributesW(custom.c_str()) != INVALID_FILE_ATTRIBUTES;
+    if (!hasCustom && ::GetFileAttributesW(launcher.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        ::MessageBoxW(window_,
+                      Format(L"The editor does not know how to start your game.\n\nPut a file named "
+                             L"editor-launch.cmd in the game folder, holding the command that starts the "
+                             L"game: your launcher, or nfsw.exe with your server's arguments.\n\n%s",
+                             custom.c_str()).c_str(),
+                      kWindowTitle, MB_ICONINFORMATION | MB_OK);
         return;
     }
 
@@ -2147,17 +2157,19 @@ void MainWindow::LaunchWorldGame() {
 
     // Its own console, minimised: the launcher keeps the offline server up
     // while the game runs and prints why when it cannot start it.
-    std::wstring command = L"node \"" + launcher + L"\" --game-dir \"" + gameFolder_ + L"\"";
+    std::wstring command = hasCustom ? L"cmd.exe /d /c \"\"" + custom + L"\"\""
+                                     : L"node \"" + launcher + L"\" --game-dir \"" + gameFolder_ + L"\"";
     STARTUPINFOW startup{ sizeof(startup) };
     startup.dwFlags = STARTF_USESHOWWINDOW;
     startup.wShowWindow = SW_SHOWMINNOACTIVE;
     PROCESS_INFORMATION process{};
     if (!::CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NEW_CONSOLE, nullptr,
-                          root.c_str(), &startup, &process)) {
+                          (hasCustom ? gameFolder_ : root).c_str(), &startup, &process)) {
         LOG_WARN("launch: could not run %S (error %lu)", command.c_str(), ::GetLastError());
         ::DeleteFileW(posePath.c_str());
-        ::MessageBoxW(window_, Format(L"Could not run\n%s\n\nIs Node.js installed and on the PATH?",
-                                      command.c_str()).c_str(), kWindowTitle, MB_ICONWARNING | MB_OK);
+        ::MessageBoxW(window_, Format(L"Could not run\n%s%s", command.c_str(),
+                                      hasCustom ? L"" : L"\n\nIs Node.js installed and on the PATH?").c_str(),
+                      kWindowTitle, MB_ICONWARNING | MB_OK);
         return;
     }
     ::CloseHandle(process.hThread);

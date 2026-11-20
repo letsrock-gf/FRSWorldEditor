@@ -77,8 +77,10 @@ Save refuses while `nfsw.exe` runs: the game holds the map's files open.
   started.
 - **View > Clip Start / End and Detail**, to draw less of a large map.
 - **Launch Game / Fast test** on an NFS World folder start the real game (the
-  original's built-in drive mode needs Underground 2's `SPEED2.EXE`). See the
-  limitations: this needs two pieces that are not in the package.
+  original's built-in drive mode needs Underground 2's `SPEED2.EXE`), with
+  your own command (`editor-launch.cmd`), and a small ASI takes it straight
+  into free roam with the car at the editor's camera. See the limitations for
+  the three things to set up.
 
 ### Tools
 
@@ -126,8 +128,10 @@ has only scripted checks.
   came out byte for byte as the build before the merge had written them, and
   `verify_table.py` found an entry for all 469 sections.
 - **In game.** Ground collision added in the editor (a speed bump) is driven
-  over without bouncing. The fast-test ASI reaches free roam with no input,
-  with and without a car position (started by script, on the author's setup).
+  over without bouncing. The fast-test ASI, as built from `fasttest-nfsw`,
+  reaches free roam with no input, with and without a car position (started
+  by script, on the author's setup). The editor running an `editor-launch.cmd`
+  has a scripted check only.
 - **Not confirmed in game, item by item:** placed objects and their physics,
   edited and new models, new textures, walls after the one-side fix, key `I`,
   the grown `L5RA.BUN`.
@@ -157,13 +161,19 @@ the entry, and `verify_table.py` checks it.
   that the polygon is left out of the save and the status bar counts it.
 - **Culling tree:** the game walks it with a 64-entry stack. A save that would
   pass it is refused, and the message names the section and the object.
-- **Launch Game / Fast test** work only on the author's setup so far. The
-  editor starts the game through an offline launcher script it expects beside
-  the game folder (`..\scripts\launch-offline.cjs`, run with Node.js), and a
-  small ASI in the game's `scripts` folder passes the title and the driver
-  select and puts the car at the editor's camera. Neither is in this
-  repository or in the package; without the launcher the editor says so and
-  starts nothing. The game's own loading screens are never skipped.
+- **Launch Game / Fast test** need setting up by hand (the setup does not do
+  it), and were tried only on the author's setup:
+  1. an ASI loader in the game folder, for example
+     [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader);
+  2. `editor-fast-test.asi` copied to the game's `scripts` folder. It is in
+     the package under `game\scripts`; its source is in `fasttest-nfsw`;
+  3. a file named `editor-launch.cmd` in the game folder, holding the command
+     that starts your game: your launcher, or `nfsw.exe` with your server's
+     arguments. Without it the editor says so and starts nothing.
+
+  The ASI passes the title and the driver select by code and puts the car at
+  the editor's camera. It checks the hash of `nfsw.exe` and does nothing on
+  another build. The game's own loading screens are never skipped.
 - **Game look and sky** on NFS World were not compared with the game.
 - **The original's newest tools on NFS World** (new regions, region import,
   the model library across games) were not tried on an NFS World folder. The
@@ -207,8 +217,16 @@ cmake -S . -B build -G "Visual Studio 18 2026" -A x64
 cmake --build build --config Release
 ```
 
-`package-nfsw.ps1` builds the release (without New Region / Import Region, as
-the original's releases) and writes the folder and the zip to `dist\`.
+The game is 32-bit, so the fast-test ASI is built for Win32 (MinHook is
+downloaded at its 1.3.4 tag; the build runs the ASI's own self-test):
+
+```
+cmake -S fasttest-nfsw -B fasttest-nfsw/build -G "Visual Studio 18 2026" -A Win32
+cmake --build fasttest-nfsw/build --config Release
+```
+
+`package-nfsw.ps1` builds both (the editor without New Region / Import Region,
+as the original's releases) and writes the folder and the zip to `dist\`.
 `package.ps1` is the original's and also builds the Underground 2 plugins,
 from repositories that are not here.
 

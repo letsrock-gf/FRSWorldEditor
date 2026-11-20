@@ -2,6 +2,7 @@
 #
 #   dist\FRSWorldEditor-NFSW-<version>\     what a player unzips anywhere
 #       FRSWorldEditor.exe                  the editor; nothing is installed into NFS World
+#       game\scripts\editor-fast-test.asi   for Launch Game: copied into the game by hand
 #       README.txt, LICENSE.txt
 #   dist\FRSWorldEditor-NFSW-<version>.zip  the same, zipped
 #
@@ -12,7 +13,8 @@
 # New Region / Import Region, as the original's package.ps1 does. The
 # Underground 2 plugins are not in it: that package is the original's.
 
-param([string]$Version = "0.2.7-nfsw.1")
+# -MinHook <folder>: a copy of MinHook 1.3.4 on disk, instead of downloading it.
+param([string]$Version = "0.2.7-nfsw.2", [string]$MinHook)
 
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
@@ -29,9 +31,20 @@ if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
 & $cmake --build (Join-Path $root "build-release") --config Release | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "build failed" }
 
+"[..] building editor-fast-test.asi (Win32, like the game)"
+$fast = Join-Path $root "fasttest-nfsw"
+$options = @()
+if ($MinHook) { $options += "-DFETCHCONTENT_SOURCE_DIR_MINHOOK=$($MinHook -replace '\\', '/')" }
+& $cmake -S $fast -B (Join-Path $fast "build") -G "Visual Studio 18 2026" -A Win32 -Wno-dev -Wno-deprecated @options | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "cmake configure failed for fasttest-nfsw" }
+& $cmake --build (Join-Path $fast "build") --config Release | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "build or self-test failed for fasttest-nfsw" }
+$minhookLicense = if ($MinHook) { Join-Path $MinHook "LICENSE.txt" } else { Join-Path $fast "build\_deps\minhook-src\LICENSE.txt" }
+
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
-New-Item -ItemType Directory -Force -Path $stage | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $stage "game\scripts") | Out-Null
 Copy-Item (Join-Path $root "build-release\bin\Release\FRSWorldEditor.exe") $stage
+Copy-Item (Join-Path $fast "build\Release\editor-fast-test.asi") (Join-Path $stage "game\scripts")
 
 $readme = @(
     "FRS World Editor -- NFS World port $Version",
@@ -50,6 +63,15 @@ $readme = @(
     "5. Ctrl+Shift+S writes your edits into the game. The shipped files are kept in",
     "   TRACKS\frs-original.",
     "",
+    "Launch Game / Fast test (optional) start your game from the editor, pass the",
+    "title and the driver select and put the car at the editor's camera. They need:",
+    "  a. an ASI loader in the game folder (for example Ultimate ASI Loader);",
+    "  b. game\scripts\editor-fast-test.asi of this package copied to the game's",
+    "     scripts folder;",
+    "  c. a file named editor-launch.cmd in the game folder, holding the command",
+    "     that starts your game: your launcher, or nfsw.exe with your server's",
+    "     arguments.",
+    "",
     "What works, what was tested and what does not work yet is on the port's page.",
     "For Need for Speed Underground 2, use the original: this package does not carry",
     "its plugins.",
@@ -63,7 +85,7 @@ $rule = "=" * 76
 $license = @(
     "FRS World Editor -- NFS World port $Version",
     "",
-    "This package holds works under three licenses.",
+    "This package holds works under four licenses.",
     "",
     $rule,
     "1. FRS World Editor (FRSWorldEditor.exe), by Chrystian Farias",
@@ -94,7 +116,14 @@ $license = @(
     "4. Phosphor Icons, compiled into FRSWorldEditor.exe -- MIT",
     $rule,
     "",
-    (Get-Content (Join-Path $root "third_party\phosphor\LICENSE") -Raw).TrimEnd()
+    (Get-Content (Join-Path $root "third_party\phosphor\LICENSE") -Raw).TrimEnd(),
+    "",
+    $rule,
+    "5. MinHook, by Tsuda Kageyu, compiled into game\scripts\editor-fast-test.asi",
+    "   BSD 2-Clause",
+    $rule,
+    "",
+    (Get-Content $minhookLicense -Raw).TrimEnd()
 )
 ($license -join "`r`n") + "`r`n" | Set-Content (Join-Path $stage "LICENSE.txt") -Encoding utf8 -NoNewline
 
