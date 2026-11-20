@@ -1,236 +1,233 @@
-<p align="center"><img src="docs/cover.png" alt="FRS World Editor: a world editor for the Black Box Need for Speed games"></p>
+# FRS World Editor -- NFS World port
 
-<p align="center">
-  <a href="https://discord.gg/jTKwQXYQkb"><img src="https://img.shields.io/badge/Discord-join%20the%20community-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
-  <a href="../../releases/latest"><img src="https://img.shields.io/github/v/release/chrystianfarias/FRSWorldEditor?label=download" alt="Latest release"></a>
-</p>
+A fork of **[FRS World Editor](https://github.com/chrystianfarias/FRSWorldEditor)**
+by Chrystian Farias (FRS Mods) that adds **Need for Speed World**. It opens the
+game's map, Palmont, straight from the game's files, and **Save writes your
+edits into the map's own files**, keeping the shipped ones.
 
-# FRS World Editor
+The original editor is for the Black Box Need for Speed games (Underground 2
+today, others on the way) and is where the editor itself comes from: this fork
+is the original at **0.2.7** plus the NFS World work described below. For
+Underground 2, use [the original](https://github.com/chrystianfarias/FRSWorldEditor).
 
-> **This is a fork: the Need for Speed World port** of
-> [chrystianfarias/FRSWorldEditor](https://github.com/chrystianfarias/FRSWorldEditor),
-> on the branch `nfsw-port`, based on upstream 0.2.7. It opens Palmont and writes
-> edits into NFS World's own map files. What changed, what was tested and what
-> does not work yet: **[NFSW-PORT.md](NFSW-PORT.md)**. The rest of this page is
-> upstream's; this fork has no releases, so build it from source.
+> Fan project, not affiliated with or endorsed by Electronic Arts. No game file
+> is in this repository or in its packages: you need your own copy of the game.
 
-An open-source world editor for the **Black Box Need for Speed games** --
-Underground, Underground 2, Most Wanted, Carbon and ProStreet
+- [Download and first run](#download-and-first-run)
+- [What this version adds](#what-this-version-adds)
+- [How saving works on NFS World](#how-saving-works-on-nfs-world)
+- [What was checked where](#what-was-checked-where)
+- [Limitations](#limitations)
+- [The original editor](#the-original-editor)
+- [Building](#building)
+- [Credits and licence](#credits-and-licence)
 
-These games share one engine family and much of its file formats: track
-streams split into sections, chunked geometry and texture packs, collision
-packs, visibility zones, road and route graphs. The editor reads each game's
-own files directly -- nothing is converted or imported first -- so what the
-viewport draws is what the game ships. What you change goes to
-`<game>\models`, never into the game's files, and a small ASI plugin puts it
-into the game as it loads.
+## Download and first run
 
-**Need for Speed Underground 2 is supported today**; the other games are on
-the way, starting with Underground. The table below shows where each one is.
+1. Get the zip from the [Releases](../../releases) page and unzip it anywhere.
+   It holds `FRSWorldEditor.exe` and nothing to install.
+2. **Back up your game's `TRACKS` folder first.** The editor keeps the shipped
+   files by itself (see below), but this is a port still being tested.
+3. Close the game, run `FRSWorldEditor.exe`, and on the setup's "Your games"
+   page give the folder that holds `nfsw.exe` in the **Need for Speed World**
+   row. Nothing is installed into the game.
+4. The window shows at once and the map loads after it: about half a minute and
+   about 3.5 GB of memory on the development machine.
+5. Right mouse looks around, `W` `A` `S` `D` moves, `Q` / `E` down / up, Shift
+   faster. Edit, then **Ctrl+Shift+S** writes the edits into the game.
 
-**[Download the latest release](../../releases/latest)** -- unzip, run
-`FRSWorldEditor.exe`, and the setup does the rest.
+Save refuses while `nfsw.exe` runs: the game holds the map's files open.
 
-Questions, bugs, ideas, or something you built: join the **[official Discord](https://discord.gg/jTKwQXYQkb)**.
+## What this version adds
 
-If the editor helps you, you can [buy me a coffee](https://buymeacoffee.com/chrystianfarias).
+### Reading and viewing
 
-## Games
+- The whole region (`L5RA`): map sections, models, texture packs, scenery
+  placements.
+- Collision: all 747 packs of `STREAML5RA_25000.BUN`, ground triangles and wall
+  barriers.
+- Visibility outlines and animated scenery, view only.
+- Game look: a reader for the `timeofdaylighting` and `sunandsky` classes of
+  `GLOBAL\attributes.bin`.
 
-✅ ready &nbsp; 🚧 in progress &nbsp; 🗓️ planned &nbsp; — not in that game
+### Edits written into the game
 
-| Feature | Underground | Underground 2 | Most Wanted | Carbon | ProStreet |
-| --- | :---: | :---: | :---: | :---: | :---: |
-| View the world as shipped (geometry, textures, scenery, lighting) | 🚧 | ✅ | 🗓️ | 🗓️ | 🗓️ |
-| Sky, animated textures, object animations | 🗓️ | ✅ | 🗓️ | 🗓️ | 🗓️ |
-| Place, move, copy and remove objects | 🗓️ | ✅ | 🗓️ | 🗓️ | 🗓️ |
-| Mesh editor and OBJ export / import | 🗓️ | ✅ | 🗓️ | 🗓️ | 🗓️ |
-| Edit in Blender, new objects | 🗓️ | ✅ | 🗓️ | 🗓️ | 🗓️ |
-| Collision: view, draw, edit, make from meshes | 🗓️ | ✅ | 🗓️ | 🗓️ | 🗓️ |
-| Roads: draw, junctions, bridges, bake into the game | 🗓️ | ✅ | 🗓️ | 🗓️ | 🗓️ |
-| Traffic and GPS routes for new roads | 🗓️ | ✅ | 🗓️ | 🗓️ | 🗓️ |
-| Terrain: new patches, sculpting, fitting to roads | 🗓️ | ✅ | 🗓️ | 🗓️ | 🗓️ |
-| Visibility zones: view and edit | 🗓️ | ✅ | 🗓️ | 🗓️ | 🗓️ |
-| Named zones and quick travel | — | ✅ | 🗓️ | 🗓️ | — |
-| Worlds: separate sets of edits, per-edit revert, undo | 🗓️ | ✅ | 🗓️ | 🗓️ | 🗓️ |
-| Game plugin: edits loaded into the running game | 🗓️ | ✅ | 🗓️ | 🗓️ | 🗓️ |
-| Launch the game into free roam at the camera | — | ✅ | 🗓️ | 🗓️ | — |
-
-Underground and ProStreet have no free roam: in those games the editor will
-launch into a race instead.
-
-## What it does (Underground 2)
-
-- **The whole city, as shipped.** Every region, its objects, scenery,
-  textures and baked night lighting, with a free-flight camera, the skybox,
-  animated textures and the game's object animations (doors, planes, cranes,
-  trams). Textured, unlit, vertex-colour and wireframe views, collision
-  overlay, texture browser.
-- **Objects.** Place any model of the region from a catalogue with a picture of
-  each, sorted into shelves (buildings, lights, signs, fences, trees, vehicles...),
-  then move, rotate, snap to
-  the ground, copy and paste, move or remove shipped objects (a moved one is replaced by a placement of the same model). Every
-  edit is listed and can be reverted one by one.
-- **Meshes and collision.** Export a selection to OBJ, edit it in any 3D
-  tool, import it back -- geometry, textures and collision.
-- **Collision tools.** The Collision menu draws collision straight onto the
-  map: barriers (no height limit), walls with a real height, and ground from
-  an outline, each snapping to the corners already there. Selected collision
-  can be moved (G), deleted (Del) and given another surface -- road, grass,
-  sidewalk, metal... -- in the properties panel; Ctrl+Z undoes. Polygons along
-  a section edge are kept by both neighbours, and every edit reaches both.
-  Selected objects get collision from their own mesh with one button
-  (Make collision in the properties panel, Ctrl+Shift+K): walls round what a
-  car can hit and ground on their tops, or just ground for ramps and decks.
-- **Mesh editor.** Tab on a selected object edits its shape in place: pick
-  vertices, edges or faces (1 / 2 / 3), move, turn or scale them with the gizmo
-  and watch the model change; Ctrl+Z steps back and Tab writes it, the same way
-  an edit from Blender comes back. Every placement of the model changes.
-- **Edit in Blender.** Objects > Edit in Blender (Ctrl+Shift+E) opens the
-  selection in Blender; every save there (Ctrl+S) loads it back into the
-  editor. Nothing to install in Blender -- the editor brings its own script.
-- **New objects.** Model something new in Blender (Objects > New Object in
-  Blender, Ctrl+Shift+N, opens an empty scene centred on the view) or bring any
-  OBJ in (Objects > New Object from OBJ). Each shape becomes a model of its own,
-  placed where it stands, with its textures or plain material colours.
-  They are listed as yours in Objects > Place My Object (Ctrl+Shift+P), to
-  place again anywhere; editing one in Blender updates every copy.
-- **Zones and quick travel.** The city's named zones (Pigeon Park, Coal
-  Harbour East, Jackson Heights...) grouped by district in the Scene tab and in
-  Camera > Travel To; the camera flies there, and the status bar names the zone
-  it is over.
-- **Launch game.** Starts the game straight into free roam, with your car on
-  the street where the editor's camera is -- inside the editor's window when
-  the game runs windowed.
-- **Roads.** Draw roads with Bézier nodes and junctions, with lanes,
-  sidewalks, walls, street lights and bridges, and join them to the game's
-  own roads. Ctrl+Shift+B bakes them into the game, with traffic and GPS
-  routes and collision; Ctrl+Z takes a bake back.
-- **Terrain.** New terrain patches, sculpting of the game's own ground, and
-  ground fitted under new roads.
-- **Visibility zones.** See the zones the game streams the city by, edit
-  their outlines and section lists in place, and load new pieces into the
-  zones around them.
-- **Hidden items.** H / Alt+H hides objects in the editor only, to work
-  behind them.
-
-## Getting started
-
-1. Download the release zip and unzip it anywhere.
-2. Run `FRSWorldEditor.exe`. The first time, the setup:
-   - finds the game (registry, usual folders) or lets you pick the folder with
-     `SPEED2.EXE`;
-   - installs the game-side plugins: Ultimate ASI Loader (`dinput8.dll`,
-     skipped if the game already has an ASI loader), `FRSWorldLoader.asi` and
-     `FRSFastTest.asi` (it replaces the older `FRSFastBoot.asi`, which is moved
-     aside: the two together crash the game as it starts);
-   - asks for administrator rights once if the game is under Program Files.
-3. Pick a region at the top left. Right mouse to look, `W` `A` `S` `D` to
-   move, `Q` / `E` down / up, Shift faster, Ctrl slower.
-
-Run the setup again from **File > Game Folder and Plugins**.
-
-The plugins are written for `SPEED2.EXE` v1.2 (MD5
-`6445adbf4e8d64be51e96a69bba168a4`). The editor opens any version's files; on
-another executable the plugins leave the game alone.
-
-### Keys
-
-| Input | Action |
+| Edit | How it is written |
 | --- | --- |
-| Right mouse | Look around |
-| `W` `A` `S` `D`, `Q` / `E` | Move, down / up |
-| Shift / Ctrl | Faster / slower |
-| Wheel | Base movement speed |
-| Left click, Ctrl+click | Select, add to the selection |
-| `G` / `R` | Move / rotate the selection |
-| `1` `2` `3` | Gizmo: move, rotate, scale -- also on the toolbar (drag its handles; Ctrl snaps turns to 15 degrees) |
-| Drag from Library | Place a model where you let go, on the ground under the pointer |
-| `Home` | Frame the region |
-| `F1`-`F4` | Textured, unlit, vertex colours, wireframe |
-| `F5` `F6` `F7` | Backdrop, backface culling, scenery |
-| `F9` | Texture browser |
-| Ctrl+K | Collision overlay |
-| Ctrl+Shift+W / H / G | Draw a barrier / a wall with height / ground (Enter or a double click finishes, Esc stops) |
-| Ctrl+Shift+K | Make collision for the selected objects |
-| Tab | Edit the selected object's mesh; Tab again writes it (1/2/3 vertices/edges/faces, Ctrl+A all) |
-| Ctrl+Z | Undo (collision, and objects placed, moved or deleted) |
-| Ctrl+N | Place an object |
-| Ctrl+E / Ctrl+I | Export selection / import edited OBJ |
-| Ctrl+Shift+E | Edit the selection in Blender |
-| Ctrl+Shift+N | New object in Blender |
-| Ctrl+S | Save the world |
-| Ctrl+Shift+S | Write placements and collision edits to the game |
+| Remove or move a map object | Patched inside its 96-byte record; no file changes size. |
+| Place an object (copy, or from the Library) | A new record with what the game needs to draw it. The section's culling tree grows when every node is full. |
+| Physical props (trash cans, parked cars...) | A placed copy gets its own prop entry (chunks `0x34027`, `0x34106`, and `0x34108` in `L5RA.BUN`), a removed one loses it, a moved one takes it along. |
+| Replace a texture | Encoded over every stored copy. A different image size is allowed: the packs are laid out again and the section table follows. |
+| Edit a model in Blender | The OBJ comes back into the model's own chunk of the section file. |
+| New model, new texture | Added to the section's solid list and to the texture section its materials need. New textures are named `FRS_<name>`. |
+| Collision: delete, add, move, change surface | Articles are written again inside their pack. Walls are barrier records, one per side. Ground that no collision box holds makes the nearest box grow. |
+| Raised ground over a road (a speed bump) | The road under it is cut out, so the wheel does not jump between the two. |
+
+### Editor
+
+- **Setup:** the "Your games" page has a row for Need for Speed World.
+- **Dark theme** for the whole program. `FRS_LIGHT=1` in the environment turns
+  it off.
+- **Texture Browser:** Replace, Restore, save as image, and a search field that
+  filters by name.
+- **Collision tools:** walls drawn per side (front red, back blue); key `I`
+  flips a wall's side.
+- **Start:** the window shows at once and the map loads after it. Before, the
+  editor stayed invisible for about half a minute and looked as if it had not
+  started.
+- **View > Clip Start / End and Detail**, to draw less of a large map.
+- **Launch Game / Fast test** on an NFS World folder start the real game (the
+  original's built-in drive mode needs Underground 2's `SPEED2.EXE`). See the
+  limitations: this needs two pieces that are not in the package.
+
+### Tools
+
+`tools/nfsw` holds the scripts the port was made with: measurements of the
+file formats (`*_stats.py`, `col_check.py`, `table_*.py`), scripted editor runs
+(`test_*.ps1`) and readers of what was written (`verify_*.py`).
+`verify_table.py` checks every written section against the section table of
+`L5RA.BUN`. The layouts were measured on every shipped file and matched
+against the loaders in `nfsw.exe`; the comments at the top of
+`src/io/WorldWrite.h`, `WorldPlace.h`, `WorldTexture.h`, `WorldMesh.h` and
+`src/nfs/WorldCollision.cpp` give the offsets and the addresses.
+
+## How saving works on NFS World
+
+The original never changes a game's files: edits go to `<game>\models` and an
+ASI plugin loads them. NFS World has no such plugin here, so this port writes
+into the game's files and keeps the shipped ones:
+
+- Every streaming section is a file of its own (`TRACKS\STREAML5RA_<n>.BUN`).
+  Before the first change the shipped file is copied to `TRACKS\frs-original`.
+- The edits are a text list beside those copies, `L5RA-edits.txt`. The editor
+  always reads the shipped copy plus the list, and each Save makes the game's
+  files again from the two.
+- A section whose edits are all undone gets its shipped file back.
+- The shipped `.BUN` files stay in `TRACKS\frs-original`. Your own backup of
+  `TRACKS` is the sure way back to the game as shipped.
+
+## What was checked where
+
+The words used here:
+
+- **scripted check**: a script in `tools/nfsw` ran the editor on a scratch copy
+  of the written files and read the result back, outside the game;
+- **in game**: seen in the running game.
+
+A scripted check does not prove that the game accepts a file. Most of this port
+has only scripted checks.
+
+- **Scripted checks.** Each kind of edit above has a `test_*.ps1` /
+  `verify_*.py` pair. After the merge of 0.2.7 (19 Nov 2026) a real edit list
+  was replayed: 1877 edits, 469 sections written. Every one of the 470 files
+  came out byte for byte as the build before the merge had written them, and
+  `verify_table.py` found an entry for all 469 sections.
+- **In game.** Ground collision added in the editor (a speed bump) is driven
+  over without bouncing. The fast-test ASI reaches free roam with no input,
+  with and without a car position (started by script, on the author's setup).
+- **Not confirmed in game, item by item:** placed objects and their physics,
+  edited and new models, new textures, walls after the one-side fix, key `I`,
+  the grown `L5RA.BUN`.
+- **Not tried:** the package on a machine other than the author's.
+
+One known way to break the game: a section that grows while its entry in the
+section table keeps the old sizes crashes the game on load
+(`nfsw.exe+0x34B5B0`, access violation). The writer rewrites every part size of
+the entry, and `verify_table.py` checks it.
+
+## Limitations
+
+- **One game build.** The addresses the port was matched against are from one
+  `nfsw.exe` (32-bit, image base `0x400000`). Other builds were not checked.
+- **Not written to NFS World:** roads, terrain, markers, traffic and GPS
+  routes. Those tools show on the map but their bake is Underground 2's format.
+- **Publish World, `.frsworld` files and the game plugin** do not carry NFS
+  World edits.
+- **Collision import** (OBJ, Blender) is refused for NFS World. Collision is
+  edited with the editor's own tools only.
+- **Edited models:** only the edited level of detail changes. From far away the
+  game may still show the shipped shape. Models whose vertices are
+  integer-packed (effects 8 and 9) are not written.
+- **New textures:** at most 512 px a side, DXT1 or DXT5.
+- **Collision outside every box:** the nearest box grows by 200 m at most. Past
+  that the polygon is left out of the save and the status bar counts it.
+- **Culling tree:** the game walks it with a 64-entry stack. A save that would
+  pass it is refused, and the message names the section and the object.
+- **Launch Game / Fast test** work only on the author's setup so far. The
+  editor starts the game through an offline launcher script it expects beside
+  the game folder (`..\scripts\launch-offline.cjs`, run with Node.js), and a
+  small ASI in the game's `scripts` folder passes the title and the driver
+  select and puts the car at the editor's camera. Neither is in this
+  repository or in the package; without the launcher the editor says so and
+  starts nothing. The game's own loading screens are never skipped.
+- **Game look and sky** on NFS World were not compared with the game.
+- **The original's newest tools on NFS World** (new regions, region import,
+  the model library across games) were not tried on an NFS World folder. The
+  package is built the way the original's releases are, without New Region and
+  Import Region.
+- **Underground and Underground 2** were not run after the port's changes or
+  after the merge of 0.2.7: there was no copy of those games on the machine.
+  The port branches on the game, but regressions there are possible, and the
+  package does not carry the Underground 2 plugins. Use the original for them.
+- **Test scripts** have the development machine's paths in them
+  (`D:\NFS World\...`). Change them before use.
+
+## The original editor
+
+[FRS World Editor](https://github.com/chrystianfarias/FRSWorldEditor) reads a
+game's own files directly -- nothing is converted or imported first -- so what
+the viewport draws is what the game ships. In short, what it does (for
+Underground 2; see its page for the full list, the keys and the other games):
+
+- **The whole city as shipped**, with a free camera, the sky, animated
+  textures and object animations; textured, unlit, vertex-colour and wireframe
+  views; a texture browser.
+- **Objects:** place any model from a Library with pictures, move, rotate,
+  snap to the ground, copy, remove. Every edit is listed and can be reverted.
+- **Meshes:** edit a shape in place (Tab), or in Blender with one key and
+  every save coming back; bring in new models from Blender or OBJ.
+- **Collision tools:** draw barriers, walls and ground on the map, move them,
+  give them a surface, or make collision from an object's own mesh.
+- **Roads, terrain, markers, visibility zones, quick travel** and a game
+  plugin that loads the edits into the running game.
+
+Its page has the download for Underground 2, the full documentation, the
+[Discord](https://discord.gg/jTKwQXYQkb) and a way to
+[support its author](https://buymeacoffee.com/chrystianfarias).
 
 ## Building
 
-Visual Studio 2022 with the C++ workload and CMake 3.21 or newer. No other
-dependencies: `D3DX` is not part of the modern SDK, so the maths is hand
-written.
+Visual Studio with the C++ workload and CMake 3.21 or newer; no other
+dependencies. The port is built with the 2026 Build Tools:
 
 ```
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake -S . -B build -G "Visual Studio 18 2026" -A x64
 cmake --build build --config Release
 ```
 
-The game is 32-bit, so its plugin is built for Win32:
+`package-nfsw.ps1` builds the release (without New Region / Import Region, as
+the original's releases) and writes the folder and the zip to `dist\`.
+`package.ps1` is the original's and also builds the Underground 2 plugins,
+from repositories that are not here.
 
-```
-cmake -S loader -B loader/build -G "Visual Studio 17 2022" -A Win32
-cmake --build loader/build --config Release
-```
+The source layout is the original's; the NFS World code is in `src/io/World*`,
+`src/nfs/WorldCollision.*`, `src/nfs/GameFormat.h`, `src/render/GameLook*` and
+behind `nfs::IsWorld()` elsewhere. `docs/NFSU2-FORMATS.md` is the original's
+record of the Underground 2 formats.
 
-`package.ps1` builds everything, FRSFastTest included (from its own
-repository, by default `D:\Outros\FRSFastTest`), downloads Ultimate ASI
-Loader and writes the release folder and zip to `dist\`.
+## Credits and licence
 
-### Extensions
+- **FRS World Editor** is by Chrystian Farias (FRS Mods):
+  <https://github.com/chrystianfarias/FRSWorldEditor>.
+- **The NFS World port** is by letsrock-gf.
+- [Dear ImGui](https://github.com/ocornut/imgui) (MIT),
+  [Phosphor Icons](https://phosphoricons.com) (MIT) and the Win32 property grid
+  by David MacDermot (CPOL) are in `third_party`.
 
-The editor and the loader can be built with extensions of their own: a folder
-with an `editor.cmake` (and a `loader.cmake` for the game side) at `./private`,
-or wherever `-DFRS_EXTENSIONS_DIR=` points, is compiled in. The editor's side
-implements `src/ui/EditorExtension.h` and `src/render/RenderExtension.h`, the
-loader's `InstallExtensions` / `ExtensionsFrame` in `loader/src/Loader.h`.
-Without such a folder -- this repository on its own -- the build has none;
-`-DFRS_WITH_EXTENSIONS=OFF` leaves them out even when the folder is there.
+Licensed, like the original, under [Creative Commons
+Attribution-NonCommercial 4.0 International (CC BY-NC 4.0)](LICENSE): you may
+share and adapt this work, with credit, for non-commercial purposes only -- it
+may not be sold.
 
-## Layout
-
-```
-src/core      file mapping, maths, logging
-src/nfs       the file formats: chunks, section table, geometry, textures,
-              scenery, collision, free-roam zones
-src/io        reading and writing edits: placements, OBJ, textures
-src/render    Direct3D 9 device, GPU buffers, camera, renderer
-src/ui        the Win32 frame, viewport, panels and the setup wizard
-loader        FRSWorldLoader.asi, the game side
-packaging     what goes into the release beside the executable
-docs          the file formats, and how they were worked out
-tools         Python scripts used to explore and validate the formats
-third_party   Dear ImGui (MIT), Phosphor icons (MIT), the Win32 property grid (CPOL)
-```
-
-[`docs/NFSU2-FORMATS.md`](docs/NFSU2-FORMATS.md) records the chunk layouts,
-field offsets and the rules a parser has to get right, and what the plugin
-does inside the game, address by address.
-
-## Credits
-
-- [Dear ImGui](https://github.com/ocornut/imgui) 1.91.9b, docking branch (MIT), in `third_party/imgui`: the panels.
-- [Phosphor Icons](https://phosphoricons.com) 2.1.1 (MIT), in `third_party/phosphor`: the icons.
-- Win32 property grid by David MacDermot (CPOL), in `third_party/propertygrid`.
-- [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader) by
-  ThirteenAG (MIT), shipped in the release package.
-- The [NFSU2ExOpts](https://github.com/ExOptsTeam/NFSU2ExOpts) and
-  [nfsu2-re](https://github.com/yugecin/nfsu2-re) projects are useful
-  references for the engine internals.
-
-Need for Speed, Need for Speed Underground, Underground 2, Most Wanted,
-Carbon and ProStreet are trademarks of Electronic Arts. This is a fan project,
-not affiliated with or endorsed by EA; you need your own copy of each game.
-
-## License
-
-Licensed under [Creative Commons Attribution-NonCommercial 4.0 International
-(CC BY-NC 4.0)](LICENSE). You may share and adapt this work, crediting FRS Mods
-for non-commercial purposes only -- it may not be sold.
+Need for Speed, Need for Speed World, Underground and Underground 2 are
+trademarks of Electronic Arts.
