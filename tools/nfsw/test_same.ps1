@@ -2,7 +2,7 @@
 # Same Name: selects what is at a point of the view, posts the command, and prints what the log says of both.
 param([double]$ClickX = 0.60, [double]$ClickY = 0.80)
 $tools = $PSScriptRoot
-$d = 'D:\NFS World\work\nfsw-world-editor\build-test\bin\Release'
+$d = "$(Split-Path (Split-Path $PSScriptRoot))\build-test\bin\Release"
 $log = "$d\FRSWorldEditor.log"
 Add-Type @'
 using System;

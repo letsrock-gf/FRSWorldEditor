@@ -24,7 +24,7 @@ public static class P {
 }
 '@
 [P]::SetProcessDPIAware() | Out-Null
-$log = 'D:\NFS World\work\nfsw-world-editor\build\bin\Release\FRSWorldEditor.log'
+$log = "$(Split-Path (Split-Path $PSScriptRoot))\build\bin\Release\FRSWorldEditor.log"
 $before = (Get-Content $log).Count
 $main = [P]::MainOf([uint32]$ProcessId)
 $view = [P]::FindWindowExW($main, [IntPtr]::Zero, 'FRSWorldEditor.Viewport', $null)

@@ -3,7 +3,7 @@
 # again on that list and saved again (must come out the same). Never writes to the game, never starts while nfsw.exe
 # runs. Check with verify_tree.py, verify_place.py and verify_table.py on $Out\T1.
 # Usage: test_treegrow.ps1 -Out <folder> [-Exe <bin folder>] [-Section 479] [-Model 8D902783] [-Count 30]
-param([Parameter(Mandatory = $true)][string]$Out, [string]$Exe = 'D:\NFS World\work\nfsw-world-editor\build-new\bin\Release',
+param([Parameter(Mandatory = $true)][string]$Out, [string]$Exe = "$(Split-Path (Split-Path $PSScriptRoot))\build-new\bin\Release",
       [int]$Section = 479, [string]$Model = '8D902783', [int]$Count = 30,
       [double]$X = 4604.56, [double]$Y = 2811.24, [double]$Z = 146.27)
 if (Get-Process nfsw -ErrorAction SilentlyContinue) { "nfsw.exe is running: not starting the editor"; return }
@@ -56,8 +56,8 @@ function Keep($step) {
 Unlink "$Out\game\TRACKS"; Unlink "$Out\game\GLOBAL"
 foreach ($dir in 'tracks', 'T1', 'T2') { if (Test-Path "$Out\$dir") { Remove-Item "$Out\$dir" -Recurse -Force } }
 New-Item -ItemType Directory -Force "$Out\game", "$Out\tracks\frs-original" | Out-Null
-cmd /c mklink /J "$Out\game\TRACKS" "D:\NFS World\Data2015\TRACKS" | Out-Null   # read only: the editor reads its frs-original copies
-cmd /c mklink /J "$Out\game\GLOBAL" "D:\NFS World\Data2015\GLOBAL" | Out-Null
+cmd /c mklink /J "$Out\game\TRACKS" "$(& $PSScriptRoot\game.ps1)\TRACKS" | Out-Null   # read only: the editor reads its frs-original copies
+cmd /c mklink /J "$Out\game\GLOBAL" "$(& $PSScriptRoot\game.ps1)\GLOBAL" | Out-Null
 if (-not (Test-Path "$Out\game\nfsw.exe")) { New-Item -ItemType File "$Out\game\nfsw.exe" | Out-Null }
 
 $lines = for ($i = 0; $i -lt $Count; $i++) {

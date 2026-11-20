@@ -2,11 +2,11 @@
 # Usage: run_views.ps1 <tag> "x,y,z,yaw,pitch" ["x,y,z,yaw,pitch" ...]
 param([string]$Tag, [Parameter(ValueFromRemainingArguments = $true)][string[]]$Views)
 $s = Split-Path $PSScriptRoot -Parent
-$d = 'D:\NFS World\work\nfsw-world-editor\build\bin\Release'
+$d = "$(Split-Path (Split-Path $PSScriptRoot))\build\bin\Release"
 $log = "$d\FRSWorldEditor.log"
 Get-Process FRSWorldEditor -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$d*" } | Stop-Process -Force
 Remove-Item $log -ErrorAction SilentlyContinue
-$env:FRS_GAME_FOLDER = 'D:\NFS World\Data2015'
+$env:FRS_GAME_FOLDER = "$(& $PSScriptRoot\game.ps1)"
 $p = Start-Process "$d\FRSWorldEditor.exe" -WorkingDirectory $d -PassThru
 $deadline = (Get-Date).AddMinutes(6)
 while ((Get-Date) -lt $deadline -and -not $p.HasExited) {

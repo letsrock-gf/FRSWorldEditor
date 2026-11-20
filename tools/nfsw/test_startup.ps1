@@ -1,7 +1,7 @@
 # Times how long the build-test editor takes to show its window: once right after the exe is linked again
 # (-Relink) and then again with the same file. Nothing is saved; the editor is closed as soon as it is seen.
 param([switch]$Relink, [int]$Runs = 2, [int]$TimeoutSeconds = 180)
-$root = 'D:\NFS World\work\nfsw-world-editor'
+$root = "$(Split-Path (Split-Path $PSScriptRoot))"
 $d = "$root\build-test\bin\Release"
 Add-Type @'
 using System;

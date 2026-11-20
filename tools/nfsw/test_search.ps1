@@ -3,7 +3,7 @@
 # the texture left selected. A name in another case should list the same rows; a name no texture has, none.
 param([string]$Out, [string[]]$Names = @('', 'road', 'ROAD', 'zzqqzz', ''), [int]$WaitMinutes = 0)
 # -WaitMinutes: waits that long for nfsw.exe to stay closed for 60 s before starting, instead of giving up at once.
-$d = 'D:\NFS World\work\nfsw-world-editor\build-test\bin\Release'
+$d = "$(Split-Path (Split-Path $PSScriptRoot))\build-test\bin\Release"
 $log = "$d\FRSWorldEditor.log"
 Add-Type @'
 using System;

@@ -1,7 +1,7 @@
 # Drives the ported editor by posted messages only (no focus, no real cursor): select, delete, undo, redo, orbit.
 param([string]$Tag = 'edit')
 $s = Split-Path $PSScriptRoot -Parent
-$d = 'D:\NFS World\work\nfsw-world-editor\build\bin\Release'
+$d = "$(Split-Path (Split-Path $PSScriptRoot))\build\bin\Release"
 $log = "$d\FRSWorldEditor.log"
 Add-Type @'
 using System;

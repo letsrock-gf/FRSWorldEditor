@@ -7,7 +7,7 @@ row with all instances (64 bytes each).
 """
 import struct
 
-TRACKS = r"D:\NFS World\Data2015\TRACKS"
+from game_folder import TRACKS
 PACKS = TRACKS + r"\STREAML5RA_25000.BUN"
 
 

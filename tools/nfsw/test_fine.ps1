@@ -3,7 +3,7 @@
 # drag must move a tenth as far.
 param([string]$Out)
 $tools = $PSScriptRoot
-$d = 'D:\NFS World\work\nfsw-world-editor\build-test\bin\Release'
+$d = "$(Split-Path (Split-Path $PSScriptRoot))\build-test\bin\Release"
 $log = "$d\FRSWorldEditor.log"
 Add-Type @'
 using System;

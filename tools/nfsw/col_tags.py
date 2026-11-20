@@ -3,7 +3,7 @@ import struct
 import sys
 from collections import Counter
 
-PATH = r"D:\NFS World\Data2015\TRACKS\STREAML5RA_25000.BUN"
+from game_folder import COLLISION as PATH
 
 
 def chunks(buf):

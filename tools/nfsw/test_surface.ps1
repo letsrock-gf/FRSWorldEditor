@@ -2,8 +2,8 @@
 # Added ground must never get the null surface (hash 0), which makes nfsw.exe reset the player car
 # (0x85c7c0 -> 0x858a20). verify_surface.py reads the result; verify_table.py checks the section table.
 param([string]$Out, [string]$Tree = 'build-reset', [string]$Extra)
-$d = "D:\NFS World\work\nfsw-world-editor\$Tree\bin\Release"
-$kept = 'D:\NFS World\Data2015\TRACKS\frs-original'
+$d = "$(Split-Path (Split-Path $PSScriptRoot))\$Tree\bin\Release"
+$kept = "$(& $PSScriptRoot\game.ps1)\TRACKS\frs-original"
 $log = "$d\FRSWorldEditor.log"
 if (Get-Process nfsw -ErrorAction SilentlyContinue) { 'nfsw.exe is running: no scripted editor beside the game'; return }
 

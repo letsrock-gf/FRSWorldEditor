@@ -2,7 +2,7 @@
 # copies and pastes two objects, saves, then starts again so the edit list is read back. Never writes to the game.
 param([string]$Out)
 $tools = $PSScriptRoot
-$d = 'D:\NFS World\work\nfsw-world-editor\build-test\bin\Release'
+$d = "$(Split-Path (Split-Path $PSScriptRoot))\build-test\bin\Release"
 $log = "$d\FRSWorldEditor.log"
 Add-Type @'
 using System;

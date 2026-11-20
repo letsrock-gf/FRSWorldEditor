@@ -2,7 +2,7 @@
 # FRS_TEST_LAUNCH_POSE (Launch Game then only writes the pose there: nothing saved, no game started), sends
 # the Fast test command (DriveMode kDriveCommand 44901) and checks the pose file appeared.
 # Do not run while nfsw.exe is running.
-param([string]$Dir = 'D:\NFS World\work\nfsw-world-editor\build-look\bin\Release')
+param([string]$Dir = "$(Split-Path (Split-Path $PSScriptRoot))\build-look\bin\Release")
 if (Get-Process nfsw -ErrorAction SilentlyContinue) { 'nfsw.exe is running: not started'; return }
 Add-Type @'
 using System;

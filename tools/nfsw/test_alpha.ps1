@@ -3,7 +3,7 @@
 # is at a point of the view and saves its first texture as PNG. verify_alpha.py reads the results.
 param([string]$Out, [string]$Hash, [string]$Image, [double]$ClickX = 0.60, [double]$ClickY = 0.80)
 $tools = $PSScriptRoot
-$d = 'D:\NFS World\work\nfsw-world-editor\build-test\bin\Release'
+$d = "$(Split-Path (Split-Path $PSScriptRoot))\build-test\bin\Release"
 $log = "$d\FRSWorldEditor.log"
 Add-Type @'
 using System;

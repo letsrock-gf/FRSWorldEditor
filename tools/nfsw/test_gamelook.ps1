@@ -2,8 +2,8 @@
 # FRS_GAMELOOK=1), then the game-look lines of the second run's log. Nothing is written into the game
 # folder (test_view sets FRS_WRITE_TRACKS to a scratch folder) and the saved camera is put back.
 # Do not run while nfsw.exe is running.
-param([string]$Dir = 'D:\NFS World\work\nfsw-world-editor\build-look\bin\Release',
-      [string]$OutDir = 'D:\NFS World\work\gamelook-research',
+param([string]$Dir = "$(Split-Path (Split-Path $PSScriptRoot))\build-look\bin\Release",
+      [string]$OutDir = "$(Split-Path (Split-Path (Split-Path $PSScriptRoot)))\gamelook-research",
       [string]$Name = 'view',
       [single]$X = 2500, [single]$Y = 2000, [single]$Z = 220, [single]$Yaw = 0.8, [single]$Pitch = -0.25)
 if (Get-Process nfsw -ErrorAction SilentlyContinue) { 'nfsw.exe is running: not started'; return }

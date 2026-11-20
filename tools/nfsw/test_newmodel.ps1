@@ -8,7 +8,7 @@
 # Each written state is kept in $Out\<step> for verify_newmodel.py.
 # Usage: test_newmodel.ps1 -Out <folder> [-Exe <bin folder>] [-Section 1012] [-Texture 926F5A52] [-Texture2 20F08EAB]
 #        [-Copy 0139B912] [-Refuse 0000DC86]
-param([Parameter(Mandatory = $true)][string]$Out, [string]$Exe = 'D:\NFS World\work\nfsw-world-editor\build-new\bin\Release',
+param([Parameter(Mandatory = $true)][string]$Out, [string]$Exe = "$(Split-Path (Split-Path $PSScriptRoot))\build-new\bin\Release",
       [int]$Section = 1012, [string]$Texture = '926F5A52', [string]$Texture2 = '20F08EAB',
       [string]$Copy = '0139B912', [string]$Refuse = '0000DC86',
       [double]$X = 2110.74, [double]$Y = 783.60, [double]$Z = 154.04, [switch]$Replay, [string]$Start = 'A', [switch]$NewTextures, [switch]$OnlyA)
@@ -71,8 +71,8 @@ Unlink "$Out\game\TRACKS"; Unlink "$Out\game\GLOBAL"
 $steps = if ($Start -eq 'A') { 'tracks', 'edit', 'A1', 'A2', 'A3', 'B', 'C', 'D', 'E' } else { 'tracks', 'B', 'C', 'D', 'E' }
 foreach ($dir in ($steps | ForEach-Object { "$Out\$_" })) { if (Test-Path $dir) { Remove-Item $dir -Recurse -Force } }
 New-Item -ItemType Directory -Force "$Out\game", "$Out\tracks", "$Out\edit" | Out-Null
-cmd /c mklink /J "$Out\game\TRACKS" "D:\NFS World\Data2015\TRACKS" | Out-Null
-cmd /c mklink /J "$Out\game\GLOBAL" "D:\NFS World\Data2015\GLOBAL" | Out-Null
+cmd /c mklink /J "$Out\game\TRACKS" "$(& $PSScriptRoot\game.ps1)\TRACKS" | Out-Null
+cmd /c mklink /J "$Out\game\GLOBAL" "$(& $PSScriptRoot\game.ps1)\GLOBAL" | Out-Null
 if (-not (Test-Path "$Out\game\nfsw.exe")) { New-Item -ItemType File "$Out\game\nfsw.exe" | Out-Null }
 
 # A Blender save of a new object: a 4 m box and a 2 m slab on it, Y up, two game textures (two effects).
@@ -176,7 +176,7 @@ try {
         "=== E: Gui's own edit list (copied, read only) replayed and saved"
         Remove-Item "$Out\tracks" -Recurse -Force
         New-Item -ItemType Directory -Force "$Out\tracks\frs-original" | Out-Null
-        $real = 'D:\NFS World\Data2015\TRACKS\frs-original'
+        $real = "$(& $PSScriptRoot\game.ps1)\TRACKS\frs-original"
         Copy-Item "$real\L5RA-edits.txt" "$Out\tracks\frs-original\"
         foreach ($dir in 'textures', 'meshes') { if (Test-Path "$real\$dir") { Copy-Item "$real\$dir" "$Out\tracks\frs-original\" -Recurse } }
         if (-not (Start-Editor)) { "editor window not found"; return }

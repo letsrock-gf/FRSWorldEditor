@@ -2,7 +2,7 @@
 # first size and after two resizes, and saves one texture as DDS through a scripted path.
 param([string]$Out)
 $tools = $PSScriptRoot
-$d = 'D:\NFS World\work\nfsw-world-editor\build-test\bin\Release'
+$d = "$(Split-Path (Split-Path $PSScriptRoot))\build-test\bin\Release"
 $log = "$d\FRSWorldEditor.log"
 Add-Type -AssemblyName System.Drawing
 Add-Type @'

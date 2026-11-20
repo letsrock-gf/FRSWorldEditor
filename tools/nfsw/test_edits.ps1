@@ -1,10 +1,10 @@
 # Isolated test (build-test copy, scratch folder, no input, nothing saved) of the Edits tab on NFS World: loads an
 # edit list with its kept textures and models, and prints the tab's own title ("Edits in force in L5RA: N...")
 # beside what the list holds, by kind. The tab should list every object, texture and model edit of the list.
-param([string]$Out, [string]$Kept = 'D:\NFS World\Data2015\TRACKS\frs-original', [switch]$Revert)
+param([string]$Out, [string]$Kept = "$(& $PSScriptRoot\game.ps1)\TRACKS\frs-original", [switch]$Revert)
 # -Revert: also takes every listed row back (FRS_TEST_REVERT), which saves into the scratch folder; the list
 # written there should keep only what the tab cannot take back (edited models, collision).
-$d = 'D:\NFS World\work\nfsw-world-editor\build-test\bin\Release'
+$d = "$(Split-Path (Split-Path $PSScriptRoot))\build-test\bin\Release"
 $log = "$d\FRSWorldEditor.log"
 Add-Type @'
 using System;

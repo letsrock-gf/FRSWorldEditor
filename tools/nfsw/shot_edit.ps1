@@ -2,14 +2,14 @@
 # once with an empty scratch list (the map as shipped). Scratch game folder as in test_mesh.ps1 (junctions, rmdir only).
 # Usage: shot_edit.ps1 -Out <test_mesh folder> -X -Y -Z -Yaw -Pitch -Name <png prefix>
 param([string]$Out, [single]$X, [single]$Y, [single]$Z, [single]$Yaw, [single]$Pitch, [string]$Name = 'close',
-      [string]$Exe = 'D:\NFS World\work\nfsw-world-editor\build-mesh\bin\Release')
+      [string]$Exe = "$(Split-Path (Split-Path $PSScriptRoot))\build-mesh\bin\Release")
 $tools = $PSScriptRoot
 $log = "$Exe\FRSWorldEditor.log"
 function Unlink($path) { if (Test-Path $path) { cmd /c rmdir "$path" | Out-Null } }
 New-Item -ItemType Directory -Force "$Out\game", "$Out\empty" | Out-Null
 Unlink "$Out\game\TRACKS"; Unlink "$Out\game\GLOBAL"
-cmd /c mklink /J "$Out\game\TRACKS" "D:\NFS World\Data2015\TRACKS" | Out-Null
-cmd /c mklink /J "$Out\game\GLOBAL" "D:\NFS World\Data2015\GLOBAL" | Out-Null
+cmd /c mklink /J "$Out\game\TRACKS" "$(& $PSScriptRoot\game.ps1)\TRACKS" | Out-Null
+cmd /c mklink /J "$Out\game\GLOBAL" "$(& $PSScriptRoot\game.ps1)\GLOBAL" | Out-Null
 $env:FRS_GAME_FOLDER = "$Out\game"
 try {
     foreach ($pass in @(@{ Tracks = "$Out\tracks"; Tag = 'edited' }, @{ Tracks = "$Out\empty"; Tag = 'shipped' })) {

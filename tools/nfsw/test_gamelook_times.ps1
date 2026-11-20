@@ -1,8 +1,8 @@
 # Game look captures of one camera at several time-of-day positions (FRS_GAMELOOK_TIME, 0..8 along the
 # attributes.bin cycle day1_1 .. day1_6). Uses test_view.ps1 (scratch FRS_WRITE_TRACKS, camera restored).
 # Do not run while nfsw.exe is running.
-param([string]$Dir = 'D:\NFS World\work\nfsw-world-editor\build-look\bin\Release',
-      [string]$OutDir = 'D:\NFS World\work\gamelook-research',
+param([string]$Dir = "$(Split-Path (Split-Path $PSScriptRoot))\build-look\bin\Release",
+      [string]$OutDir = "$(Split-Path (Split-Path (Split-Path $PSScriptRoot)))\gamelook-research",
       [string]$Name = 'time',
       [string[]]$Times = @('1.5', '3.15', '5.5', '7.5'),
       [single]$X = 2500, [single]$Y = 2000, [single]$Z = 220, [single]$Yaw = 0.8, [single]$Pitch = -0.25)

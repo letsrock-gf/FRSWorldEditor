@@ -3,7 +3,7 @@
 # (FRS_TEST_TEXTURE) and the save follows. Sections whose textures came from the list must be written too,
 # or the section table loses what they grew by. verify_resize.py reads the result.
 param([string]$Out, [string]$Textures, [string]$List)
-$d = 'D:\NFS World\work\nfsw-world-editor\build-test\bin\Release'
+$d = "$(Split-Path (Split-Path $PSScriptRoot))\build-test\bin\Release"
 $log = "$d\FRSWorldEditor.log"
 $images = @(Get-ChildItem $Textures -File | Sort-Object Name)
 if ($images.Count -lt 2) { "need two images or more in $Textures"; return }

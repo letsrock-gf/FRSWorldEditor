@@ -6,7 +6,7 @@
 # marker, so anything the editor writes beside "the game" lands in the scratch folder; FRS_WRITE_TRACKS takes the
 # section writes. The junctions are removed with rmdir (never a recursive delete through them).
 # Usage: test_mesh.ps1 -Out <folder> [-Exe <bin folder>] [-NoSave] [-Points "x,y","x,y"]   (env FRS_EDIT=cut: see blender_edit.py)
-param([Parameter(Mandatory = $true)][string]$Out, [string]$Exe = 'D:\NFS World\work\nfsw-world-editor\build-mesh\bin\Release',
+param([Parameter(Mandatory = $true)][string]$Out, [string]$Exe = "$(Split-Path (Split-Path $PSScriptRoot))\build-mesh\bin\Release",
       [switch]$NoSave, [string[]]$Points)
 if (-not $Points) { $Points = @('0.30,0.62', '0.32,0.535') }
 $tools = $PSScriptRoot
@@ -60,8 +60,8 @@ Unlink "$Out\game\TRACKS"; Unlink "$Out\game\GLOBAL"
 foreach ($dir in "$Out\tracks", "$Out\edit", "$Out\game\models") { if (Test-Path $dir) { Remove-Item $dir -Recurse -Force } }
 Get-ChildItem $Out -File -ErrorAction SilentlyContinue | Remove-Item -Force
 New-Item -ItemType Directory -Force "$Out\game", "$Out\tracks", "$Out\edit" | Out-Null
-cmd /c mklink /J "$Out\game\TRACKS" "D:\NFS World\Data2015\TRACKS" | Out-Null
-cmd /c mklink /J "$Out\game\GLOBAL" "D:\NFS World\Data2015\GLOBAL" | Out-Null
+cmd /c mklink /J "$Out\game\TRACKS" "$(& $PSScriptRoot\game.ps1)\TRACKS" | Out-Null
+cmd /c mklink /J "$Out\game\GLOBAL" "$(& $PSScriptRoot\game.ps1)\GLOBAL" | Out-Null
 if (-not (Test-Path "$Out\game\nfsw.exe")) { New-Item -ItemType File "$Out\game\nfsw.exe" | Out-Null }
 
 $obj = "$Out\edit\selection.obj"

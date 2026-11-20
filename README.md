@@ -86,7 +86,10 @@ Save refuses while `nfsw.exe` runs: the game holds the map's files open.
 file formats (`*_stats.py`, `col_check.py`, `table_*.py`), scripted editor runs
 (`test_*.ps1`) and readers of what was written (`verify_*.py`).
 `verify_table.py` checks every written section against the section table of
-`L5RA.BUN`. The layouts were measured on every shipped file and matched
+`L5RA.BUN`. The scripts find the repository from their own place and read the
+game from the folder in `FRS_GAME_FOLDER` (`tools/nfsw/game.ps1`); the editor
+runs they start come from a build tree named in each script (`build-test` for
+most). The layouts were measured on every shipped file and matched
 against the loaders in `nfsw.exe`; the comments at the top of
 `src/io/WorldWrite.h`, `WorldPlace.h`, `WorldTexture.h`, `WorldMesh.h` and
 `src/nfs/WorldCollision.cpp` give the offsets and the addresses.
@@ -169,8 +172,6 @@ the entry, and `verify_table.py` checks it.
   after the merge of 0.2.7: there was no copy of those games on the machine.
   The port branches on the game, but regressions there are possible, and the
   package does not carry the Underground 2 plugins. Use the original for them.
-- **Test scripts** have the development machine's paths in them
-  (`D:\NFS World\...`). Change them before use.
 
 ## The original editor
 

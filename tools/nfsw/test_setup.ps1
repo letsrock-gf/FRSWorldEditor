@@ -1,7 +1,7 @@
 # Captures the setup wizard's first page (build-test copy, posted messages, no focus) to check the row of each
 # game. The wizard is never finished: the editor is closed while the page is up, so nothing is stored.
 param([string]$Out)
-$d = 'D:\NFS World\work\nfsw-world-editor\build-test\bin\Release'
+$d = "$(Split-Path (Split-Path $PSScriptRoot))\build-test\bin\Release"
 $log = "$d\FRSWorldEditor.log"
 Add-Type -AssemblyName System.Drawing
 Add-Type @'

@@ -1,7 +1,7 @@
 # Isolated look at the view (no input, nothing saved): starts the editor given by -Dir, goes to a camera, saves a
 # capture and prints the process's memory and frame figures. Run it on two builds to compare what the view draws.
 # The saved camera in the registry (shared with the editor Gui uses) is put back afterwards.
-param([string]$Dir = 'D:\NFS World\work\nfsw-world-editor\build-test\bin\Release', [string]$Out,
+param([string]$Dir = "$(Split-Path (Split-Path $PSScriptRoot))\build-test\bin\Release", [string]$Out,
       [single]$X = 2500, [single]$Y = 2000, [single]$Z = 220, [single]$Yaw = 0.8, [single]$Pitch = -0.25)
 $tools = $PSScriptRoot
 $log = "$Dir\FRSWorldEditor.log"

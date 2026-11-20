@@ -7,7 +7,7 @@
 # Usage: test_colwrite.ps1 -Out <scratch folder> [-Build build-col]
 param([string]$Out, [string]$Build = 'build-col')
 $tools = $PSScriptRoot
-$d = "D:\NFS World\work\nfsw-world-editor\$Build\bin\Release"
+$d = "$(Split-Path (Split-Path $PSScriptRoot))\$Build\bin\Release"
 $log = "$d\FRSWorldEditor.log"
 Add-Type @'
 using System;

@@ -3,7 +3,7 @@
 # Usage: test_export.ps1 <out folder> "x,y" ["x,y" ...]      (camera: the highway view)
 param([string]$Out, [Parameter(ValueFromRemainingArguments = $true)][string[]]$Points)
 $tools = $PSScriptRoot
-$d = 'D:\NFS World\work\nfsw-world-editor\build-test\bin\Release'
+$d = "$(Split-Path (Split-Path $PSScriptRoot))\build-test\bin\Release"
 $log = "$d\FRSWorldEditor.log"
 Add-Type @'
 using System;

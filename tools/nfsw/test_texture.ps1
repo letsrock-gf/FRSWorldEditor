@@ -1,7 +1,7 @@
 # Isolated test of texture replacement: the build-test editor replaces one texture with a test image and saves
 # into a scratch folder (FRS_WRITE_TRACKS). Never writes to the game.
 param([string]$Out, [string]$Hash, [string]$Image)
-$d = 'D:\NFS World\work\nfsw-world-editor\build-test\bin\Release'
+$d = "$(Split-Path (Split-Path $PSScriptRoot))\build-test\bin\Release"
 $log = "$d\FRSWorldEditor.log"
 New-Item -ItemType Directory -Force $Out | Out-Null
 Get-ChildItem $Out -Recurse -File | Remove-Item -Force

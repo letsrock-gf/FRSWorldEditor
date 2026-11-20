@@ -3,7 +3,7 @@
 # Zones, View > Animations and View > Sky through posted WM_COMMAND (no focus taken), captures two views and prints
 # the log lines that count what was read. The saved camera in the registry is put back afterwards.
 # Refuses to run while nfsw.exe runs.
-param([string]$Dir = 'D:\NFS World\work\nfsw-world-editor\build-read\bin\Release', [string]$Out = "$env:TEMP\frs-test-read",
+param([string]$Dir = "$(Split-Path (Split-Path $PSScriptRoot))\build-read\bin\Release", [string]$Out = "$env:TEMP\frs-test-read",
       [int[]]$Commands = @(44801, 44602, 44601), [switch]$Catch)
 if (Get-Process nfsw -ErrorAction SilentlyContinue) { "nfsw.exe is running: not starting the editor"; return }
 $tools = $PSScriptRoot
