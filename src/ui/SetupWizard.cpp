@@ -219,9 +219,29 @@ void GrantUsersModify(const std::wstring& path, bool folder) {
 
 InstallStatus Install(const SetupChoices& choices, std::wstring& report) {
     if (IsWorldFolder(choices.folder)) {
-        report = L"NFS World needs no plugin: nothing was installed. Save writes your edits into the map's "
-                 L"own files.\r\n";
-        return InstallStatus::Ok;
+        // Only what Launch Game needs, and only when asked for: Save writes into
+        // the map's own files and needs nothing in the game.
+        const std::wstring game = choices.folder;
+        const std::wstring plugin = PayloadFolder() + L"\\scripts\\editor-fast-test.asi";
+        Installer in{ choices };
+        if (choices.fastBoot && FileExists(plugin) && in.Folder(game + L"\\scripts")) {
+            const std::wstring loader = AsiLoaderIn(game);
+            if (!loader.empty())
+                in.report += L"Kept the ASI loader already in the game (" + loader + L")\r\n";
+            else if (choices.asiLoader)
+                in.Copy(PayloadFolder() + L"\\dinput8.dll", game + L"\\dinput8.dll", L"Ultimate ASI Loader (dinput8.dll)");
+            else
+                in.report += L"No ASI loader installed: the plugin only loads with one\r\n";
+            in.Copy(plugin, game + L"\\scripts\\editor-fast-test.asi",
+                    L"the fast-test plugin (scripts\\editor-fast-test.asi)");
+            in.report += L"The first Launch Game asks what starts your game.\r\n";
+        } else if (in.status == InstallStatus::Ok) {
+            in.report += L"Nothing was installed into the game.\r\n";
+        }
+        in.report += L"Save writes your edits into the map's own files and keeps the shipped ones in "
+                     L"TRACKS\\frs-original.\r\n";
+        report = in.report;
+        return in.status;
     }
     Installer in{ choices };
     const std::wstring game = choices.folder;
@@ -532,7 +552,10 @@ INT_PTR CALLBACK FolderPage(HWND dialog, UINT message, WPARAM wParam, LPARAM lPa
                         if (!folders[row]->empty() && !RowValid(row, *folders[row])) wrong = true;
                     if (wrong) { Stay(dialog); return TRUE; }
                     c.folder = *folders[main];
-                    if (main != kRowUnderground2) {
+                    // NFS World goes on to the plugins page when the package has its plugin.
+                    const bool worldPlugins =
+                        main == kRowWorld && FileExists(PayloadFolder() + L"\\scripts\\editor-fast-test.asi");
+                    if (main != kRowUnderground2 && !worldPlugins) {
                         // The plugins are Underground 2's: nothing to install.
                         wizard->installed = true;
                         wizard->installOk = true;
@@ -561,27 +584,8 @@ void DescribeParts(HWND dialog) {
     Wizard* wizard = WizardOf(dialog);
     const std::wstring& folder = wizard->choices.folder;
 
-    // NFS World: there is nothing to install, so the page only says so and
-    // lets the wizard go on. Without this it waited for a "game" folder of
-    // Underground 2 plugins and could never be finished.
-    if (IsWorldFolder(folder)) {
-        for (int id : { IDC_SETUP_ASILOADER, IDC_SETUP_LOADER, IDC_SETUP_FASTBOOT,
-                        IDC_SETUP_FASTBOOT_ALWAYS }) {
-            Check(dialog, id, false);
-            Enable(dialog, id, false);
-        }
-        ::ShowWindow(::GetDlgItem(dialog, IDC_SETUP_DISABLE_OLD), SW_HIDE);
-        SetText(dialog, IDC_SETUP_ASILOADER_NOTE, L"Not used with NFS World.");
-        SetText(dialog, IDC_SETUP_PARTS_NOTE,
-                L"NFS World needs none of these. Save writes objects removed, moved and placed, "
-                L"new and edited models, textures and collision into the map's own files; the "
-                L"shipped files are kept in TRACKS\\frs-original. Roads, terrain and markers are "
-                L"not written to NFS World yet.");
-        PropSheet_SetWizButtons(::GetParent(dialog), PSWIZB_BACK | PSWIZB_NEXT);
-        PropSheet_SetNextText(::GetParent(dialog), L"&Next");
-        return;
-    }
-
+    // What both games share: the ASI loader.
+    const bool world = IsWorldFolder(folder);
     const std::wstring loader = AsiLoaderIn(folder);
     const bool haveLoaderFile = PayloadHas(L"dinput8.dll");
     Check(dialog, IDC_SETUP_ASILOADER, loader.empty() && haveLoaderFile);
@@ -590,6 +594,33 @@ void DescribeParts(HWND dialog) {
             !loader.empty() ? L"The game already has one (" + loader + L"); it is kept."
             : haveLoaderFile ? std::wstring(L"Loads the plugins below when the game starts. By ThirteenAG, MIT license.")
                              : std::wstring(L"Not in this package: install an ASI loader yourself."));
+
+    // The page is laid out for Underground 2. NFS World shows what it has of
+    // it -- the loader and the plugin Launch Game needs -- and hides the rest.
+    for (int id : { IDC_SETUP_LOADER, IDC_SETUP_LOADER_NOTE, IDC_SETUP_FASTBOOT_ALWAYS })
+        ::ShowWindow(::GetDlgItem(dialog, id), world ? SW_HIDE : SW_SHOW);
+    SetText(dialog, IDC_SETUP_FASTBOOT, world ? L"Fast test plugin (editor-fast-test.asi)" : L"FRSFastTest");
+    SetText(dialog, IDC_SETUP_FASTBOOT_NOTE,
+            world ? L"Launch Game in the editor passes the title and the driver select by itself and puts "
+                    L"the car where the camera is."
+                  : L"Launch Game in the editor goes straight into free roam, with the car where the camera is.");
+    if (world) {
+        const bool havePlugin = PayloadHas(L"scripts\\editor-fast-test.asi");
+        Check(dialog, IDC_SETUP_FASTBOOT, havePlugin);
+        Enable(dialog, IDC_SETUP_FASTBOOT, havePlugin);
+        Check(dialog, IDC_SETUP_FASTBOOT_ALWAYS, false);
+        Check(dialog, IDC_SETUP_DISABLE_OLD, false);
+        ::ShowWindow(::GetDlgItem(dialog, IDC_SETUP_DISABLE_OLD), SW_HIDE);
+        SetText(dialog, IDC_SETUP_PARTS_NOTE,
+                havePlugin ? L"Both are optional and only serve Launch Game: dinput8.dll goes beside nfsw.exe, "
+                             L"the plugin into scripts\\. Save needs neither: it writes your edits into the "
+                             L"map's own files and keeps the shipped ones in TRACKS\\frs-original."
+                           : L"This copy of the editor has no \"game\" folder beside it, so there is nothing "
+                             L"to install. Save needs none: it writes your edits into the map's own files.");
+        PropSheet_SetWizButtons(::GetParent(dialog), PSWIZB_BACK | PSWIZB_NEXT);
+        PropSheet_SetNextText(::GetParent(dialog), havePlugin ? L"&Install" : L"&Next");
+        return;
+    }
 
     Check(dialog, IDC_SETUP_LOADER, true);
     Enable(dialog, IDC_SETUP_LOADER, false);
@@ -843,7 +874,7 @@ bool RunSetupWizard(HINSTANCE instance, HWND owner, std::wstring& folder) {
 
     PROPSHEETPAGEW pages[] = {
         Page(instance, IDD_SETUP_FOLDER, FolderPage, L"Your games", &wizard),
-        Page(instance, IDD_SETUP_PARTS, PartsPage, L"Plugins for Need for Speed Underground 2", &wizard),
+        Page(instance, IDD_SETUP_PARTS, PartsPage, L"Plugins for the game", &wizard),
         Page(instance, IDD_SETUP_DONE, DonePage, L"Setup finished", &wizard),
     };
     HPROPSHEETPAGE handles[3] = {};

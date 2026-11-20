@@ -2,7 +2,8 @@
 #
 #   dist\FRSWorldEditor-NFSW-<version>\     what a player unzips anywhere
 #       FRSWorldEditor.exe                  the editor; nothing is installed into NFS World
-#       game\scripts\editor-fast-test.asi   for Launch Game: copied into the game by hand
+#       game\dinput8.dll                    Ultimate ASI Loader (ThirteenAG, MIT)
+#       game\scripts\editor-fast-test.asi   for Launch Game; the setup installs both when asked
 #       README.txt, LICENSE.txt
 #   dist\FRSWorldEditor-NFSW-<version>.zip  the same, zipped
 #
@@ -14,13 +15,19 @@
 # Underground 2 plugins are not in it: that package is the original's.
 
 # -MinHook <folder>: a copy of MinHook 1.3.4 on disk, instead of downloading it.
-param([string]$Version = "0.2.7-nfsw.2", [string]$MinHook)
+# -AsiLoader <folder>: where Ultimate ASI Loader's 32-bit dinput8.dll and its LICENSE.txt are. The original's
+# package.ps1 downloads them into third_party\asi-loader; any release of the loader put there by hand does too.
+param([string]$Version = "0.2.7-nfsw.2", [string]$MinHook,
+      [string]$AsiLoader = (Join-Path $PSScriptRoot "third_party\asi-loader"))
 
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
 $name = "FRSWorldEditor-NFSW-$Version"
 $stage = Join-Path $root "dist\$name"
 
+foreach ($file in "dinput8.dll", "LICENSE.txt") {
+    if (-not (Test-Path (Join-Path $AsiLoader $file))) { throw "$file of Ultimate ASI Loader is not in $AsiLoader (see -AsiLoader)" }
+}
 $cmake = (Get-Command cmake -ErrorAction SilentlyContinue).Source
 if (-not $cmake) {
     $cmake = "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
@@ -45,6 +52,7 @@ if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 New-Item -ItemType Directory -Force -Path (Join-Path $stage "game\scripts") | Out-Null
 Copy-Item (Join-Path $root "build-release\bin\Release\FRSWorldEditor.exe") $stage
 Copy-Item (Join-Path $fast "build\Release\editor-fast-test.asi") (Join-Path $stage "game\scripts")
+Copy-Item (Join-Path $AsiLoader "dinput8.dll") (Join-Path $stage "game")
 
 $readme = @(
     "FRS World Editor -- NFS World port $Version",
@@ -58,19 +66,20 @@ $readme = @(
     "1. Back up your game's TRACKS folder. This port is still being tested.",
     "2. Close the game and run FRSWorldEditor.exe.",
     "3. On the setup's `"Your games`" page, give the folder that holds nfsw.exe in the",
-    "   Need for Speed World row. Nothing is installed into the game.",
+    "   Need for Speed World row.",
     "4. The map takes about half a minute to load.",
     "5. Ctrl+Shift+S writes your edits into the game. The shipped files are kept in",
     "   TRACKS\frs-original.",
     "",
     "Launch Game / Fast test (optional) start your game from the editor, pass the",
-    "title and the driver select and put the car at the editor's camera. They need:",
-    "  a. an ASI loader in the game folder (for example Ultimate ASI Loader);",
-    "  b. game\scripts\editor-fast-test.asi of this package copied to the game's",
-    "     scripts folder;",
-    "  c. a file named editor-launch.cmd in the game folder, holding the command",
-    "     that starts your game: your launcher, or nfsw.exe with your server's",
-    "     arguments.",
+    "title and the driver select and put the car at the editor's camera:",
+    "  a. the setup's next page offers the two files it needs -- an ASI loader",
+    "     (dinput8.dll) and the plugin scripts\editor-fast-test.asi -- and copies",
+    "     them into the game folder when you press Install. Both are in the game",
+    "     folder of this package; File > Game Folder and Plugins runs the setup again;",
+    "  b. the first Launch Game asks what starts your game: pick your launcher.",
+    "     The answer is kept as editor-launch.cmd in the game folder.",
+    "Saving needs neither.",
     "",
     "What works, what was tested and what does not work yet is on the port's page.",
     "For Need for Speed Underground 2, use the original: this package does not carry",
@@ -123,7 +132,14 @@ $license = @(
     "   BSD 2-Clause",
     $rule,
     "",
-    (Get-Content $minhookLicense -Raw).TrimEnd()
+    (Get-Content $minhookLicense -Raw).TrimEnd(),
+    "",
+    $rule,
+    "6. Ultimate ASI Loader (game\dinput8.dll), by ThirteenAG -- MIT",
+    "   https://github.com/ThirteenAG/Ultimate-ASI-Loader",
+    $rule,
+    "",
+    (Get-Content (Join-Path $AsiLoader "LICENSE.txt") -Raw).TrimEnd()
 )
 ($license -join "`r`n") + "`r`n" | Set-Content (Join-Path $stage "LICENSE.txt") -Encoding utf8 -NoNewline
 

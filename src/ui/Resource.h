@@ -181,6 +181,8 @@
 #define IDC_SETUP_NFSW_PATH    2720
 #define IDC_SETUP_NFSW_BROWSE  2721
 #define IDC_SETUP_NFSW_STATUS  2722
+#define IDC_SETUP_LOADER_NOTE  2723
+#define IDC_SETUP_FASTBOOT_NOTE 2724
 
 // Worlds (sets of edits)
 #define ID_EDIT_UNDO           40420

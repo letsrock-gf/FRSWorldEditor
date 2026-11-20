@@ -25,12 +25,14 @@ Underground 2, use [the original](https://github.com/chrystianfarias/FRSWorldEdi
 ## Download and first run
 
 1. Get the zip from the [Releases](../../releases) page and unzip it anywhere.
-   It holds `FRSWorldEditor.exe` and nothing to install.
+   It holds `FRSWorldEditor.exe` and, in `game`, two optional files for Launch
+   Game.
 2. **Back up your game's `TRACKS` folder first.** The editor keeps the shipped
    files by itself (see below), but this is a port still being tested.
 3. Close the game, run `FRSWorldEditor.exe`, and on the setup's "Your games"
    page give the folder that holds `nfsw.exe` in the **Need for Speed World**
-   row. Nothing is installed into the game.
+   row. The next page offers to install what Launch Game needs; saving needs
+   nothing in the game, so you may untick both.
 4. The window shows at once and the map loads after it: about half a minute and
    about 3.5 GB of memory on the development machine.
 5. Right mouse looks around, `W` `A` `S` `D` moves, `Q` / `E` down / up, Shift
@@ -65,7 +67,9 @@ Save refuses while `nfsw.exe` runs: the game holds the map's files open.
 
 ### Editor
 
-- **Setup:** the "Your games" page has a row for Need for Speed World.
+- **Setup:** the "Your games" page has a row for Need for Speed World, and the
+  plugins page installs what Launch Game needs there: an ASI loader
+  (`dinput8.dll`, kept if the game already has one) and the fast-test plugin.
 - **Dark theme** for the whole program. `FRS_LIGHT=1` in the environment turns
   it off.
 - **Texture Browser:** Replace, Restore, save as image, and a search field that
@@ -77,10 +81,11 @@ Save refuses while `nfsw.exe` runs: the game holds the map's files open.
   started.
 - **View > Clip Start / End and Detail**, to draw less of a large map.
 - **Launch Game / Fast test** on an NFS World folder start the real game (the
-  original's built-in drive mode needs Underground 2's `SPEED2.EXE`), with
-  your own command (`editor-launch.cmd`), and a small ASI takes it straight
-  into free roam with the car at the editor's camera. See the limitations for
-  the three things to set up.
+  original's built-in drive mode needs Underground 2's `SPEED2.EXE`). The
+  first time, the editor asks what starts your game -- your launcher, or a
+  `.cmd` of your own -- and keeps the answer as `editor-launch.cmd` in the
+  game folder. The fast-test plugin then passes the title and the driver
+  select by code and puts the car at the editor's camera.
 
 ### Tools
 
@@ -128,10 +133,12 @@ has only scripted checks.
   came out byte for byte as the build before the merge had written them, and
   `verify_table.py` found an entry for all 469 sections.
 - **In game.** Ground collision added in the editor (a speed bump) is driven
-  over without bouncing. The fast-test ASI, as built from `fasttest-nfsw`,
-  reaches free roam with no input, with and without a car position (started
-  by script, on the author's setup). The editor running an `editor-launch.cmd`
-  has a scripted check only.
+  over without bouncing. The fast-test plugin, as built from `fasttest-nfsw`
+  and loaded by the Ultimate ASI Loader 10.0.0 the package carries, reaches
+  free roam with no input, with and without a car position (started by
+  script, on the author's setup). The setup installing the two files, and the
+  editor asking for and running an `editor-launch.cmd`, have scripted checks
+  only, on a scratch game folder.
 - **Not confirmed in game, item by item:** placed objects and their physics,
   edited and new models, new textures, walls after the one-side fix, key `I`,
   the grown `L5RA.BUN`.
@@ -161,19 +168,15 @@ the entry, and `verify_table.py` checks it.
   that the polygon is left out of the save and the status bar counts it.
 - **Culling tree:** the game walks it with a 64-entry stack. A save that would
   pass it is refused, and the message names the section and the object.
-- **Launch Game / Fast test** need setting up by hand (the setup does not do
-  it), and were tried only on the author's setup:
-  1. an ASI loader in the game folder, for example
-     [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader);
-  2. `editor-fast-test.asi` copied to the game's `scripts` folder. It is in
-     the package under `game\scripts`; its source is in `fasttest-nfsw`;
-  3. a file named `editor-launch.cmd` in the game folder, holding the command
-     that starts your game: your launcher, or `nfsw.exe` with your server's
-     arguments. Without it the editor says so and starts nothing.
-
-  The ASI passes the title and the driver select by code and puts the car at
-  the editor's camera. It checks the hash of `nfsw.exe` and does nothing on
-  another build. The game's own loading screens are never skipped.
+- **Launch Game / Fast test** were tried only on the author's setup. The
+  plugin checks the hash of `nfsw.exe` and does nothing on another build: the
+  game then starts the usual way. If your launcher asks for a login or a click
+  before it starts the game, you still do that part; the plugin takes over
+  when the game itself starts, within ten minutes of the click in the editor.
+  A game that already has a `dinput8.dll` keeps it, and the plugin only loads
+  if that file is an ASI loader. The game's own loading screens are never
+  skipped. Delete `editor-launch.cmd` in the game folder to choose another
+  way of starting the game.
 - **Game look and sky** on NFS World were not compared with the game.
 - **The original's newest tools on NFS World** (new regions, region import,
   the model library across games) were not tried on an NFS World folder. The
@@ -226,7 +229,10 @@ cmake --build fasttest-nfsw/build --config Release
 ```
 
 `package-nfsw.ps1` builds both (the editor without New Region / Import Region,
-as the original's releases) and writes the folder and the zip to `dist\`.
+as the original's releases) and writes the folder and the zip to `dist\`. It
+takes Ultimate ASI Loader's 32-bit `dinput8.dll` and its `LICENSE.txt` from
+`third_party\asi-loader`, which is not in the repository: put a release of
+the loader there first.
 `package.ps1` is the original's and also builds the Underground 2 plugins,
 from repositories that are not here.
 

@@ -2130,15 +2130,50 @@ void MainWindow::LaunchWorldGame() {
     const std::wstring root = gameFolder_.substr(0, gameFolder_.find_last_of(L'\\'));
     const std::wstring custom = gameFolder_ + L"\\editor-launch.cmd";
     const std::wstring launcher = root + L"\\scripts\\launch-offline.cjs";
-    const bool hasCustom = ::GetFileAttributesW(custom.c_str()) != INVALID_FILE_ATTRIBUTES;
+    bool hasCustom = ::GetFileAttributesW(custom.c_str()) != INVALID_FILE_ATTRIBUTES;
     if (!hasCustom && ::GetFileAttributesW(launcher.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        ::MessageBoxW(window_,
-                      Format(L"The editor does not know how to start your game.\n\nPut a file named "
-                             L"editor-launch.cmd in the game folder, holding the command that starts the "
-                             L"game: your launcher, or nfsw.exe with your server's arguments.\n\n%s",
-                             custom.c_str()).c_str(),
-                      kWindowTitle, MB_ICONINFORMATION | MB_OK);
-        return;
+        // The first time: ask what starts the game, and keep the answer as that
+        // file. FRS_TEST_LAUNCHER=<file> answers for scripted checks.
+        wchar_t starter[MAX_PATH * 2] = {};
+        if (!::GetEnvironmentVariableW(L"FRS_TEST_LAUNCHER", starter, MAX_PATH * 2)) {
+            if (::MessageBoxW(window_,
+                              L"The editor does not know how to start your game yet.\n\nChoose what starts it: "
+                              L"your launcher, or a .cmd of your own that runs nfsw.exe with your server's "
+                              L"arguments.\n\nThe choice is kept as editor-launch.cmd in the game folder; "
+                              L"delete that file to choose again.",
+                              kWindowTitle, MB_ICONINFORMATION | MB_OKCANCEL) != IDOK)
+                return;
+            OPENFILENAMEW dialog{};
+            dialog.lStructSize = sizeof(dialog);
+            dialog.hwndOwner = window_;
+            dialog.lpstrFilter = L"Programs and scripts\0*.exe;*.cmd;*.bat;*.lnk\0All files\0*.*\0";
+            dialog.lpstrFile = starter;
+            dialog.nMaxFile = MAX_PATH * 2;
+            dialog.lpstrTitle = L"What starts your game?";
+            dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+            if (!::GetOpenFileNameW(&dialog)) return;
+        }
+        const std::wstring picked = starter;
+        const std::wstring pickedFolder = picked.substr(0, picked.find_last_of(L"\\/"));
+        // UTF-8, so any folder name survives; chcp has cmd read it as such.
+        const std::wstring lines = L"@echo off\r\nchcp 65001 >nul\r\ncd /d \"" + pickedFolder +
+                                   L"\"\r\nstart \"\" \"" + picked + L"\"\r\n";
+        std::string bytes(lines.size() * 4, '\0');
+        bytes.resize((size_t)::WideCharToMultiByte(CP_UTF8, 0, lines.c_str(), (int)lines.size(), bytes.data(),
+                                                   (int)bytes.size(), nullptr, nullptr));
+        FILE* file = nullptr;
+        if (::_wfopen_s(&file, custom.c_str(), L"wb") != 0 || !file) {
+            ::MessageBoxW(window_,
+                          Format(L"Could not write\n%s\n\nWrite that file yourself -- one line that starts "
+                                 L"your game -- or run the editor as administrator once.",
+                                 custom.c_str()).c_str(),
+                          kWindowTitle, MB_ICONWARNING | MB_OK);
+            return;
+        }
+        std::fwrite(bytes.data(), 1, bytes.size(), file);
+        std::fclose(file);
+        LOG_INFO("launch: %S starts the game, kept in %S", picked.c_str(), custom.c_str());
+        hasCustom = true;
     }
 
     SaveWorld();

@@ -1,7 +1,8 @@
 # Isolated check of Launch Game's own command on NFS World (build-test copy, posted messages, no focus, no game
 # started): a scratch game folder (junctions to the real TRACKS and GLOBAL, an empty nfsw.exe) gets an
 # editor-launch.cmd that only leaves a note. Launch Game must run it from the game folder and leave the request
-# for editor-fast-test.asi; without the file, and with no launcher beside the folder, it must say how to set one.
+# for editor-fast-test.asi; without the file, and with no launcher beside the folder, it must ask what starts the
+# game (FRS_TEST_LAUNCHER answers), keep the answer as editor-launch.cmd and run it.
 param([Parameter(Mandatory = $true)][string]$Out)
 $d = "$(Split-Path (Split-Path $PSScriptRoot))\build-test\bin\Release"
 $log = "$d\FRSWorldEditor.log"
@@ -47,6 +48,8 @@ New-Item -ItemType File "$game\nfsw.exe" | Out-Null
 Remove-Item Env:FRS_TEST_TEXTURE, Env:FRS_TEST_EXPORT, Env:FRS_TEST_SAVE, Env:FRS_TEST_REVERT, Env:FRS_TEST_LAUNCH_POSE -ErrorAction SilentlyContinue
 $env:FRS_GAME_FOLDER = $game
 $env:FRS_WRITE_TRACKS = "$Out\tracks"
+[IO.File]::WriteAllText("$Out\my-launcher.cmd", "@echo launcher in %CD%> `"%~dp0launcher-ran.txt`"`r`n")
+$env:FRS_TEST_LAUNCHER = "$Out\my-launcher.cmd"
 Remove-Item $log -ErrorAction SilentlyContinue
 try {
     $p = Start-Process "$d\FRSWorldEditor.exe" -WorkingDirectory $d -PassThru
@@ -68,19 +71,22 @@ try {
     Select-String -Path $log -Pattern 'launch' | ForEach-Object { "  $($_.Line)" }
     $one = ($note -eq "started in $game") -and ($request -match '^(pose |menus$)')
 
-    # 2. without it, and with no launcher beside the folder
+    # 2. without it, and with no launcher beside the folder: the answer is kept and run
     Remove-Item "$game\editor-launch.cmd", "$game\launched.txt" -Force
     Remove-Item "$game\scripts\editor-fast-test.txt" -ErrorAction SilentlyContinue
     [Launch]::PostMessageW($main[0], 0x111, [IntPtr]1007, [IntPtr]::Zero) | Out-Null
-    Start-Sleep 4
-    $box = @([Launch]::Tops([uint32]$p.Id) | Where-Object { $main -notcontains $_ })
-    $said = if ($box) { ([Launch]::Texts($box[0]) -join ' | ') } else { '' }
-    "without a command: '$($said.Substring(0, [Math]::Min(230, $said.Length)))'"
-    $two = ($said -match 'editor-launch\.cmd') -and -not (Test-Path "$game\scripts\editor-fast-test.txt")
-    if ($one -and $two) { 'PASSED' } else { "FAILED (own command $one, message $two)" }
+    $deadline = (Get-Date).AddSeconds(60)
+    while ((Get-Date) -lt $deadline -and -not (Test-Path "$Out\launcher-ran.txt")) { Start-Sleep 1 }
+    $kept = if (Test-Path "$game\editor-launch.cmd") { (Get-Content "$game\editor-launch.cmd") -join ' / ' } else { '' }
+    $ran = if (Test-Path "$Out\launcher-ran.txt") { (Get-Content "$Out\launcher-ran.txt" -Raw).Trim() } else { '' }
+    "kept command: '$kept'"
+    "launcher: '$ran'"
+    $two = ($kept -like "*start `"`" `"$Out\my-launcher.cmd`"*") -and ($ran -eq "launcher in $Out") -and
+           (Test-Path "$game\scripts\editor-fast-test.txt")
+    if ($one -and $two) { 'PASSED' } else { "FAILED (own command $one, first-time choice $two)" }
 } finally {
     if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force }
     Start-Sleep 1
     Unlink "$game\TRACKS"; Unlink "$game\GLOBAL"
-    Remove-Item Env:FRS_GAME_FOLDER, Env:FRS_WRITE_TRACKS -ErrorAction SilentlyContinue
+    Remove-Item Env:FRS_GAME_FOLDER, Env:FRS_WRITE_TRACKS, Env:FRS_TEST_LAUNCHER -ErrorAction SilentlyContinue
 }
