@@ -2935,6 +2935,9 @@ void MainWindow::SetGameFolder(const std::wstring& folder) {
         std::wstring beside = self;
         beside.resize(beside.find_last_of(L'\\'));
         modelsFolder_ = beside + L"\\nfsw-models";
+        // Made here: the roads, terrain and undo copies are written into it, and
+        // without the folder those writes failed (a drawn road network was lost).
+        ::CreateDirectoryW(modelsFolder_.c_str(), nullptr);
     }
     // The world file last opened or saved, and how <game>\models stood then
     // -- only for the game folder it was opened into. A session on another

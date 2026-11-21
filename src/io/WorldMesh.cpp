@@ -718,8 +718,8 @@ struct Donor {
     u32 effect = 0;
 };
 
-bool FindDonor(const nfs::World& world, const nfs::LoadedSection& target, u32 texture, Donor& out) {
-    for (const u32 hash : LoadedWith(target)) {
+bool FindDonorIn(const nfs::World& world, const std::vector<u32>& models, u32 texture, Donor& out) {
+    for (const u32 hash : models) {
         const nfs::SolidObject* model = world.FindModel(hash);
         if (!model || std::find(model->textureHashes.begin(), model->textureHashes.end(), texture) ==
                           model->textureHashes.end())
@@ -774,6 +774,26 @@ bool FindDonor(const nfs::World& world, const nfs::LoadedSection& target, u32 te
         }
     }
     return false;
+}
+
+bool FindDonor(const nfs::World& world, const nfs::LoadedSection& target, u32 texture, Donor& out) {
+    return FindDonorIn(world, LoadedWith(target), texture, out);
+}
+
+// The same, from any shipped model of the region that draws with `texture`
+// first: the game's own material for it, its normal and specular maps
+// included (a road strip: effect 3, slots diffuse, normal, diffuse, specular,
+// diffuse; tools/nfsw/texture_users.py). Models are tried in hash order, so
+// the choice is the same every time.
+bool FindDonorAnywhere(const nfs::World& world, u32 texture, Donor& out) {
+    std::vector<u32> users;
+    for (const nfs::SolidObject* model : world.AllModels())
+        if (model && std::find(model->textureHashes.begin(), model->textureHashes.end(), texture) !=
+                         model->textureHashes.end())
+            users.push_back(model->hash);
+    std::sort(users.begin(), users.end());
+    users.erase(std::unique(users.begin(), users.end()), users.end());
+    return FindDonorIn(world, users, texture, out);
 }
 
 // The texture an OBJ material names: tex_<hash> (the editor's own), else the
@@ -888,12 +908,27 @@ bool BuildNewNode(const nfs::World& world, const nfs::World::NewModel& entry, co
             // A new texture's material is the one of the game texture it copies.
             const nfs::World::NewTexture* made = NewTextureOf(world, texture);
             Donor donor;
-            if (!FindDonor(world, *target, made ? made->like : texture, donor)) {
+            bool have = FindDonor(world, *target, made ? made->like : texture, donor);
+            if (!have && !made) {
+                // A game texture no model of the section draws with (the road
+                // bake's): the material a shipped model elsewhere draws it
+                // with; failing that, the material of a texture the section
+                // does draw with, alpha alike, with this texture first, as a
+                // new texture's. The save copies every texture the material
+                // names in beside the section's (StageCopiedTextures).
+                have = FindDonorAnywhere(world, texture, donor);
+                if (!have) {
+                    const nfs::Texture* game = world.FindTexture(texture);
+                    const u32 like = game ? PickLikeTexture(world, *target, nfs::AlphaIsOpacity(*game)) : 0u;
+                    have = like && FindDonor(world, *target, like, donor);
+                }
+            }
+            if (!have) {
                 why = L"no model section " + Widen(target->info->name) + L" draws with texture " +
                       Hex(made ? made->like : texture) + L" as its first, in a layout the editor writes";
                 return false;
             }
-            if (made) donor.slots[0] = texture;
+            donor.slots[0] = texture;
             found = donors.emplace(texture, std::move(donor)).first;
         }
         Part part;
@@ -1303,17 +1338,25 @@ std::vector<u32> StageCopiedTextures(nfs::World& world) {
         u32 host = 0;   // a texture of the section whose pack takes the copies
         for (const auto& placement : loaded.placements) {
             const u32 hash = placement.instance.modelHash;
-            if (std::binary_search(here.begin(), here.end(), hash)) continue;
+            // A model the editor made here may draw with game textures the
+            // section's own models do not (BuildNewNode): those come too.
+            const bool loaded_here = std::binary_search(here.begin(), here.end(), hash);
+            const bool made = loaded_here && NewModelOf(world, hash) != nullptr;   // made in this section
+            if (loaded_here && !made) continue;
             const nfs::SolidObject* model = world.FindModel(hash);
             if (!model) continue;
             if (!read) {
-                textures = SectionTextures(world, here);
+                std::vector<u32> shipped;
+                for (u32 h : here)
+                    if (!NewModelOf(world, h)) shipped.push_back(h);
+                textures = SectionTextures(world, shipped);
                 read = true;
                 for (const u32 t : textures)
                     if (!NewTextureOf(world, t) && !TextureHosts(world, t).empty()) { host = t; break; }
             }
             for (const u32 t : model->textureHashes) {
                 if (std::binary_search(textures.begin(), textures.end(), t)) continue;
+                if (made && NewTextureOf(world, t)) continue;   // made or already copied: written as such
                 std::wstring why;
                 if (!host || !StageCopiedWorldTexture(world, t, host, why)) {
                     LOG_WARN("texture %08X of %s placed in %s not copied: %S", t, model->name.c_str(),

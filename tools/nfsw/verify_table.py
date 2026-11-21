@@ -75,26 +75,29 @@ def check(ok, text):
     print(("ok   " if ok else "FAIL ") + text)
 
 
-# The file grows by the ids of the physical props placed (chunk 0x34108, io/WorldPlace.h); it never shrinks.
+# The file grows by the ids of the physical props placed (chunk 0x34108, io/WorldPlace.h) and by widened
+# streaming zones (0x34152, before the table: the table moves); it never shrinks.
 check(len(new) >= len(old), "table file is not smaller than the shipped one (+%d bytes)" % (len(new) - len(old)))
 start, count = table(old)
+moved = table(new)[0] - start   # where the written table is, in the written file
 written = {n.upper() for n in os.listdir(out) if n.upper().startswith("STREAML5RA_")}
 seen = 0
 for i in range(count):
     e = start + i * 208
+    n = e + moved   # the same entry in the written file
     name = old[e:e + 8].split(b"\0")[0].decode("latin1")
     files = [f"STREAML5RA_{u32(old, e + 8)}.BUN", f"STREAML5RA_0x{u32(old, e + 0x1C):08X}.BUN"]
     file = next((f for f in files if f.upper() in written), None)
     if not file:
-        if new[e:e + 208] != old[e:e + 208]:
+        if new[n:n + 208] != old[e:e + 208]:
             check(False, f"{name}: entry changed but no file was written for it")
         continue
     seen += 1
     f = open(os.path.join(out, file), "rb").read()
     parts = u32(old, e + 0x5C)
-    got = [struct.unpack_from("<3I", new, e + 0x60 + 12 * k) for k in range(parts)]
+    got = [struct.unpack_from("<3I", new, n + 0x60 + 12 * k) for k in range(parts)]
     was = [struct.unpack_from("<3I", old, e + 0x60 + 12 * k) for k in range(parts)]
-    rest_same = new[e:e + 0x60] == old[e:e + 0x60] and new[e + 0x60 + 12 * parts:e + 208] == old[e + 0x60 + 12 * parts:e + 208]
+    rest_same = new[n:n + 0x60] == old[e:e + 0x60] and new[n + 0x60 + 12 * parts:n + 208] == old[e + 0x60 + 12 * parts:e + 208]
     shipped = next((os.path.join(d, file) for d in shipped_folders if os.path.exists(os.path.join(d, file))), None)
     if parts == 1:
         delta = len(f) - os.path.getsize(shipped) if shipped else None

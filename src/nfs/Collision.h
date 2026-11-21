@@ -133,6 +133,20 @@ void ParseCollisionPolygons(ByteSpan polygons, std::vector<CollisionPolygon>& ou
 // the hash itself and `flags` the triangle's or barrier's flag byte.
 bool ParseWorldCollision(const Chunk& collisionChunk, CollisionPack& out);
 
+// NFS World surface hashes (Attrib lookup2 of the simsurface names, measured
+// on the shipped packs; memory null-surface-reset). An added polygon whose
+// `attributes` hold one of these is written with that surface; any other added
+// polygon takes its article's first surface that is not null.
+constexpr u32 kWorldAsphalt = 0x19DB2F1E;
+constexpr u32 kWorldConcrete = 0x6CA26F9B;
+constexpr u32 kWorldGrass = 0x772FB736;
+constexpr u32 kWorldGravel = 0xC1C577D6;
+inline bool IsWorldSurface(u32 hash) {
+    return hash == kWorldAsphalt || hash == kWorldConcrete || hash == kWorldGrass || hash == kWorldGravel;
+}
+// The byte `surface` holds for an NFS World surface hash (the parser's fold).
+inline u8 WorldSurfaceId(u32 hash) { return (u8)((hash * 2654435761u) >> 24); }
+
 // Takes polygons out of an NFS World pack where it stands: `payload` is the
 // chunk's payload, filler included, and `removed` the `source` of each polygon
 // to drop. The articles that lose polygons are written again -- a strip cut in

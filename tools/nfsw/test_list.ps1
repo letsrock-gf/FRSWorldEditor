@@ -2,8 +2,8 @@
 # -Textures but the last goes into the list the editor reads at load, the last is replaced after loading
 # (FRS_TEST_TEXTURE) and the save follows. Sections whose textures came from the list must be written too,
 # or the section table loses what they grew by. verify_resize.py reads the result.
-param([string]$Out, [string]$Textures, [string]$List)
-$d = "$(Split-Path (Split-Path $PSScriptRoot))\build-test\bin\Release"
+param([string]$Out, [string]$Textures, [string]$List, [string]$Exe)
+$d = if ($Exe) { $Exe } else { "$(Split-Path (Split-Path $PSScriptRoot))\build-test\bin\Release" }
 $log = "$d\FRSWorldEditor.log"
 $images = @(Get-ChildItem $Textures -File | Sort-Object Name)
 if ($images.Count -lt 2) { "need two images or more in $Textures"; return }

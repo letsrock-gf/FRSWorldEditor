@@ -14,6 +14,7 @@
 #include "core/Log.h"
 #include "io/CollisionEdit.h"
 #include "io/TextureImport.h"
+#include "io/WorldWrite.h"
 #include "nfs/SceneryEdit.h"
 #include "nfs/TextureDecode.h"
 #include "nfs/World.h"
@@ -46,6 +47,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdarg>
+#include <cstring>
 #include <cwchar>
 #include <filesystem>
 #include <fstream>
@@ -72,6 +74,7 @@ struct RoadsAccess {
     nfs::World* World() const { return w.world_.get(); }
     const std::wstring& ModelsFolder() const { return w.modelsFolder_; }
     const std::wstring& GameFolder() const { return w.gameFolder_; }
+    const std::wstring& TracksFolder() const { return w.tracksFolder_; }
     void Status(const std::wstring& text) const { w.SetStatusText(2, text); }
     void RebuildTree() const { w.PopulateSectionTree(); }
     void UpdateMenuChecks() const { w.UpdateMenuChecks(); }
@@ -105,6 +108,91 @@ namespace {
 
 // How far ahead a pulled-out road's new end is put.
 constexpr float kPullLength = 30.0f;
+
+// NFS World holds none of the Underground 2 textures the road profiles name
+// by default (RDP_*, ARC_*: no RDP_ name in Data2015\TRACKS). A name the
+// region does not hold is drawn with the NFS World texture for the same part
+// of a road (tools/nfsw/road_textures.py lists the map's road textures).
+std::string WorldRoadTexture(const std::string& name) {
+    const auto has = [&](const char* part) { return name.find(part) != std::string::npos; };
+    if (has("LANEA")) return "TRNS_ALL_LA_PAVEMENTA_YL_01";        // yellow line beside the centre
+    if (has("LANEB_WD")) return "TRNS_ALL_LB_PAVEMENTA_WD_01";     // white dashes between lanes
+    if (has("LANEB")) return "TRNS_ALL_LB_PAVEMENTA_WL_01";        // solid white line
+    if (has("INTERSECT")) return "TRNS_ALL_LW_PAVEMENTA_INT_01";
+    if (has("GRAVEL")) return "TRNS_GRAVELA_LD_GRAVELA_01";
+    if (name.rfind("RDP_", 0) == 0) return "TRNS_ALL_LB_PAVEMENTA_NL_01";   // plain asphalt
+    if (has("SIDEWALK") || has("CURB") || has("KERB") || has("PAVE")) return "TRN_SIDEWALK_CLEAN_01_D";
+    if (has("GRASS")) return "TRNS_GRASSA_LD_GRASSA_01";
+    if (has("CLIFF") || has("ROCK")) return "TRNS_ALL_LF_CLIFFA_01";
+    if (has("WATER") || has("OCEAN") || has("POOL")) return "TRNS_POND_01";
+    return "ARC_CONCRETEOVERPASS_01";   // walls, barriers, decks, pillars
+}
+
+// Even-odd point in polygon, as the game tests a streaming zone (0x73af90).
+bool InOutline(const std::vector<Vec2>& poly, float x, float y) {
+    bool in = false;
+    for (size_t i = 0, j = poly.size() - 1; i < poly.size(); j = i++)
+        if ((poly[i].y > y) != (poly[j].y > y) &&
+            x < (poly[j].x - poly[i].x) * (y - poly[i].y) / (poly[j].y - poly[i].y) + poly[i].x)
+            in = !in;
+    return in;
+}
+
+// The point of the outline nearest to p: on edge `edge` (from point `edge` to the next).
+Vec2 NearestOnOutline(const std::vector<Vec2>& poly, Vec2 p, size_t& edge, float& distance) {
+    Vec2 best{};
+    distance = 1e30f;
+    for (size_t i = 0; i < poly.size(); ++i) {
+        const Vec2 a = poly[i], b = poly[(i + 1) % poly.size()];
+        const float dx = b.x - a.x, dy = b.y - a.y, len2 = dx * dx + dy * dy;
+        const float t = len2 > 0.0f ? std::clamp(((p.x - a.x) * dx + (p.y - a.y) * dy) / len2, 0.0f, 1.0f) : 0.0f;
+        const Vec2 q{ a.x + t * dx, a.y + t * dy };
+        const float d = std::hypot(p.x - q.x, p.y - q.y);
+        if (d < distance) { distance = d; best = q; edge = i; }
+    }
+    return best;
+}
+
+// A corridor `half` wide along `path` (outside the outline), let into the
+// outline at the point of it nearest to the path's start: two points on that
+// edge either side of it, then one side of the corridor out and the other back.
+void AddCorridor(std::vector<Vec2>& poly, const std::vector<Vec2>& path, float half) {
+    if (path.empty() || poly.size() < 3) return;
+    size_t edge = 0;
+    float gap = 0.0f;
+    const Vec2 base = NearestOnOutline(poly, path.front(), edge, gap);
+    (void)gap;
+    const Vec2 a = poly[edge], b = poly[(edge + 1) % poly.size()];
+    const float el = std::max(1e-3f, std::hypot(b.x - a.x, b.y - a.y));
+    const Vec2 e{ (b.x - a.x) / el, (b.y - a.y) / el };
+    std::vector<Vec2> line{ base };
+    line.insert(line.end(), path.begin(), path.end());
+    // The base on the edge itself, so the corridor never laps over the zone
+    // (the even-odd test would make that a hole); then both sides outwards.
+    const Vec2 nearA{ base.x - e.x * half, base.y - e.y * half }, nearB{ base.x + e.x * half, base.y + e.y * half };
+    std::vector<Vec2> left, right;
+    for (size_t i = 1; i < line.size(); ++i) {
+        const Vec2 from = line[i - 1], to = line[std::min(i + 1, line.size() - 1)];
+        float tx = to.x - from.x, ty = to.y - from.y;
+        const float tl = std::max(1e-3f, std::hypot(tx, ty));
+        tx /= tl; ty /= tl;
+        left.push_back({ line[i].x - ty * half, line[i].y + tx * half });
+        right.push_back({ line[i].x + ty * half, line[i].y - tx * half });
+    }
+    // Out along the side nearer `a`, back along the other: the outline stays one loop.
+    const auto along = [&](const Vec2& p) { return (p.x - a.x) * e.x + (p.y - a.y) * e.y; };
+    if (along(right.front()) < along(left.front())) std::swap(left, right);
+    // Side points inside the zone add nothing and would cross its edge (near
+    // the edge a side swings back in): left out.
+    const auto inside = [&](const Vec2& p) { return InOutline(poly, p.x, p.y); };
+    left.erase(std::remove_if(left.begin(), left.end(), inside), left.end());
+    right.erase(std::remove_if(right.begin(), right.end(), inside), right.end());
+    std::vector<Vec2> spur{ nearA };
+    spur.insert(spur.end(), left.begin(), left.end());
+    spur.insert(spur.end(), right.rbegin(), right.rend());
+    spur.push_back(nearB);
+    poly.insert(poly.begin() + (std::ptrdiff_t)(edge + 1), spur.begin(), spur.end());
+}
 
 constexpr int ID_ROADS_FIRST        = ID_EXTENSION_FIRST + 100;
 constexpr int ID_VIEW_ROADS         = ID_ROADS_FIRST + 0;
@@ -368,7 +456,53 @@ public:
             hash = (hash ^ (u64)it->file_size(ec)) * 1099511628211ull;
             hash = (hash ^ (u64)it->last_write_time(ec).time_since_epoch().count()) * 1099511628211ull;
         }
+        // NFS World: the edit list the game's files are made from.
+        if (nfs::IsWorld() && app_.World()) {
+            const fs::path list = WorldEditList();
+            hash = (hash ^ (u64)(fs::exists(list, ec) ? fs::file_size(list, ec) : 0)) * 1099511628211ull;
+            if (fs::exists(list, ec))
+                hash = (hash ^ (u64)fs::last_write_time(list, ec).time_since_epoch().count()) * 1099511628211ull;
+        }
         return hash;
+    }
+
+    // NFS World: the bake is written into TRACKS, not the models folder. What
+    // makes those files is the edit list and the meshes and images kept beside
+    // it (io/WorldWrite.h), so those are what a bake's undo keeps.
+    std::wstring WorldEditList() const {
+        return io::WorldEditsFolder(app_.TracksFolder()) + L"\\" + app_.World()->Region() + L"-edits.txt";
+    }
+    static std::wstring WorldBackupOf(const std::wstring& backup) { return backup + L"-tracks"; }
+
+    bool BackupWorldEdits(const std::wstring& backup) const {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        const fs::path from = io::WorldEditsFolder(app_.TracksFolder()), to = WorldBackupOf(backup);
+        const fs::path list = fs::path(WorldEditList()).filename();
+        fs::create_directories(to, ec);
+        if (fs::exists(from / list, ec)) fs::copy_file(from / list, to / list, fs::copy_options::overwrite_existing, ec);
+        for (const wchar_t* kept : { L"meshes", L"textures" })
+            if (!ec && fs::exists(from / kept, ec))
+                fs::copy(from / kept, to / kept, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+        if (ec) LOG_WARN("undo: the edit list could not be copied: %s", ec.message().c_str());
+        return !ec;
+    }
+
+    // The list goes back as it was (none if there was none); kept files the
+    // bake added stay, unused. The caller reopens the region and saves.
+    bool RestoreWorldEdits(const std::wstring& backup) {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        const fs::path from = WorldBackupOf(backup), to = io::WorldEditsFolder(app_.TracksFolder());
+        const fs::path list = fs::path(WorldEditList()).filename();
+        if (!fs::exists(from, ec)) return false;
+        if (fs::exists(from / list, ec)) fs::copy_file(from / list, to / list, fs::copy_options::overwrite_existing, ec);
+        else fs::remove(to / list, ec);
+        for (const wchar_t* kept : { L"meshes", L"textures" })
+            if (!ec && fs::exists(from / kept, ec))
+                fs::copy(from / kept, to / kept, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+        if (ec) LOG_WARN("undo: the edit list could not be put back: %s", ec.message().c_str());
+        return !ec;
     }
 
     // A copy of the world's files, under %LOCALAPPDATA%\\FRSWorldEditor\\undo.
@@ -395,6 +529,7 @@ public:
                 return {};
             }
         }
+        if (nfs::IsWorld() && app_.World() && !BackupWorldEdits(backup.wstring())) return {};
         return backup.wstring();
     }
 
@@ -411,6 +546,7 @@ public:
         }
         fs::copy(from, root, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
         if (ec) LOG_WARN("undo: the world's files could not all be put back: %s", ec.message().c_str());
+        if (!ec && nfs::IsWorld() && app_.World() && !RestoreWorldEdits(from)) return false;
         return !ec;
     }
 
@@ -418,6 +554,7 @@ public:
         if (state.filesBackup.empty()) return;
         std::error_code ec;
         std::filesystem::remove_all(state.filesBackup, ec);
+        std::filesystem::remove_all(WorldBackupOf(state.filesBackup), ec);
     }
 
     // A bake or a removal as one step: what the roads were, and the files.
@@ -466,6 +603,19 @@ public:
                 return true;
             }
             app_.ReopenRegionKeepingView();
+            if (nfs::IsWorld() && app_.World()) {
+                // The game's files are made from the list put back: every
+                // section is written again, so the ones the bake touched and the
+                // list no longer names get their shipped file back.
+                nfs::World* world = app_.World();
+                for (size_t s = 0; s < world->Loaded().size(); ++s)
+                    if (nfs::LoadedSection* section = world->MutableLoaded(s)) section->placementsChanged = true;
+                if (!app_.SaveEdits()) {
+                    app_.Message(L"The edit list was put back, but the game's files could not be written from it; "
+                                 L"the log has why. Save again to retry.", MB_ICONWARNING);
+                    return true;
+                }
+            }
         }
         UndoState state = std::move(undo_.back());
         undo_.pop_back();
@@ -6756,6 +6906,90 @@ private:
 
     // The game's road graph with the network's roads in it: always built from
     // the game's own file, written where the loader serves it in its place.
+    // NFS World streams no section while the car is in no drivable zone
+    // (io/WorldWrite.h WorldZone): scenery, road and collision go. A stretch of
+    // road outside them all gets a corridor of the zone it leaves (else the
+    // nearest), so the car stays in that zone -- and its sections loaded --
+    // all along. The outlines start from the shipped ones on every bake.
+    size_t WidenZones() {
+        nfs::World* world = app_.World();
+        if (!world) return 0;
+        world->zoneOutlines.clear();
+        const std::vector<io::WorldZone> zones = io::ReadWorldZones(app_.TracksFolder(), world->Region());
+        if (zones.empty() || network_.Segments().empty()) return 0;
+        const auto zoneAt = [&](Vec2 p) -> int {
+            for (size_t z = 0; z < zones.size(); ++z)
+                if (InOutline(zones[z].points, p.x, p.y)) return (int)z;
+            return -1;
+        };
+        const auto nearestZone = [&](Vec2 p) {
+            int best = 0;
+            float bestDistance = 1e30f;
+            for (size_t z = 0; z < zones.size(); ++z) {
+                size_t edge = 0;
+                float d = 0.0f;
+                NearestOnOutline(zones[z].points, p, edge, d);
+                if (d < bestDistance) { bestDistance = d; best = (int)z; }
+            }
+            return best;
+        };
+        // (zone, path) for every stretch outside them all.
+        std::vector<std::pair<int, std::vector<Vec2>>> stretches;
+        std::vector<float> halves;
+        for (const roads::Segment& segment : network_.Segments()) {
+            const roads::Curve curve = network_.CurveOf(segment);
+            const float span = Length(curve.p3 - curve.p0) + Length(curve.p1 - curve.p0) + Length(curve.p2 - curve.p3);
+            const int steps = std::clamp((int)std::ceil(span / 4.0f), 2, 2000);
+            std::vector<Vec2> points;
+            std::vector<int> in;
+            for (int i = 0; i <= steps; ++i) {
+                const Vec3 p = curve.At((float)i / steps);
+                points.push_back({ p.x, p.y });
+                in.push_back(zoneAt(points.back()));
+            }
+            for (size_t i = 0; i < points.size();) {
+                if (in[i] >= 0) { ++i; continue; }
+                const size_t first = i;
+                while (i < points.size() && in[i] < 0) ++i;
+                std::vector<Vec2> path(points.begin() + (std::ptrdiff_t)first, points.begin() + (std::ptrdiff_t)i);
+                // The game looks 1.5 s ahead (0x742c20, up to 100 m): past an open end, 40 m more.
+                if (i == points.size() && path.size() >= 2) {
+                    const Vec2 a = path[path.size() - 2], b = path.back();
+                    const float l = std::max(1e-3f, std::hypot(b.x - a.x, b.y - a.y));
+                    path.push_back({ b.x + (b.x - a.x) / l * 40.0f, b.y + (b.y - a.y) / l * 40.0f });
+                }
+                stretches.push_back({ first > 0 ? in[first - 1] : nearestZone(path.front()), std::move(path) });
+                halves.push_back(segment.profile.HalfWidth() + 25.0f);
+            }
+        }
+        if (stretches.empty()) return 0;
+        // The game reads at most 127 points an outline (a signed byte, 0x7471f0):
+        // the corridors are thinned until every widened outline fits in 124.
+        for (float spacing = 20.0f; spacing < 2000.0f; spacing *= 1.5f) {
+            std::map<u32, std::vector<Vec2>> made;
+            for (size_t s = 0; s < stretches.size(); ++s) {
+                const io::WorldZone& zone = zones[(size_t)stretches[s].first];
+                auto outline = made.find(zone.section);
+                if (outline == made.end()) outline = made.emplace(zone.section, zone.points).first;
+                const std::vector<Vec2>& path = stretches[s].second;
+                std::vector<Vec2> thin{ path.front() };
+                for (size_t k = 1; k + 1 < path.size(); ++k)
+                    if (std::hypot(path[k].x - thin.back().x, path[k].y - thin.back().y) >= spacing) thin.push_back(path[k]);
+                if (path.size() > 1) thin.push_back(path.back());
+                AddCorridor(outline->second, thin, halves[s]);
+            }
+            bool fits = true;
+            for (const auto& [section, outline] : made) fits = fits && outline.size() <= 124;
+            if (!fits) continue;
+            world->zoneOutlines = std::move(made);
+            for (const auto& [section, outline] : world->zoneOutlines)
+                LOG_INFO("roads: streaming zone %u widened along the road: %zu points", section, outline.size());
+            return world->zoneOutlines.size();
+        }
+        LOG_WARN("roads: the streaming zones could not be widened along the road within 127 points");
+        return 0;
+    }
+
     bool WriteRoutes(std::wstring& summary) {
         nfs::World* world = app_.World();
         if (!world) return false;
@@ -8871,12 +9105,50 @@ bool RoadsExtension::RemoveBaked(size_t& removed) {
     removed = 0;
     nfs::World* world = app_.World();
     if (!world) return false;
+    // The streaming zones the last bake widened go back as shipped (only the bake widens them).
+    if (nfs::IsWorld()) world->zoneOutlines.clear();
     std::vector<u32> hashes;
     for (const nfs::SolidObject* model : world->AllModels())
         if (model && roads::IsBakedRoadModel(model->name) &&
             std::find(hashes.begin(), hashes.end(), model->hash) == hashes.end())
             hashes.push_back(model->hash);
     if (hashes.empty()) return true;
+    if (nfs::IsWorld()) {
+        // NFS World: taken out in memory and written by the bake's own save --
+        // a reopen here would drop what the bake has staged. A new model that
+        // is placed nowhere is not written (io/WorldWrite.cpp), and its section
+        // gets its shipped file back when nothing else is edited there.
+        for (size_t s = 0; s < world->Loaded().size(); ++s) {
+            nfs::LoadedSection* section = world->MutableLoaded(s);
+            if (!section) continue;
+            auto& list = section->placements;
+            const size_t before = list.size();
+            list.erase(std::remove_if(list.begin(), list.end(),
+                                      [&](const nfs::LoadedSection::UserPlacement& placement) {
+                                          return std::find(hashes.begin(), hashes.end(),
+                                                           placement.instance.modelHash) != hashes.end();
+                                      }),
+                       list.end());
+            if (list.size() != before) section->placementsChanged = true;
+        }
+        for (u32 hash : hashes) {
+            for (size_t s = 0; s < world->Loaded().size(); ++s)
+                if (world->Loaded()[s]->HoldsModel(hash))
+                    if (nfs::LoadedSection* section = world->MutableLoaded(s)) section->placementsChanged = true;
+            world->RemoveModel(hash);
+        }
+        auto& made = world->newModels;
+        made.erase(std::remove_if(made.begin(), made.end(),
+                                  [&](const nfs::World::NewModel& m) {
+                                      return std::find(hashes.begin(), hashes.end(), m.hash) != hashes.end();
+                                  }),
+                   made.end());
+        app_.Renderer().ClearSelection();
+        app_.Renderer().RebuildInstances(*world);
+        removed = hashes.size();
+        LOG_INFO("roads: %zu baked road models taken out of the region (written by the next save)", removed);
+        return true;
+    }
     app_.Edits().Refresh(world, app_.ModelsFolder());
     std::wstring summary;
     if (!app_.Edits().RevertModels(app_.Window(), hashes, summary)) return false;
@@ -9760,6 +10032,31 @@ bool RoadsExtension::BakeCollision(const std::vector<roads::MeshPiece>& pieces, 
     std::vector<collision::PolygonRef> refs;
     if (!polygons.empty()) refs = editor.Add(polygons, L"Bake roads");
     added = polygons.size();
+    if (nfs::IsWorld()) {
+        // NFS World names a polygon's surface by hash: the road's asphalt, the
+        // grass beside it, concrete for pavements, kerbs and walls. The hash
+        // goes into the four bytes the list keeps (A lines) after the add,
+        // which reads flags from those bytes; flags stay as they are, and a
+        // reload reads the same (io/WorldWrite.cpp).
+        const auto hashOf = [](u8 kind) {
+            return kind == roads::kSurfaceRoad ? nfs::kWorldAsphalt
+                 : kind == roads::kSurfaceGrass ? nfs::kWorldGrass : nfs::kWorldConcrete;
+        };
+        const auto& loaded = world->Loaded();
+        for (const collision::PolygonRef& ref : refs) {
+            if (ref.section >= loaded.size()) continue;
+            nfs::LoadedSection* section = world->MutableLoaded(ref.section);
+            if (!section || ref.pack >= section->collision.size() ||
+                ref.polygon >= section->collision[ref.pack].polygons.size())
+                continue;
+            nfs::CollisionPolygon& p = section->collision[ref.pack].polygons[ref.polygon];
+            const u32 hash = hashOf(p.attributes[2]);
+            std::memcpy(p.attributes, &hash, 4);
+            p.raceGroup = 0;
+            p.surface = nfs::WorldSurfaceId(hash);
+        }
+        for (nfs::CollisionPolygon& p : polygons) p.surface = nfs::WorldSurfaceId(hashOf(p.attributes[2]));
+    }
     tools->RefreshAfterEdit();
 
     // Recorded as they went in, so the next bake can find them again.
@@ -9785,6 +10082,21 @@ void RoadsExtension::Unbake() {
     if (!app_.ConfirmUnsaved()) return;
     DiskStep step(this, L"remove the baked roads");
     size_t collisionAdded = 0, collisionRemoved = 0, polesAdded = 0, polesRemoved = 0;
+    if (nfs::IsWorld()) {
+        // NFS World: everything comes out in memory, then one save writes it.
+        size_t removed = 0;
+        if (!RemoveBaked(removed) || !BakePoles({}, polesAdded, polesRemoved) ||
+            (app_.Collision() && !BakeCollision({}, collisionAdded, collisionRemoved)) || !app_.SaveEdits()) {
+            app_.Message(L"The baked roads could not be taken out of the game's files. The log has why.",
+                         MB_ICONWARNING);
+            return;
+        }
+        app_.ReopenRegionKeepingView();
+        WriteBakeStamp();
+        app_.Status(Fmt(L"%zu baked road pieces and %zu collision polygons removed from the game; the road network "
+                        L"is kept in the editor (Ctrl+Z puts them back)", removed, collisionRemoved));
+        return;
+    }
     if (!BakePoles({}, polesAdded, polesRemoved) ||
         (app_.Collision() && !BakeCollision({}, collisionAdded, collisionRemoved)) || !app_.SaveEdits()) {
         app_.Message(L"The road collision could not be taken out. The log has why.", MB_ICONWARNING);
@@ -9825,14 +10137,33 @@ void RoadsExtension::Bake() {
     ProgressWindow progress(app_.Window(), L"Baking into the game", 10);
 
     SaveTerrain();
+    // NFS World: the meshes, their textures, the street furniture and the
+    // collision go into the map's own files through the edit list and one
+    // Save at the end (io/WorldWrite.h). Its traffic and GPS graph is not the
+    // ROUTES<region>\RoutesFreeRoam.bin Underground 2 reads (NFS World ships no
+    // such folder) and is not written; nor are the lights and flares, whose
+    // writers are Underground 2's.
+    const bool worldGame = nfs::IsWorld();
     std::wstring routes;
-    progress.Step(L"Writing the traffic and GPS routes...");
-    if (!WriteRoutes(routes)) {
-        app_.Message(L"The roads' traffic and GPS could not be written, so nothing was baked: " + routes,
+    if (worldGame) {
+        routes = L"traffic and GPS were NOT written (NFS World's road graph is not supported yet)";
+    } else {
+        progress.Step(L"Writing the traffic and GPS routes...");
+        if (!WriteRoutes(routes)) {
+            app_.Message(L"The roads' traffic and GPS could not be written, so nothing was baked: " + routes,
+                         MB_ICONWARNING);
+            return;
+        }
+    }
+    LOG_INFO("roads: %S", routes.c_str());
+    // NFS World: what the last bake made comes out first, in memory (the
+    // region is not reopened before the save, which would drop the rest).
+    size_t removed = 0;
+    if (worldGame && !RemoveBaked(removed)) {
+        app_.Message(L"The roads baked before could not be taken out, so nothing was baked. The log has why.",
                      MB_ICONWARNING);
         return;
     }
-    LOG_INFO("roads: %S", routes.c_str());
     std::vector<roads::Pole> poles;
     progress.Step(L"Building the roads, buildings and ground...");
     std::vector<roads::MeshPiece> pieces = network_.BuildMesh(&poles);
@@ -9869,7 +10200,7 @@ void RoadsExtension::Bake() {
         return;
     }
     progress.Step(L"Writing the placements and collision (the region reloads)...");
-    if (!app_.SaveEdits()) {
+    if (!worldGame && !app_.SaveEdits()) {
         app_.Message(L"The street lights and road collision could not be written, so nothing was baked. "
                      L"The log has why.", MB_ICONWARNING);
         return;
@@ -9895,14 +10226,21 @@ void RoadsExtension::Bake() {
     }
 
     // What the last bake made goes first, so the network is the only source.
-    size_t removed = 0;
     progress.Step(L"Taking out the last bake...");
-    if (!RemoveBaked(removed)) {
+    if (!worldGame && !RemoveBaked(removed)) {
         app_.Message(L"The roads baked before could not be taken out, so nothing was baked. The log has why.",
                      MB_ICONWARNING);
         return;
     }
     if (pieces.empty()) {
+        if (worldGame) {
+            if (!app_.SaveEdits()) {
+                app_.Message(L"The last bake could not be taken out of the game's files. The log has why.",
+                             MB_ICONWARNING);
+                return;
+            }
+            app_.ReopenRegionKeepingView();
+        }
         WriteBakeStamp();
         app_.Status(Fmt(L"No roads to bake; %zu old pieces and %zu collision polygons removed", removed,
                         collisionRemoved));
@@ -9977,6 +10315,17 @@ void RoadsExtension::Bake() {
         if (cuts) LOG_INFO("roads: %zu pieces cut where they cross visibility zones with no section in common", cuts);
     }
 
+    if (worldGame) {
+        size_t swapped = 0;
+        for (roads::MeshPiece& piece : pieces)
+            for (roads::MeshGroup& g : piece.groups)
+                if (!app_.World()->FindTexture(TextureHash(g.texture))) {
+                    g.texture = WorldRoadTexture(g.texture);
+                    ++swapped;
+                }
+        if (swapped) LOG_INFO("roads: %zu groups drawn with NFS World road textures in place of names it lacks", swapped);
+    }
+
     const std::wstring obj = folder + L"\\roads.obj";
     Vec3 origin{};
     std::wstring error;
@@ -9992,6 +10341,23 @@ void RoadsExtension::Bake() {
     ImportProgress() = [&progress](size_t done, size_t) { if (done % 4 == 0) progress.Pump(); };
     app_.ImportObj(obj, origin);
     ImportProgress() = nullptr;
+    size_t widened = 0;
+    if (worldGame) {
+        widened = WidenZones();
+        if (widened) routes += Fmt(L"; %zu streaming zone(s) widened along the road", widened);
+        // The import staged the models; everything the bake staged is
+        // written now, in one save.
+        progress.Step(L"Writing the roads, their collision and street furniture into the game's files...");
+        if (!app_.SaveEdits()) {
+            app_.Message(L"The roads could not be written into the game's files (the log has why). Ctrl+Z takes "
+                         L"the bake back.", MB_ICONWARNING);
+            return;
+        }
+        // Read back from the list, as Underground 2's bake reloads: the
+        // collision and object histories start again, so Ctrl+Z takes the
+        // whole bake back rather than a part of it.
+        app_.ReopenRegionKeepingView();
+    }
 
     size_t baked = 0;
     if (nfs::World* reloaded = app_.World())
@@ -10007,11 +10373,13 @@ void RoadsExtension::Bake() {
                     baked, meshes, removed, collisionAdded, collisionRemoved, polesAdded, groundMeshes,
                     groundPolygons, routes.c_str()));
     LOG_INFO("roads: baked %zu of %zu pieces from %S", baked, meshes, obj.c_str());
-    // The game's own objects the lights placed by hand reach.
-    progress.Step(L"Lighting the game's own objects...");
-    WriteNativeLights();
-    // The street lights' flares, in the sections' flare packs.
-    WriteFlares(LampFlares(poles));
+    if (!worldGame) {
+        // The game's own objects the lights placed by hand reach.
+        progress.Step(L"Lighting the game's own objects...");
+        WriteNativeLights();
+        // The street lights' flares, in the sections' flare packs.
+        WriteFlares(LampFlares(poles));
+    }
     progress.Close();
     WriteBakeStamp();
     if (baked < meshes)

@@ -14,6 +14,7 @@
 #include "nfs/TexturePack.h"
 
 #include <deque>
+#include <map>
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
@@ -280,6 +281,12 @@ public:
         std::vector<u32> moreLikes;
     };
     std::deque<NewTexture> newTextures;
+
+    // NFS World: drivable section boundaries (L5RA.BUN 0x34152) given a new
+    // outline, by section number, game x/y. The road bake widens the boundary
+    // a road leaves so the car stays in a zone along all of it: outside every
+    // one nfsw.exe streams no section at all (io/WorldWrite.h).
+    std::map<u32, std::vector<Vec2>> zoneOutlines;
 
     // A model the editor made, put into a loaded section (a solid list of its
     // own) and into the index FindModel reads. Replaces one of the same hash.

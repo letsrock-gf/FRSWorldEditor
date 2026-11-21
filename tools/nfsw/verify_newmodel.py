@@ -301,7 +301,12 @@ for f in written:
 
 # --- the section table ---------------------------------------------------------------
 lay = os.path.join(out, "L5RA.BUN")
-if os.path.exists(lay):
+edits = os.path.join(out, "frs-original", "L5RA-edits.txt")
+zones = os.path.exists(edits) and any(line.startswith("Z ") for line in open(edits))
+if os.path.exists(lay) and zones:
+    # Widened streaming zones grow the visibility container before the table, which moves.
+    print("   (L5RA.BUN grew with widened streaming zones: verify_table.py and verify_zones.py check it)")
+elif os.path.exists(lay):
     a = open(shipped("L5RA.BUN"), "rb").read()
     b = open(lay, "rb").read()
     p = 0
@@ -322,6 +327,8 @@ if os.path.exists(lay):
         if struct.unpack_from("<I", a, at + 0x1C)[0]:
             continue   # a texture section (new textures): verify_newtex.py checks its five parts
         fn = f"STREAML5RA_{num}.BUN"
+        if num == 25000:
+            continue   # the collision file: five parts, which verify_table.py checks
         was, now = struct.unpack_from("<3I", a, at + 0x60), struct.unpack_from("<3I", b, at + 0x60)
         only = all(at + 0x60 <= i < at + 0x6C for i in diff if (i - table) // 208 == e)
         size = os.path.getsize(os.path.join(out, fn)) if os.path.exists(os.path.join(out, fn)) else -1

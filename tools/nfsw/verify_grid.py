@@ -1,7 +1,8 @@
 """Checks the collision grid (chunk 0x3B802) of a save against the shipped one.
 - records parse by the game's rule (nfsw.exe 0x6d8d20: 0x14 + 4 * the four counts), offsets = 4 * counts before;
 - every shipped cell is still there with all its shipped entries, in order, and its other lists untouched;
-- for every added ground triangle, the cell the game looks a point up in (0x6cff40: round((x - origin) / 96))
+- for every added ground triangle, the cell the game looks a point up in (0x6cff40: round((x - origin) / 96),
+  clamped to the grid)
   lists the instance holding it, at the triangle's centre and corners.
 Usage: verify_grid.py <out folder>"""
 import struct
@@ -64,7 +65,11 @@ for n, data in L.packs(open(out + r"\STREAML5RA_25000.BUN", "rb").read()):
                 continue
             centre = tuple(sum(p[i] for p in w) / 3 for i in range(3))
             for p in w + [centre]:   # collision axes: x, up, z
-                cell = round((p[2] - ORIGIN_Z) / CELL) * COLUMNS + round((p[0] - ORIGIN_X) / CELL)
+                # The game clamps both cell numbers to the grid (0x6cff40, 0x6df170): a point beyond it
+                # is looked up in the nearest edge cell.
+                cz = min(max(round((p[2] - ORIGIN_Z) / CELL), 0), ROWS - 1)
+                cx = min(max(round((p[0] - ORIGIN_X) / CELL), 0), COLUMNS - 1)
+                cell = cz * COLUMNS + cx
                 checked += 1
                 if (n << 16 | k) not in new.get(cell, [[]])[0]:
                     missing += 1

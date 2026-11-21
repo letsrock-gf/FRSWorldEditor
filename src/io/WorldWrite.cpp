@@ -159,6 +159,96 @@ bool GrowPropIds(std::vector<u8>& region, std::vector<u8>& hot, const std::vecto
 }
 
 
+// Chunk 0x34152 inside the top-level 0x80034150: where its payload starts and
+// how long it is, and where the parent's header is.
+bool ZoneChunk(const std::vector<u8>& region, size_t& parent, size_t& at, size_t& size) {
+    size_t outer = 0, outerSize = 0;
+    if (!RegionChunk(region, 0x80034150, outer, outerSize)) return false;
+    parent = outer - 8;
+    for (size_t pos = outer; pos + 8 <= outer + outerSize;) {
+        const size_t length = Read<u32>(region.data() + pos + 4);
+        if (pos + 8 + length > outer + outerSize) return false;
+        if (Read<u32>(region.data() + pos) == 0x34152) { at = pos + 8; size = length; return true; }
+        pos += 8 + length;
+    }
+    return false;
+}
+
+constexpr size_t kZoneHead = 48;   // marker, section, count, 12 bytes, min, max, centre
+
+// The new outlines (World::zoneOutlines) over their records of 0x34152. The
+// parent 0x80034150 and everything after it move by a multiple of 16 (an extra
+// copy of an outline's last point makes it so: an edge of no length), and
+// L5RA.HOT's rows follow as in GrowPropIds. Applied after every other change
+// to the file, whose offsets are the shipped ones. False when the file is not
+// laid out as expected or an outline has more points than the game reads.
+bool GrowZones(std::vector<u8>& region, std::vector<u8>& hot, const std::map<u32, std::vector<Vec2>>& outlines) {
+    size_t parent = 0, at = 0, size = 0;
+    if (!ZoneChunk(region, parent, at, size)) return false;
+    std::vector<u8> chunk;
+    std::vector<size_t> lastPoint;   // in `chunk`, of each rewritten record, for the padding point
+    for (size_t q = at; q + kZoneHead <= at + size;) {
+        const u32 marker = Read<u32>(region.data() + q);
+        const size_t count = Read<u8>(region.data() + q + 10);
+        const size_t length = kZoneHead + 8 * count;
+        if (marker != 11 || q + length > at + size) return false;
+        const auto outline = outlines.find(Read<u16>(region.data() + q + 8));
+        if (outline == outlines.end() || outline->second.size() < 3) {
+            chunk.insert(chunk.end(), region.begin() + (std::ptrdiff_t)q, region.begin() + (std::ptrdiff_t)(q + length));
+        } else {
+            const std::vector<Vec2>& points = outline->second;
+            if (points.size() > 126) return false;
+            Vec2 lo = points[0], hi = points[0];
+            for (const Vec2& p : points) {
+                lo = { std::min(lo.x, p.x), std::min(lo.y, p.y) };
+                hi = { std::max(hi.x, p.x), std::max(hi.y, p.y) };
+            }
+            const size_t from = chunk.size();
+            chunk.insert(chunk.end(), region.begin() + (std::ptrdiff_t)q, region.begin() + (std::ptrdiff_t)(q + 24));
+            chunk[from + 10] = (u8)points.size();   // byte 11 is a flag of its own (0 or 1), kept
+            const float box[6] = { lo.x, lo.y, hi.x, hi.y, (lo.x + hi.x) * 0.5f, (lo.y + hi.y) * 0.5f };
+            chunk.insert(chunk.end(), (const u8*)box, (const u8*)box + sizeof(box));
+            for (const Vec2& p : points) {
+                const float xy[2] = { p.x, p.y };
+                chunk.insert(chunk.end(), (const u8*)xy, (const u8*)xy + 8);
+            }
+            lastPoint.push_back(chunk.size() - 8);
+        }
+        q += length;
+    }
+    if (lastPoint.empty()) return true;
+    if ((chunk.size() - size) % 16) {
+        // One more copy of the last rewritten record's last point.
+        const size_t point = lastPoint.back();
+        size_t record = 0;
+        for (size_t q = 0; q + kZoneHead <= chunk.size(); q += kZoneHead + 8 * (size_t)Read<u8>(chunk.data() + q + 10))
+            if (q < point) record = q;
+        const size_t n = (size_t)Read<u8>(chunk.data() + record + 10) + 1;
+        if (n > 127) return false;
+        chunk[record + 10] = (u8)n;
+        const std::vector<u8> copy(chunk.begin() + (std::ptrdiff_t)point, chunk.begin() + (std::ptrdiff_t)(point + 8));
+        chunk.insert(chunk.begin() + (std::ptrdiff_t)(point + 8), copy.begin(), copy.end());
+    }
+    const long delta = (long)chunk.size() - (long)size;
+    if (delta % 16) return false;
+    region.erase(region.begin() + (std::ptrdiff_t)at, region.begin() + (std::ptrdiff_t)(at + size));
+    region.insert(region.begin() + (std::ptrdiff_t)at, chunk.begin(), chunk.end());
+    const u32 chunkSize = (u32)chunk.size(), parentSize = (u32)(Read<u32>(region.data() + parent + 4) + delta);
+    std::memcpy(region.data() + at - 4, &chunkSize, 4);
+    std::memcpy(region.data() + parent + 4, &parentSize, 4);
+    if (delta && hot.size() >= 16 && hot.size() % 16 == 0) {
+        for (size_t row = 16; row + 16 <= hot.size(); row += 16) {
+            const u32 offset = Read<u32>(hot.data() + row + 8);
+            if (offset == parent) std::memcpy(hot.data() + row + 4, &parentSize, 4);
+            else if (offset > parent) {
+                const u32 moved = (u32)((long)offset + delta);
+                std::memcpy(hot.data() + row + 8, &moved, 4);
+            }
+        }
+    }
+    return true;
+}
+
 void WriteVec3(u8* at, const Vec3& v) {
     const float f[3] = { v.x, v.y, v.z };
     std::memcpy(at, f, sizeof(f));
@@ -629,6 +719,42 @@ bool GameIsRunning() {
     return running;
 }
 
+std::wstring WorldEditsFolder(const std::wstring& tracksFolder) {
+    bool redirected = false;
+    return TargetFolder(tracksFolder, redirected) + kBackupFolder;
+}
+
+std::vector<WorldZone> ReadWorldZones(const std::wstring& tracksFolder, const std::wstring& region) {
+    // The shipped file: a copy kept by a save comes first (the live one may be an edited one).
+    const std::wstring name = L"\\" + region + L".BUN";
+    std::vector<u8> bytes = ReadWhole(WorldEditsFolder(tracksFolder) + name);
+    if (bytes.empty()) bytes = ReadWhole(tracksFolder + kBackupFolder + name);
+    if (bytes.empty()) bytes = ReadWhole(tracksFolder + name);
+    std::vector<WorldZone> zones;
+    size_t parent = 0, at = 0, size = 0;
+    if (bytes.empty() || !ZoneChunk(bytes, parent, at, size)) return zones;
+    // The base: the first word of 0x34151, the sibling before (400 in L5RA).
+    u32 base = 0;
+    for (size_t pos = parent + 8; pos + 12 <= at - 8; pos += 8 + Read<u32>(bytes.data() + pos + 4))
+        if (Read<u32>(bytes.data() + pos) == 0x34151) { base = Read<u32>(bytes.data() + pos + 8); break; }
+    for (size_t q = at; q + kZoneHead <= at + size;) {
+        const size_t count = Read<u8>(bytes.data() + q + 10);
+        if (Read<u32>(bytes.data() + q) != 11 || q + kZoneHead + 8 * count > at + size) break;
+        const i16 number = Read<i16>(bytes.data() + q + 8);
+        // As 0x7471f0 sorts them: the drivable list, the one 0x741ba0 searches.
+        if (number != -1 && number / 1000 <= 0x13 && number % 1000 >= 1 && (u32)(number % 1000) < base) {
+            WorldZone zone;
+            zone.section = (u32)number;
+            for (size_t k = 0; k < count; ++k)
+                zone.points.push_back({ Read<float>(bytes.data() + q + kZoneHead + 8 * k),
+                                        Read<float>(bytes.data() + q + kZoneHead + 8 * k + 4) });
+            zones.push_back(std::move(zone));
+        }
+        q += kZoneHead + 8 * count;
+    }
+    return zones;
+}
+
 std::wstring KeptTextureFolder(const std::wstring& tracksFolder) {
     bool redirected = false;
     const std::wstring backups = TargetFolder(tracksFolder, redirected) + kBackupFolder;
@@ -906,6 +1032,12 @@ size_t LoadWorldEdits(nfs::World& world, const std::wstring& realTracksFolder) {
                 polygon.surface = (u8)((((u32)a[0] | (u32)a[1] << 8 | (u32)a[2] << 16 | (u32)a[3] << 24) * 2654435761u) >> 24);
             } else {
                 polygon.SyncFromAttributes();
+                const u32 hash = (u32)a[0] | (u32)a[1] << 8 | (u32)a[2] << 16 | (u32)a[3] << 24;
+                if (nfs::IsWorldSurface(hash)) {
+                    // Bytes that are a surface hash (the road bake's), not a race group and an index.
+                    polygon.raceGroup = 0;
+                    polygon.surface = nfs::WorldSurfaceId(hash);
+                }
             }
             polygon.flags = (u8)flags;
             nfs::LoadedSection* section = found->second.first;
@@ -928,6 +1060,15 @@ size_t LoadWorldEdits(nfs::World& world, const std::wstring& realTracksFolder) {
                 world.textureReplacements.push_back({ hash, fileName });
                 ++applied;
             }
+            continue;
+        }
+        if (line[0] == 'Z') {
+            // A point of a widened streaming zone's outline, in order: section, game x, y.
+            unsigned section = 0;
+            float x = 0.0f, y = 0.0f;
+            if (std::sscanf(line, "Z %u %f %f", &section, &x, &y) != 3) continue;
+            world.zoneOutlines[section].push_back({ x, y });
+            ++applied;
             continue;
         }
         if (line[0] == 'O') {
@@ -1105,7 +1246,9 @@ bool WriteWorldEdits(nfs::World& world, const std::wstring& tracksFolder, WorldW
     ::CreateDirectoryW(backups.c_str(), nullptr);
 
     // Sections whose file is no longer laid out as the table in L5RA.BUN says.
-    struct Grown { u64 tableEntry; u32 delta; std::vector<u32> parts; u32 resident = 0; };
+    // By the entry's name: the table written is the shipped one, and the live
+    // table the world was read from moves when the zones before it grew.
+    struct Grown { u32 id; u32 delta; std::vector<u32> parts; u32 resident = 0; };
     std::vector<Grown> grownSections;
 
     // The shipped region file: the copy kept here, else the one kept in the
@@ -1129,6 +1272,12 @@ bool WriteWorldEdits(nfs::World& world, const std::wstring& tracksFolder, WorldW
         std::snprintf(line, sizeof(line), "T %08X %ls\n", replacement.hash, replacement.file.c_str());
         list += line;
     }
+    for (const auto& [section, outline] : world.zoneOutlines)
+        for (const Vec2& p : outline) {
+            char line[96];
+            std::snprintf(line, sizeof(line), "Z %u %.9g %.9g\n", section, p.x, p.y);
+            list += line;
+        }
     for (const auto& replacement : world.meshReplacements) {
         const size_t slash = replacement.file.find_last_of(L"\\/");
         char line[400];
@@ -1311,7 +1460,7 @@ bool WriteWorldEdits(nfs::World& world, const std::wstring& tracksFolder, WorldW
             const size_t now = ResidentBytes(bytes.data(), bytes.size());
             const size_t was = ResidentBytes(shipped.data, shipped.size);
             const u32 resident = parts.empty() || now <= was ? 0u : (u32)((now - was + 127) & ~(size_t)127);
-            grownSections.push_back({ loaded->info->tableEntryOffset, (u32)(bytes.size() - shipped.size),
+            grownSections.push_back({ loaded->info->id, (u32)(bytes.size() - shipped.size),
                                       std::move(parts), resident });
         }
 
@@ -1351,7 +1500,8 @@ bool WriteWorldEdits(nfs::World& world, const std::wstring& tracksFolder, WorldW
     {
         const std::wstring name = world.Region() + L".BUN";
         const std::wstring live = target + L"\\" + name, kept = backups + L"\\" + name;
-        if (!grownSections.empty() || !propIds.added.empty() || Exists(kept)) {
+        const bool zones = !world.zoneOutlines.empty();
+        if (!grownSections.empty() || !propIds.added.empty() || zones || Exists(kept)) {
             std::vector<u8> layout;
             // The shipped table: the copy kept here, else the one kept in the
             // game's own folder (a scripted run writes elsewhere, and the
@@ -1377,7 +1527,7 @@ bool WriteWorldEdits(nfs::World& world, const std::wstring& tracksFolder, WorldW
                 return false;
             }
 
-            if (grownSections.empty() && propIds.added.empty()) {
+            if (grownSections.empty() && propIds.added.empty() && !zones) {
                 if (!WriteWhole(live, layout.data(), layout.size())) {
                     report.error = L"Could not put back " + live;
                     return false;
@@ -1397,11 +1547,21 @@ bool WriteWorldEdits(nfs::World& world, const std::wstring& tracksFolder, WorldW
                     report.error = L"Could not keep a copy of the shipped file as " + kept;
                     return false;
                 }
+                size_t tableAt = 0, tableSize = 0;
+                if (!grownSections.empty() && !RegionChunk(layout, 0x34110, tableAt, tableSize)) {
+                    report.error = L"No section table (0x34110) in " + source;
+                    return false;
+                }
                 for (const Grown& grown : grownSections) {
-                    if (grown.tableEntry + 0x60 + 12 * std::max<size_t>(grown.parts.size(), 1) > layout.size())
-                        continue;
+                    size_t entry = 0;
+                    for (size_t e = tableAt; e + 208 <= tableAt + tableSize; e += 208)
+                        if (Read<u32>(layout.data() + e) == grown.id) { entry = e; break; }
+                    if (!entry) {
+                        report.error = L"A grown section has no entry in the section table of " + source;
+                        return false;
+                    }
                     for (size_t part = 0; part < grown.parts.size(); ++part) {
-                        u8* at = layout.data() + grown.tableEntry + 0x60 + 12 * part;
+                        u8* at = layout.data() + entry + 0x60 + 12 * part;
                         std::memcpy(at, &grown.parts[part], 4);
                         std::memcpy(at + 4, &grown.parts[part], 4);
                         const u32 third = Read<u32>(at + 8) + grown.resident;
@@ -1409,12 +1569,12 @@ bool WriteWorldEdits(nfs::World& world, const std::wstring& tracksFolder, WorldW
                     }
                     if (!grown.parts.empty()) continue;
                     for (size_t field : { (size_t)0x60, (size_t)0x64, (size_t)0x68 }) {
-                        u8* at = layout.data() + grown.tableEntry + field;
+                        u8* at = layout.data() + entry + field;
                         const u32 value = Read<u32>(at) + grown.delta;
                         std::memcpy(at, &value, sizeof(value));
                     }
                 }
-                if (!propIds.added.empty()) {
+                if (!propIds.added.empty() || zones) {
                     // The HOT index comes and goes with the region file.
                     const std::wstring hotName = world.Region() + L".HOT";
                     const std::wstring hotLive = target + L"\\" + hotName, hotKept = backups + L"\\" + hotName;
@@ -1426,15 +1586,24 @@ bool WriteWorldEdits(nfs::World& world, const std::wstring& tracksFolder, WorldW
                         report.error = L"Could not keep a copy of the shipped file as " + hotKept;
                         return false;
                     }
-                    if (!GrowPropIds(layout, hot, propIds.added)) {
+                    if (!propIds.added.empty() && !GrowPropIds(layout, hot, propIds.added)) {
                         report.error = L"The prop table of " + live + L" is laid out in a way the editor does not write yet.";
+                        return false;
+                    }
+                    // Last: it moves what follows the visibility container.
+                    if (zones && !GrowZones(layout, hot, world.zoneOutlines)) {
+                        report.error = L"The streaming zones of " + live + L" could not be widened (an outline of more "
+                                       L"than 127 points, or a layout the editor does not write yet). Save again after taking the road back.";
                         return false;
                     }
                     if (!hot.empty() && !WriteWhole(hotLive, hot.data(), hot.size())) {
                         report.error = L"Could not write " + hotLive;
                         return false;
                     }
-                    LOG_INFO("NFS World: %zu prop ids added to %S (0x34108)", propIds.added.size() / 6, live.c_str());
+                    if (!propIds.added.empty())
+                        LOG_INFO("NFS World: %zu prop ids added to %S (0x34108)", propIds.added.size() / 6, live.c_str());
+                    if (zones) LOG_INFO("NFS World: %zu streaming zones widened in %S (0x34152)", world.zoneOutlines.size(),
+                                        live.c_str());
                 }
                 if (!WriteWhole(live, layout.data(), layout.size())) {
                     report.error = L"Could not write the section table " + live;

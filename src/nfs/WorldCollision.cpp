@@ -55,14 +55,10 @@ namespace nfs {
 namespace {
 // The collision grid of the region (L5RA.BUN CGrd): 96 m cells, 80 across x
 // from -5088 and 115 along z from 0, in collision axes (x = -game y, z = game
-// x). The game finds collision through it, so it is also where collision can be.
+// x). The game finds collision through it; a point outside it is looked up in
+// the nearest edge cell (nfsw.exe 0x6cff40 clamps both cell numbers).
 constexpr float kGridOriginX = -5088.0f, kGridOriginZ = 0.0f, kGridCell = 96.0f;
 constexpr int kGridColumns = 80, kGridRows = 115;
-
-bool InCollisionGrid(float x, float z) {
-    return x >= kGridOriginX && x < kGridOriginX + kGridCell * kGridColumns &&
-           z >= kGridOriginZ && z < kGridOriginZ + kGridCell * kGridRows;
-}
 
 
 constexpr u32 kTagPack     = 0x43415250;   // 'CARP'
@@ -575,7 +571,7 @@ bool RewriteWorldCollision(ByteSpan whole, const CollisionPack& pack, const std:
     // inside one the polygon is reached and outside every one it is not.
     std::vector<std::vector<u8>> newStrips(rows.size()), newBarriers(rows.size());
     std::vector<std::vector<u32>> newSurfaces(rows.size());
-    constexpr u32 kAsphaltSurface = 0x19DB2F1E;   // simsurface "asphalt" (Attrib hash)
+    constexpr u32 kAsphaltSurface = kWorldAsphalt;
     std::vector<u8> instanceBody;
     {
         const Row& list = rows[(size_t)instanceRow];
@@ -653,10 +649,23 @@ bool RewriteWorldCollision(ByteSpan whole, const CollisionPack& pack, const std:
                 const int row = index < articleRow.size() ? articleRow[index] : -1;
                 return row >= 0 && uses[(size_t)row] == 1 && rows[(size_t)row].size >= 16;
             };
+            // Room left in a usable box's article: its strip bytes and its barrier
+            // bytes each stay within 0xFFFF (RebuildArticle); a triangle costs 40,
+            // a barrier record 32. A full article sends the polygon on to the
+            // next box (a long road beside the map's edge fills several).
+            // ponytail: 4 KiB kept for the strips deletions cut in two.
+            const size_t cost = barrier ? (size_t)(count / 2) * 32 : (size_t)(count / 3) * 40;
+            auto fits = [&](size_t i) {
+                const size_t row = (size_t)articleRow[article16(i * kInstanceSize)];
+                const ByteSpan article = data.sub(rows[row].at, rows[row].size);
+                const size_t used = barrier ? article.read<u16>(6) + newBarriers[row].size()
+                                            : article.read<u16>(2) + newStrips[row].size();
+                return used + cost + 0x1000 <= 0xFFFF;
+            };
             int best = -1;
             float bestArea = 1e30f;
             for (size_t i = 0; i < instanceCount; ++i) {
-                if (!usable(i)) continue;
+                if (!usable(i) || !fits(i)) continue;
                 const size_t at = i * kInstanceSize;
                 const float width = field(at + 0x0C), length = field(at + 0x2C);
                 const float sx = field(at + 0x30), sz = field(at + 0x38);
@@ -673,9 +682,12 @@ bool RewriteWorldCollision(ByteSpan whole, const CollisionPack& pack, const std:
             // ground is written twice (same plane); subtract boxes if an article
             // runs out of room. Barriers still need one box.
             std::vector<std::pair<int, std::vector<Vec3>>> jobs;
+            // A box it crosses with no room left: the whole polygon goes to the
+            // next box with room instead (grown below), never part of it.
+            bool blocked = false;
             if (best >= 0 && !foreign) jobs.push_back({ best, std::vector<Vec3>(points, points + count) });
             else if (!barrier)
-                for (size_t i = 0; i < instanceCount; ++i) {
+                for (size_t i = 0; i < instanceCount && !blocked; ++i) {
                     if (!usable(i)) continue;
                     const size_t at = i * kInstanceSize;
                     const float width = field(at + 0x0C), length = field(at + 0x2C);
@@ -691,23 +703,25 @@ bool RewriteWorldCollision(ByteSpan whole, const CollisionPack& pack, const std:
                         for (size_t v = 1; v + 1 < cut.size(); ++v)
                             for (const Vec3& p : { cut[0], cut[v], cut[v + 1] }) pieces.push_back(p);
                     }
-                    if (!pieces.empty()) jobs.push_back({ (int)i, std::move(pieces) });
+                    if (pieces.empty()) continue;
+                    if (!fits(i)) { blocked = true; break; }
+                    jobs.push_back({ (int)i, std::move(pieces) });
                 }
+            if (blocked) jobs.clear();
             // Held by no box (a barrier, or ground outside them all): the nearest
             // box in plan grows to hold it, however far. The grid and the radius
             // follow below (AddToCollisionGrid, +0x3C), so the game reaches it
-            // there. Outside the grid the game has no cell to look in: such a
-            // polygon cannot be reached and stays left out.
+            // there. Outside the grid too: the game does not refuse a point
+            // there but takes the nearest edge cell (nfsw.exe 0x6cff40 and
+            // 0x6df170 clamp both cell numbers to the grid), so the edge cells
+            // listing the grown box reach it.
             // ponytail: one box stretched over the gap; an instance and article of
             // its own when far-away ground fills an article (about 1600 triangles).
-            bool reachable = true;
-            for (int k = 0; k < count && reachable; ++k)
-                reachable = InCollisionGrid(-points[k].y, points[k].x);
-            if (jobs.empty() && !foreign && reachable) {
+            if (jobs.empty() && !foreign) {
                 int nearest = -1;
                 float gap = 1e30f;
                 for (size_t i = 0; i < instanceCount; ++i) {
-                    if (!usable(i)) continue;
+                    if (!usable(i) || !fits(i)) continue;
                     const size_t at = i * kInstanceSize;
                     const float width = field(at + 0x0C), length = field(at + 0x2C);
                     const float sx = field(at + 0x30), sz = field(at + 0x38);
@@ -761,8 +775,18 @@ bool RewriteWorldCollision(ByteSpan whole, const CollisionPack& pack, const std:
                 std::memcpy(&hash, polygon.attributes, 4);
                 u8 surface = 0;
                 bool known = false;
+                // An added polygon that names a surface of its own (the road
+                // bake's asphalt, concrete, grass: IsWorldSurface) keeps it.
+                const bool named = shipped || IsWorldSurface(hash);
                 for (size_t s = 0; s < surfaceCount; ++s)
-                    if (shipped && article.read<u32>(surfaces + s * 4) == hash) { surface = (u8)s; known = true; }
+                    if (named && article.read<u32>(surfaces + s * 4) == hash) { surface = (u8)s; known = true; }
+                if (!known && !shipped && named) {
+                    auto& more = newSurfaces[row];
+                    const auto slot = std::find(more.begin(), more.end(), hash);
+                    surface = (u8)(surfaceCount + (size_t)(slot - more.begin()));
+                    if (slot == more.end()) more.push_back(hash);
+                    known = true;
+                }
                 if (!known || (hash == 0 && !polygon.barrier)) {
                     // Never the null surface (hash 0) on ground that was added, moved
                     // or given another surface: the car's reset behaviour (nfsw.exe
@@ -778,8 +802,10 @@ bool RewriteWorldCollision(ByteSpan whole, const CollisionPack& pack, const std:
                     for (size_t s = 0; s < surfaceCount && surface == 0xFF; ++s)
                         if (article.read<u32>(surfaces + s * 4) != 0) surface = (u8)s;
                     if (surface == 0xFF) {
-                        if (newSurfaces[row].empty()) newSurfaces[row].push_back(kAsphaltSurface);
-                        surface = (u8)surfaceCount;
+                        auto& more = newSurfaces[row];
+                        const auto slot = std::find(more.begin(), more.end(), kAsphaltSurface);
+                        surface = (u8)(surfaceCount + (size_t)(slot - more.begin()));
+                        if (slot == more.end()) more.push_back(kAsphaltSurface);
                     }
                 }
                 const u8 flags = shipped ? polygon.flags : 0;
@@ -943,10 +969,12 @@ bool AddToCollisionGrid(ByteSpan raw, const std::vector<GridEntry>& entries, std
     const u16 section = (u16)data.read<u32>(4);
     bool changed = false;
     // Cells hold a point by round() (0x6cff40), shipped lists look like floor:
-    // take both, the game tests the instance's radius after.
+    // take both, the game tests the instance's radius after. A point outside
+    // the grid is looked up in the nearest edge cell (0x6cff40 / 0x6df170
+    // clamp), so both ends are clamped the same way.
     auto span = [&](float lo, float hi, float origin, int cellCount, int& a, int& b) {
-        a = std::max(0, (int)std::floor((lo - origin) / kCell));
-        b = std::min(cellCount - 1, (int)std::floor((hi - origin) / kCell + 0.5f));
+        a = std::clamp((int)std::floor((lo - origin) / kCell), 0, cellCount - 1);
+        b = std::clamp((int)std::floor((hi - origin) / kCell + 0.5f), 0, cellCount - 1);
     };
     for (const GridEntry& entry : entries) {
         int x0, x1, z0, z1;

@@ -41,6 +41,25 @@ bool WriteWorldEdits(nfs::World& world, const std::wstring& tracksFolder, WorldW
 
 bool GameIsRunning();
 
+// The folder the edit list and the kept files live in (TRACKS\frs-original,
+// or under FRS_WRITE_TRACKS for scripted runs). Not made here.
+std::wstring WorldEditsFolder(const std::wstring& tracksFolder);
+
+// --- streaming zones ------------------------------------------------------------
+// The drivable section boundaries of the region as shipped (L5RA.BUN chunk
+// 0x34152 in 0x80034150; nfsw.exe 0x7471f0 loads them). Record: u32 11, u32 11,
+// u16 section, u8 point count (a signed byte to the game: at most 127), u8 flag (0 or 1), 12 bytes,
+// min x/y, max x/y, centre x/y, then the points (float x, y: game axes).
+// Drivable: letter (section / 1000) up to 19 and 1 <= section % 1000 < the
+// first word of 0x34151 (400). The streamer looks the car up in these
+// (0x741ba0: inside a polygon, or within 0.1 of one); outside all of them the
+// zone is 0 and no section of the map is streamed (0x742c20, 0x742e00).
+struct WorldZone {
+    u32 section = 0;
+    std::vector<Vec2> points;
+};
+std::vector<WorldZone> ReadWorldZones(const std::wstring& tracksFolder, const std::wstring& region);
+
 // --- textures -------------------------------------------------------------------
 // A texture is replaced where it stands: the image is encoded to each stored
 // copy's own size, format and mip levels -- the pack's and every larger level

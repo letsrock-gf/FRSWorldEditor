@@ -64,6 +64,7 @@ Save refuses while `nfsw.exe` runs: the game holds the map's files open.
 | New model, new texture | Added to the section's solid list and to the texture section its materials need. New textures are named `FRS_<name>`. |
 | Collision: delete, add, move, change surface | Articles are written again inside their pack. Walls are barrier records, one per side. Ground that no collision box holds makes the nearest box grow. |
 | Raised ground over a road (a speed bump) | The road under it is cut out, so the wheel does not jump between the two. |
+| Roads > Bake | The road becomes new models (built with the material a shipped road draws the same texture with; the texture is copied into the section that needs it), its collision new polygons named asphalt, concrete or grass, its street lights placed objects. All of it is lines of the edit list: Ctrl+Z takes the bake back, Roads > Remove baked roads takes it out and keeps the ground fitted under it. Traffic and GPS are not written (see Limitations). |
 
 ### Editor
 
@@ -131,7 +132,13 @@ has only scripted checks.
   `verify_*.py` pair. After the merge of 0.2.7 (19 Nov 2026) a real edit list
   was replayed: 1877 edits, 469 sections written. Every one of the 470 files
   came out byte for byte as the build before the merge had written them, and
-  `verify_table.py` found an entry for all 469 sections.
+  `verify_table.py` found an entry for all 469 sections. After the road bake
+  (20 Nov 2026) the author's list of 2407 edits was replayed again: all 473
+  files and the list came out byte for byte as installed. `test_roadbake.ps1`
+  bakes a road, takes it back, bakes it again, reopens and removes it; each
+  state is read back by `verify_roadbake.py`, `verify_roadcol.py`,
+  `verify_newmodel.py`, `verify_newtex.py`, `verify_grid.py` and
+  `verify_table.py`.
 - **In game.** Ground collision added in the editor (a speed bump) is driven
   over without bouncing. The fast-test plugin, as built from `fasttest-nfsw`
   and loaded by the Ultimate ASI Loader 10.0.0 the package carries, reaches
@@ -141,7 +148,9 @@ has only scripted checks.
   only, on a scratch game folder.
 - **Not confirmed in game, item by item:** placed objects and their physics,
   edited and new models, new textures, walls after the one-side fix, key `I`,
-  the grown `L5RA.BUN`.
+  the grown `L5RA.BUN` (bar the baked road below).
+- **Confirmed in game:** one baked road (21 Nov 2026, author's map): drivable,
+  map loaded along it. Traffic and GPS on it do not exist (see Limitations).
 - **Not tried:** the package on a machine other than the author's.
 
 One known way to break the game: a section that grows while its entry in the
@@ -154,8 +163,30 @@ the entry, and `verify_table.py` checks it.
 - **One game build.** The port was matched against one `nfsw.exe` (32-bit, MD5
   `4c32936debffcbdc208d39502b79a56f`). The setup says so when yours is another
   build; no other build was checked.
-- **Not written to NFS World:** roads, terrain, markers, traffic and GPS
-  routes. Those tools show on the map but their bake is Underground 2's format.
+- **Roads > Bake on NFS World** writes the road meshes, their collision and
+  the street furniture the map has models for, but **not traffic and GPS
+  routes**: NFS World keeps no `ROUTES<region>` folder, and where its road
+  graph lives has not been read yet. The lights and flares the bake makes for
+  Underground 2 are not written either. Road textures named after
+  Underground 2's are drawn with the map's own road textures. The editor
+  draws a baked road grey: it reads the texture sections as shipped, and the
+  textures copied in for the road are in the written files only. In the game
+  (20 Nov 2026) a baked road showed, but the car did not follow its rises and
+  dips: the road lay beyond the collision grid, whose polygons the save then
+  left out. They are written now (see collision outside every box). Past the
+  edge of every drivable streaming zone the game then dropped the whole map:
+  outside them all it streams no section (`nfsw.exe` 0x741ba0, 0x742c20,
+  0x742e00). The bake now widens the zone a road leaves with a corridor along
+  it (`L5RA.BUN` chunk 0x34152, at most 127 points an outline; edit list `Z`
+  lines), so the car stays in that zone and its sections stay loaded. A save
+  after a widened zone first wrote the section sizes where the live table
+  sat, 0x140 bytes past the copy being written (the zone lies before the
+  table), and the game crashed before the garage (`memcpy` from
+  `nfsw.exe` 0x615af0); the writer now finds each entry by its section's
+  name. On 21 Nov 2026 the author drove a baked road with all three fixes:
+  the car follows it, the map stays loaded, the game loads.
+- **Not written to NFS World:** markers, and terrain made with the terrain
+  tools (the patches the road bake carries go in with it, untried).
 - **Publish World, `.frsworld` files and the game plugin** do not carry NFS
   World edits.
 - **Collision import** (OBJ, Blender) is refused for NFS World. Collision is
@@ -164,12 +195,14 @@ the entry, and `verify_table.py` checks it.
   game may still show the shipped shape. Models whose vertices are
   integer-packed (effects 8 and 9) are not written.
 - **New textures:** at most 512 px a side, DXT1 or DXT5.
-- **Collision outside every box:** the nearest box grows to hold it, anywhere
-  inside the game's collision grid (96 m cells, 7680 m by 11040 m over the
-  map). Outside the grid the game has nowhere to look, so the polygon is left
-  out of the save and the status bar counts it. One box holds about 1600
-  triangles; a save that would pass that is refused with a message. Ground in
-  a grown box has scripted checks only: nobody has driven on it yet.
+- **Collision outside every box:** the nearest box grows to hold it, also
+  beyond the game's collision grid (96 m cells, 7680 m by 11040 m over the
+  map): the game looks a point outside the grid up in the nearest edge cell
+  (`nfsw.exe` 0x6cff40 and 0x6df170 clamp the cell), and the save lists the
+  grown box there. One box holds about 1600 triangles; when the nearest one is
+  full, the next nearest grows, and a save with no box left is refused with a
+  message. Ground in a grown box has scripted checks only: nobody has driven
+  on it yet.
 - **Culling tree:** the game walks it with a 64-entry stack. A save that would
   pass it is refused, and the message names the section and the object.
 - **Launch Game / Fast test** were tried only on the author's setup. The
