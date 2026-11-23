@@ -3,10 +3,7 @@
 Changes of the NFS World port. The original editor's own history is in
 [its repository](https://github.com/chrystianfarias/FRSWorldEditor).
 
-## In the source, not in a package yet
-
-Everything below is in the `nfsw-port` branch after 0.2.7-nfsw.2. The zip of
-0.2.7-nfsw.2 does not have it; build the branch to use it.
+## 0.2.7-nfsw.3 (2026-11-23)
 
 ### Roads
 

@@ -8,7 +8,7 @@
 #   dist\FRSWorldEditor-NFSW-<version>.zip  the same, zipped
 #
 #   .\package-nfsw.ps1
-#   .\package-nfsw.ps1 -Version 0.2.7-nfsw.2
+#   .\package-nfsw.ps1 -Version 0.2.7-nfsw.3
 #
 # Built in a folder of its own (build-release), without extensions and without
 # New Region / Import Region, as the original's package.ps1 does. The
@@ -17,7 +17,7 @@
 # -MinHook <folder>: a copy of MinHook 1.3.4 on disk, instead of downloading it.
 # -AsiLoader <folder>: where Ultimate ASI Loader's 32-bit dinput8.dll and its LICENSE.txt are. The original's
 # package.ps1 downloads them into third_party\asi-loader; any release of the loader put there by hand does too.
-param([string]$Version = "0.2.7-nfsw.2", [string]$MinHook,
+param([string]$Version = "0.2.7-nfsw.3", [string]$MinHook,
       [string]$AsiLoader = (Join-Path $PSScriptRoot "third_party\asi-loader"))
 
 $ErrorActionPreference = "Stop"
