@@ -15,6 +15,7 @@ Underground 2, use [the original](https://github.com/chrystianfarias/FRSWorldEdi
 
 - [Download and first run](#download-and-first-run)
 - [What this version adds](#what-this-version-adds)
+- [Changelog](CHANGELOG.md)
 - [How saving works on NFS World](#how-saving-works-on-nfs-world)
 - [What was checked where](#what-was-checked-where)
 - [Limitations](#limitations)
