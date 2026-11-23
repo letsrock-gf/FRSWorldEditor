@@ -746,9 +746,18 @@ void PatchSection(const nfs::World& world, const nfs::LoadedSection& loaded, std
         std::vector<const nfs::SolidObject*> edited(infoCount, nullptr);
         for (size_t i = 0; i < infoCount; ++i)
             for (size_t level = 0; level < 4 && !edited[i]; ++level) {
-                const u32 hash = Read<u32>(infoBase + i * kInfoSize + kInfoLevels + level * 4);
-                for (const auto& replacement : world.meshReplacements)
-                    if (replacement.hash == hash) edited[i] = world.FindModel(hash);
+                u8* levels = infoBase + i * kInfoSize + kInfoLevels;
+                const u32 hash = Read<u32>(levels + level * 4);
+                for (const auto& replacement : world.meshReplacements) {
+                    if (replacement.hash != hash) continue;
+                    edited[i] = world.FindModel(hash);
+                    // A model replaced whole is drawn at every level of detail
+                    // its info names: the shipped far ones show the old shape.
+                    // ponytail: the full mesh far away too; a level of its own when that costs frames.
+                    if (level == 0 && WholeReplacement(replacement.file))
+                        for (size_t distant = 1; distant < 4; ++distant)
+                            if (Read<u32>(levels + distant * 4)) std::memcpy(levels + distant * 4, &hash, 4);
+                }
             }
         for (size_t i = 0; i < infoCount; ++i)
             if (edited[i]) {
@@ -1409,13 +1418,6 @@ bool WriteWorldEdits(nfs::World& world, const std::wstring& tracksFolder, WorldW
             list += line;
         }
     }
-    for (const auto& replacement : world.meshReplacements) {
-        const size_t slash = replacement.file.find_last_of(L"\\/");
-        char line[400];
-        std::snprintf(line, sizeof(line), "O %08X %ls\n", replacement.hash,
-                      replacement.file.substr(slash == std::wstring::npos ? 0 : slash + 1).c_str());
-        list += line;
-    }
     // New textures before the new models that draw with them, and only those
     // a placed new model draws with (io/WorldTexture.h).
     // Game textures copied for models placed where they are not loaded come
@@ -1439,6 +1441,14 @@ bool WriteWorldEdits(nfs::World& world, const std::wstring& tracksFolder, WorldW
         else
             std::snprintf(line, sizeof(line), "X %08X %08X %s %ls\n", texture->hash, texture->like,
                           texture->name.c_str(), texture->file.c_str());
+        list += line;
+    }
+    // Edited meshes after the new textures: a model replaced whole may draw with them.
+    for (const auto& replacement : world.meshReplacements) {
+        const size_t slash = replacement.file.find_last_of(L"\\/");
+        char line[400];
+        std::snprintf(line, sizeof(line), "O %08X %ls\n", replacement.hash,
+                      replacement.file.substr(slash == std::wstring::npos ? 0 : slash + 1).c_str());
         list += line;
     }
     // New models before the placements that use them; one nothing places is

@@ -30,13 +30,15 @@
 //
 // Only the edited model changes. The other levels of detail the scenery names
 // for it (an info holds four) stay as shipped: from far away the game may still
-// show the old shape. Collision is a separate pack and is not touched.
+// show the old shape (a whole replacement, below, names itself at every level
+// instead). Collision is a separate pack and is not touched.
 namespace io {
 
 struct WorldMeshImport {
     size_t objectsRead = 0;
     size_t staged      = 0;
     size_t created     = 0;     // of those, new models placed where they stand
+    size_t removed     = 0;     // placements taken out (replaced, or gone from the save)
     std::vector<u32> hashes;    // the models staged
     std::vector<size_t> sections;   // loaded sections that took a new model
     std::wstring done;          // one line per model staged
@@ -48,8 +50,21 @@ struct WorldMeshImport {
 // or every object, when there is no manifest and `newOrigin` says where the
 // OBJ's origin stands -- becomes a NEW model (see below) placed where it
 // stands. Nothing in the game's files changes until the next Save.
+//
+// A shipped model that cannot be written over itself -- a material of the save
+// is none of the shipped model's, or the model holds runs the editor cannot
+// read -- is replaced whole: the save is written as a new model is, under the
+// shipped model's own name and hash (WholeReplacement), so every placement of
+// it changes and the infos that name it draw it at every level of detail.
+// Only when that cannot be done is it replaced where it stands (a new model
+// there, that placement of the shipped one taken out).
+// With `wholeScene` (the quick edit: Blender sends its whole scene every
+// time) an object the save no longer holds was deleted in Blender: its
+// placement goes. When exactly one such object is gone and the save holds
+// objects the manifest does not name (another model imported in its place),
+// those objects together are that model: they replace it as above.
 bool ImportWorldMeshes(nfs::World& world, const std::wstring& tracksFolder, const std::wstring& objPath,
-                       WorldMeshImport& out, const Vec3* newOrigin = nullptr);
+                       WorldMeshImport& out, const Vec3* newOrigin = nullptr, bool wholeScene = false);
 
 // --- models the editor makes -----------------------------------------------------
 // A new model is written into the file of the section it stands in: its object
@@ -107,6 +122,11 @@ bool SectionModelCopies(const nfs::World& world, const nfs::LoadedSection& loade
 // Takes the kept OBJ of `hash` into the loaded model (what the viewport draws)
 // and lists it for the next Save. The edit list does this on opening.
 bool StageWorldMesh(nfs::World& world, u32 hash, const std::wstring& keptPath, std::wstring& error);
+
+// Whether a kept mesh replaces its shipped model whole ("# frs-topology whole"
+// at its top): kept as a new model is (usemtl tex_<hash>) and built as one,
+// under the shipped model's name and hash.
+bool WholeReplacement(const std::wstring& keptPath);
 
 // Whether this section's file stores or places an edited model.
 bool SectionHasMeshEdits(const nfs::World& world, const nfs::LoadedSection& loaded);

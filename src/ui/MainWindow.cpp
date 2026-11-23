@@ -2395,7 +2395,7 @@ void MainWindow::ImportObj(const std::wstring& path, bool quick, const Vec3* new
         // does not read. A shape the manifest does not name (or any, with
         // `newOrigin`) becomes a new model placed where it stands.
         io::WorldMeshImport result;
-        const bool staged = io::ImportWorldMeshes(*world_, tracksFolder_, path, result, newOrigin);
+        const bool staged = io::ImportWorldMeshes(*world_, tracksFolder_, path, result, newOrigin, quick);
         std::vector<size_t> touched = result.sections;
         for (size_t i = 0; i < world_->Loaded().size(); ++i)
             for (u32 hash : result.hashes)
@@ -2403,6 +2403,10 @@ void MainWindow::ImportObj(const std::wstring& path, bool quick, const Vec3* new
         std::sort(touched.begin(), touched.end());
         touched.erase(std::unique(touched.begin(), touched.end()), touched.end());
         viewport_.GetRenderer().ReuploadSections(*world_, touched);
+        if (result.removed) {   // placements replaced or deleted in Blender: indices moved
+            viewport_.GetRenderer().ClearSelection();
+            viewport_.GetRenderer().RebuildInstances(*world_);
+        }
         if (result.created) {
             const nfs::LoadedSection* last = world_->Loaded()[result.sections.back()].get();
             viewport_.GetRenderer().SelectPlacement((u32)result.sections.back(), (int)last->placements.size() - 1);
@@ -2413,6 +2417,7 @@ void MainWindow::ImportObj(const std::wstring& path, bool quick, const Vec3* new
         std::wstring status = staged ? Format(L"Blender: %zu meshes changed -- Save writes them into the game's files",
                                               result.staged)
                                      : std::wstring(L"Blender: no mesh could be taken");
+        if (result.removed) status += Format(L" -- %zu old placements taken out", result.removed);
         if (!result.refused.empty())
             status += Format(L" -- %zu left alone (see the log)", result.objectsRead - result.staged);
         SetStatusText(2, status);

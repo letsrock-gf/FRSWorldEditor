@@ -1185,6 +1185,36 @@ std::unordered_map<u32, CarBuilt>& CarsBuilt() {
     return cars;
 }
 
+} // namespace
+
+bool WholeReplacement(const std::wstring& keptPath) {
+    std::ifstream in(keptPath);
+    std::string line;
+    for (int i = 0; i < 4 && std::getline(in, line); ++i)
+        if (line.rfind("# frs-topology whole", 0) == 0) return true;
+    return false;
+}
+
+namespace {
+
+// `node`, a shipped object of hash `hash`, with the kept mesh `file` applied:
+// a whole replacement is built as a new model under the shipped name (its
+// donors from the section that stores the model), an edit over the object.
+bool ReplacedNode(const nfs::World& world, u32 hash, const std::wstring& file, Node& node, std::wstring& why) {
+    if (WholeReplacement(file)) {
+        const nfs::SolidObject* model = world.FindModel(hash);
+        for (const auto& loaded : world.Loaded())
+            if (model && loaded->info && loaded->HoldsModel(hash))
+                return BuildNewNode(world, { hash, loaded->info->number, file }, model->name, node, why);
+        why = L"the model it replaces is not loaded";
+        return false;
+    }
+    size_t materials = 0, vertices = 0;
+    MeshEdit edit;
+    if (!CountsOf(node, materials, vertices)) { why = L"the model could not be read from its file"; return false; }
+    return ReadKeptMesh(file, materials, vertices, edit, why) && BuildObject(node, edit, why);
+}
+
 // The object of a model as the game would read it now: a new one built from
 // its kept OBJ, a shipped one with its mesh edit applied.
 bool SourceNode(const nfs::World& world, u32 hash, Node& out, std::wstring& why) {
@@ -1202,12 +1232,8 @@ bool SourceNode(const nfs::World& world, u32 hash, Node& out, std::wstring& why)
     Shipped shipped;
     if (!FindShipped(world, hash, shipped, why)) return false;
     out = std::move(shipped.node);
-    for (const auto& replacement : world.meshReplacements) {
-        if (replacement.hash != hash) continue;
-        MeshEdit edit;
-        if (!ReadKeptMesh(replacement.file, shipped.materials, shipped.vertices, edit, why) || !BuildObject(out, edit, why))
-            return false;
-    }
+    for (const auto& replacement : world.meshReplacements)
+        if (replacement.hash == hash && !ReplacedNode(world, hash, replacement.file, out, why)) return false;
     return true;
 }
 
@@ -1274,10 +1300,8 @@ float ModelRadius(const nfs::SolidObject& model) {
 bool StageWorldMesh(nfs::World& world, u32 hash, const std::wstring& keptPath, std::wstring& error) {
     Shipped shipped;
     if (!FindShipped(world, hash, shipped, error)) return false;
-    MeshEdit edit;
-    if (!ReadKeptMesh(keptPath, shipped.materials, shipped.vertices, edit, error)) return false;
     Node rebuilt = shipped.node;
-    if (!BuildObject(rebuilt, edit, error)) return false;
+    if (!ReplacedNode(world, hash, keptPath, rebuilt, error)) return false;
     std::vector<u8> bytes;
     Emit(bytes, { rebuilt }, shipped.offset);
     nfs::SolidObject fresh;
@@ -1299,6 +1323,7 @@ bool StageWorldMesh(nfs::World& world, u32 hash, const std::wstring& keptPath, s
                 model.vertices     = fresh.vertices;
                 model.indices      = fresh.indices;
                 model.materials    = fresh.materials;
+                model.textureHashes = fresh.textureHashes;
                 model.bounds       = fresh.bounds;
                 model.hasNormals   = fresh.hasNormals;
                 model.vertexStride = fresh.vertexStride;
@@ -1317,8 +1342,8 @@ bool StageWorldMesh(nfs::World& world, u32 hash, const std::wstring& keptPath, s
     auto& list = world.meshReplacements;
     list.erase(std::remove_if(list.begin(), list.end(), [&](const auto& r) { return r.hash == hash; }), list.end());
     list.push_back({ hash, keptPath });
-    LOG_INFO("mesh edit %08X staged from %S: %zu vertices, %zu triangles (%s)", hash, keptPath.c_str(),
-             fresh.vertices.size(), fresh.indices.size() / 3, edit.same ? "same layout" : "rebuilt");
+    LOG_INFO("mesh edit %08X staged from %S: %zu vertices, %zu triangles%s", hash, keptPath.c_str(),
+             fresh.vertices.size(), fresh.indices.size() / 3, WholeReplacement(keptPath) ? " (replaced whole)" : "");
     return true;
 }
 
@@ -1332,11 +1357,15 @@ bool ModelPlaced(const nfs::World& world, u32 hash) {
 std::vector<u32> NewTexturesInUse(const nfs::World& world) {
     std::vector<u32> used;
     if (world.newTextures.empty()) return used;
-    for (const auto& model : world.newModels) {
-        if (!ModelPlaced(world, model.hash)) continue;
+    std::vector<std::wstring> files;
+    for (const auto& model : world.newModels)
+        if (ModelPlaced(world, model.hash)) files.push_back(model.file);
+    for (const auto& replacement : world.meshReplacements)   // shipped models replaced whole draw with them too
+        if (WholeReplacement(replacement.file)) files.push_back(replacement.file);
+    for (const std::wstring& file : files) {
         std::vector<ObjMesh> meshes;
         std::wstring ignored;
-        if (!ReadKeptObj(model.file, meshes, ignored)) continue;
+        if (!ReadKeptObj(file, meshes, ignored)) continue;
         for (const ObjMesh& mesh : meshes)
             for (const ObjFaceGroup& group : mesh.groups) {
                 unsigned hash = 0;
@@ -1406,6 +1435,44 @@ bool CopyCovers(const nfs::World& world, u32 texture, const std::vector<u32>& se
     if (std::binary_search(sectionTextures.begin(), sectionTextures.end(), copy->like)) return true;
     for (const u32 like : copy->moreLikes)
         if (std::binary_search(sectionTextures.begin(), sectionTextures.end(), like)) return true;
+    return false;
+}
+
+// The placement a manifest object was exported from, taken out of the map: a
+// shipped record is removed (written with its matrix zeroed), a placement the
+// editor made is deleted. Looked for in the section the export named first,
+// then anywhere. False when none matches. `justLook`: only whether one does.
+bool RemoveExportedPlacement(nfs::World& world, const ManifestObject& object, bool justLook = false) {
+    const auto same = [&](const Mat4& m) {
+        for (int r = 0; r < 4; ++r)
+            for (int c = 0; c < 3; ++c)
+                if (std::fabs(m.m[r][c] - object.transform.m[r][c]) > 0.01f) return false;
+        return true;
+    };
+    for (int pass = 0; pass < 2; ++pass)
+        for (size_t i = 0; i < world.Loaded().size(); ++i) {
+            nfs::LoadedSection* section = world.MutableLoaded(i);
+            if (!section || !section->info) continue;
+            if (pass == 0 && section->info->name != object.section) continue;
+            for (size_t p = 0; p < section->placements.size(); ++p) {
+                const nfs::PlacedInstance& placed = section->placements[p].instance;
+                if (placed.modelHash != object.hash || !same(placed.transform)) continue;
+                if (justLook) return true;
+                section->placements.erase(section->placements.begin() + (std::ptrdiff_t)p);
+                section->placementsChanged = true;
+                return true;
+            }
+            for (const nfs::SceneryInstance& instance : section->scenery.instances) {
+                if (section->scenery.ModelHash(instance) != object.hash || !same(instance.transform)) continue;
+                const auto key = std::make_pair(instance.sceneryNumber, instance.record);
+                auto& removed = section->removedNatives;
+                if (std::find(removed.begin(), removed.end(), key) != removed.end()) continue;
+                if (justLook) return true;
+                removed.push_back(key);
+                section->placementsChanged = true;
+                return true;
+            }
+        }
     return false;
 }
 
@@ -1500,7 +1567,7 @@ bool SectionModelCopies(const nfs::World& world, const nfs::LoadedSection& loade
 }
 
 bool ImportWorldMeshes(nfs::World& world, const std::wstring& tracksFolder, const std::wstring& objPath,
-                       WorldMeshImport& out, const Vec3* newOrigin) {
+                       WorldMeshImport& out, const Vec3* newOrigin, bool wholeScene) {
     std::vector<ObjMesh> meshes;
     std::wstring why;
     if (!ReadObjMeshes(objPath, meshes, why)) {
@@ -1581,7 +1648,7 @@ bool ImportWorldMeshes(nfs::World& world, const std::wstring& tracksFolder, cons
     };
 
     const auto keepNew = [&](const ObjMesh& mesh, const nfs::LoadedSection& section, const std::string& name, u32 hash,
-                             const Mat4& toModel, std::wstring& kept, std::wstring& error) {
+                             const Mat4& toModel, std::wstring& kept, std::wstring& error, bool whole = false) {
         std::vector<u32> textures(mesh.groups.size(), 0);
         for (size_t g = 0; g < mesh.groups.size(); ++g)
             if (mesh.groups[g].indexCount && !(textures[g] = MaterialTexture(world, mesh.groups[g].material)) &&
@@ -1590,11 +1657,12 @@ bool ImportWorldMeshes(nfs::World& world, const std::wstring& tracksFolder, cons
                 return false;
             }
         wchar_t file[32];
-        ::_snwprintf_s(file, _TRUNCATE, L"NEW_%08X.obj", hash);
+        ::_snwprintf_s(file, _TRUNCATE, whole ? L"%08X_whole.obj" : L"NEW_%08X.obj", hash);
         kept = folder + L"\\" + file;
         FILE* f = nullptr;
         if (::_wfopen_s(&f, kept.c_str(), L"w") != 0 || !f) { error = L"could not write " + kept; return false; }
-        std::fprintf(f, "# FRS World Editor: NFS World new model %s (%08X)\n", name.c_str(), hash);
+        std::fprintf(f, "# FRS World Editor: NFS World %s %s (%08X)\n", whole ? "mesh" : "new model", name.c_str(), hash);
+        if (whole) std::fprintf(f, "# frs-topology whole\n");   // WholeReplacement
         std::fprintf(f, "# model space, game axes (Z up); vt as the game stores it (v down); usemtl tex_<hash> = game texture\n");
         std::fprintf(f, "o %s\n", name.c_str());
         for (size_t k = 0; k < mesh.positions.size(); ++k) {
@@ -1621,13 +1689,179 @@ bool ImportWorldMeshes(nfs::World& world, const std::wstring& tracksFolder, cons
         return true;
     };
 
+    // A new model placed where the mesh stands, named after `label` (a Blender
+    // object, or the model it takes the place of). False, with why, when it
+    // cannot be made.
+    const auto placeNew = [&](const ObjMesh& mesh, std::string label, std::wstring& error) {
+        if (mesh.indices.size() < 3) { error = L"it has no faces"; return false; }
+        std::wstring kept;
+
+        // Pivot in the middle of its footprint, on its lowest point, as the
+        // original editor makes new objects.
+        Aabb box;
+        std::vector<Vec3> along;
+        const size_t step = std::max<size_t>(1, mesh.positions.size() / 48);
+        for (size_t k = 0; k < mesh.positions.size(); ++k) {
+            const Vec3 p = FromBlender(mesh.positions[k]) + origin;
+            box.Add(p);
+            if (k % step == 0) along.push_back(p);
+        }
+        const Vec3 pivot{ (box.min.x + box.max.x) * 0.5f, (box.min.y + box.max.y) * 0.5f, box.min.z };
+        size_t target = world.SectionForPlacementAlong(along);
+        if (target == SIZE_MAX) target = world.SectionForPlacement(pivot);
+        nfs::LoadedSection* section = world.MutableLoaded(target);
+        if (!section || !section->info) { error = L"no section where it stands can take scenery"; return false; }
+
+        // "XO_BENCH__1A2B3C4D" (an exported object) -> XO_BENCH.
+        if (const size_t tail = label.rfind("__"); tail != std::string::npos && tail > 0) label.resize(tail);
+        std::string model = label.rfind("FRS_", 0) == 0 ? "" : "FRS_";
+        for (char c : label) {
+            const bool plain = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+            model.push_back(plain ? (char)::toupper((unsigned char)c) : '_');
+        }
+        const std::string base = model;
+        for (int n = 2; world.FindModel(StringHash(model)) || NewModelOf(world, StringHash(model)); ++n)
+            model = base + "_" + std::to_string(n);
+        const u32 hash = StringHash(model);
+        const Mat4 placement = Mat4::Translation(pivot);
+        if (!keepNew(mesh, *section, model, hash, InverseAffine(placement), kept, error) ||
+            !StageNewWorldModel(world, section->info->number, hash, kept, error))
+            return false;
+        const nfs::SolidObject* made = world.FindModel(hash);
+        nfs::PlacedInstance placed;
+        placed.modelHash = hash;
+        placed.modelName = model;
+        placed.modelBounds = made->bounds;
+        placed.triangles = made->TriangleCount();
+        placed.radius = ModelRadius(*made);
+        placed.transform = placement;
+        section->placements.push_back({ section->info->number, placed });
+        section->placementsChanged = true;
+
+        char text[1024];
+        const Mat4& m = placement;
+        ::_snprintf_s(text, _TRUNCATE,
+                      "    {\n      \"name\": \"%s\",\n      \"model\": \"%s\",\n      \"hash\": \"%08X\",\n"
+                      "      \"section\": \"%s\",\n      \"placedBy\": \"instance\",\n"
+                      "      \"vertices\": %zu,\n      \"triangles\": %zu,\n"   // ReadManifest wants vertices
+                      "      \"transform\": [%.6f, %.6f, %.6f, %.6f, %.6f, %.6f, %.6f, %.6f, %.6f, %.6f, %.6f, %.6f]\n    }",
+                      mesh.name.c_str(), model.c_str(), hash, section->info->name.c_str(), mesh.positions.size(),
+                      mesh.TriangleCount(), m.m[0][0], m.m[0][1],
+                      m.m[0][2], m.m[1][0], m.m[1][1], m.m[1][2], m.m[2][0], m.m[2][1], m.m[2][2], m.m[3][0],
+                      m.m[3][1], m.m[3][2]);
+        manifestEntries += (manifestEntries.empty() ? "" : ",\n") + std::string(text);
+
+        ++out.staged;
+        ++out.created;
+        out.hashes.push_back(hash);
+        out.sections.push_back(target);
+        out.done += L"  " + Widen(mesh.name) + L": new model " + Widen(model) + L" in section " +
+                    Widen(section->info->name) + L", " + std::to_wstring(mesh.positions.size()) + L" vertices, " +
+                    std::to_wstring(mesh.TriangleCount()) + L" triangles, placed where it stands\n";
+        return true;
+    };
+
+    // Manifest objects the save holds; the rest were deleted or swapped in Blender.
+    std::unordered_set<std::string> seen;
+    // A shipped model the save cannot be written over: a new model takes this
+    // placement's place. False (and nothing changed) when it cannot.
+    const auto replaceHere = [&](const ObjMesh& mesh, const std::string& object, const ManifestObject& entry,
+                                 const std::wstring& because) {
+        const std::wstring name = Widen(mesh.name);
+        if (entry.header) {
+            out.refused += L"  " + name + L": " + because + L"; placed by its own header, so it cannot be "
+                           L"replaced by a new model\n";
+            return;
+        }
+        std::wstring reason;
+        if (!placeNew(mesh, object, reason)) { out.refused += L"  " + name + L": " + because + L"; " + reason + L"\n"; return; }
+        if (RemoveExportedPlacement(world, entry)) ++out.removed;
+        else LOG_WARN("mesh edit: the placement %s was exported from was not found: the old one may stay", mesh.name.c_str());
+        out.done += L"    (it takes the place of " + Widen(object) + L" here, this placement only: " + because + L")\n";
+    };
+    // A shipped model the save cannot be written over: the save replaces it
+    // whole, under its own name and hash, so every placement of it changes.
+    // Failing that, this placement only (replaceHere).
+    const auto replaceAll = [&](const ObjMesh& mesh, const std::string& object, const ManifestObject& entry,
+                                const std::wstring& because) {
+        const nfs::SolidObject* model = world.FindModel(entry.hash);
+        const nfs::LoadedSection* home = nullptr;
+        for (const auto& loaded : world.Loaded())
+            if (loaded->info && loaded->HoldsModel(entry.hash)) { home = &*loaded; break; }
+        std::wstring kept, reason;
+        if (mesh.indices.size() < 3) reason = L"it has no faces";
+        else if (!model || !home) reason = L"the model is not loaded";
+        else if (keepNew(mesh, *home, model->name, entry.hash, InverseAffine(entry.transform), kept, reason, true) &&
+                 StageWorldMesh(world, entry.hash, kept, reason)) {
+            ++out.staged;
+            out.hashes.push_back(entry.hash);
+            out.done += L"  " + Widen(mesh.name) + L": " + std::to_wstring(mesh.positions.size()) + L" vertices, " +
+                        std::to_wstring(mesh.TriangleCount()) + L" triangles, replaces " + Widen(model->name) +
+                        L" whole, at every placement of it (" + because + L")\n";
+            return;
+        }
+        replaceHere(mesh, object, entry, because + L"; not replaced whole: " + reason);
+    };
+
+    const auto named = [&](const std::string& name) {
+        auto found = manifest.find(name);
+        if (found == manifest.end() && name.find_last_of('.') != std::string::npos)
+            found = manifest.find(name.substr(0, name.find_last_of('.')));
+        return found;
+    };
+    // Another model imported in the place of the exported one, which was
+    // deleted: when exactly one object of the manifest is gone from the save
+    // (and still placed: not deleted in an earlier save) and the save holds
+    // objects the manifest does not name, those together are that object.
+    if (wholeScene && manifested) {
+        std::unordered_set<std::string> present;
+        std::vector<size_t> strangers;
+        for (size_t i = 0; i < meshes.size(); ++i) {
+            const auto found = named(meshes[i].name);
+            if (found == manifest.end()) strangers.push_back(i);
+            else present.insert(found->first);
+        }
+        std::vector<std::string> gone;
+        for (const auto& [object, entry] : manifest)
+            if (!present.count(object) && RemoveExportedPlacement(world, entry, true)) gone.push_back(object);
+        if (gone.size() == 1 && !strangers.empty()) {
+            ObjMesh merged;
+            merged.name = gone.front();
+            bool fits = true;
+            for (size_t i : strangers) {
+                const ObjMesh& part = meshes[i];
+                if (merged.positions.size() + part.positions.size() > 0xFFFF) { fits = false; break; }
+                const u16 base = (u16)merged.positions.size();
+                u32 sourceBase = 0;
+                for (u32 s : merged.sourcePositions) sourceBase = std::max(sourceBase, s + 1);
+                const u32 firstIndex = (u32)merged.indices.size();
+                merged.positions.insert(merged.positions.end(), part.positions.begin(), part.positions.end());
+                merged.colors.insert(merged.colors.end(), part.colors.begin(), part.colors.end());
+                merged.normals.insert(merged.normals.end(), part.normals.begin(), part.normals.end());
+                merged.uvs.insert(merged.uvs.end(), part.uvs.begin(), part.uvs.end());
+                for (u32 s : part.sourcePositions) merged.sourcePositions.push_back(sourceBase + s);
+                for (u16 k : part.indices) merged.indices.push_back((u16)(base + k));
+                for (ObjFaceGroup group : part.groups) {
+                    group.firstIndex += firstIndex;
+                    merged.groups.push_back(group);
+                }
+            }
+            if (fits) {
+                LOG_INFO("mesh edit: %zu new object(s) take the place of %s, gone from the save", strangers.size(),
+                         merged.name.c_str());
+                for (auto at = strangers.rbegin(); at != strangers.rend(); ++at)
+                    meshes.erase(meshes.begin() + (std::ptrdiff_t)*at);
+                meshes.push_back(std::move(merged));
+            }
+        }
+    }
+
     for (const ObjMesh& corners : meshes) {
         const ObjMesh mesh = MergeCorners(corners);
         ++out.objectsRead;
         const std::wstring name = Widen(mesh.name);
-        auto entry = manifest.find(mesh.name);
-        if (entry == manifest.end() && mesh.name.find_last_of('.') != std::string::npos)
-            entry = manifest.find(mesh.name.substr(0, mesh.name.find_last_of('.')));
+        const auto entry = named(mesh.name);
+        if (entry != manifest.end()) seen.insert(entry->first);
 
         if (entry == manifest.end() || NewModelOf(world, entry->second.hash)) {
             // --- a new model, or a new model saved again ---------------------------------
@@ -1651,76 +1885,13 @@ bool ImportWorldMeshes(nfs::World& world, const std::wstring& tracksFolder, cons
                             L" triangles\n";
                 continue;
             }
-            if (mesh.indices.size() < 3) { out.refused += L"  " + name + L": it has no faces\n"; continue; }
-
-            // Pivot in the middle of its footprint, on its lowest point, as the
-            // original editor makes new objects.
-            Aabb box;
-            std::vector<Vec3> along;
-            const size_t step = std::max<size_t>(1, mesh.positions.size() / 48);
-            for (size_t k = 0; k < mesh.positions.size(); ++k) {
-                const Vec3 p = FromBlender(mesh.positions[k]) + origin;
-                box.Add(p);
-                if (k % step == 0) along.push_back(p);
-            }
-            const Vec3 pivot{ (box.min.x + box.max.x) * 0.5f, (box.min.y + box.max.y) * 0.5f, box.min.z };
-            size_t target = world.SectionForPlacementAlong(along);
-            if (target == SIZE_MAX) target = world.SectionForPlacement(pivot);
-            nfs::LoadedSection* section = world.MutableLoaded(target);
-            if (!section || !section->info) { out.refused += L"  " + name + L": no section where it stands can take scenery\n"; continue; }
-
-            std::string model = "FRS_";
-            for (char c : mesh.name) {
-                const bool plain = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
-                model.push_back(plain ? (char)::toupper((unsigned char)c) : '_');
-            }
-            const std::string base = model;
-            for (int n = 2; world.FindModel(StringHash(model)) || NewModelOf(world, StringHash(model)); ++n)
-                model = base + "_" + std::to_string(n);
-            const u32 hash = StringHash(model);
-            const Mat4 placement = Mat4::Translation(pivot);
-            if (!keepNew(mesh, *section, model, hash, InverseAffine(placement), kept, why) ||
-                !StageNewWorldModel(world, section->info->number, hash, kept, why)) {
-                out.refused += L"  " + name + L": " + why + L"\n";
-                continue;
-            }
-            const nfs::SolidObject* made = world.FindModel(hash);
-            nfs::PlacedInstance placed;
-            placed.modelHash = hash;
-            placed.modelName = model;
-            placed.modelBounds = made->bounds;
-            placed.triangles = made->TriangleCount();
-            placed.radius = ModelRadius(*made);
-            placed.transform = placement;
-            section->placements.push_back({ section->info->number, placed });
-            section->placementsChanged = true;
-
-            char text[1024];
-            const Mat4& m = placement;
-            ::_snprintf_s(text, _TRUNCATE,
-                          "    {\n      \"name\": \"%s\",\n      \"model\": \"%s\",\n      \"hash\": \"%08X\",\n"
-                          "      \"section\": \"%s\",\n      \"placedBy\": \"instance\",\n"
-                          "      \"vertices\": %zu,\n      \"triangles\": %zu,\n"   // ReadManifest wants vertices
-                          "      \"transform\": [%.6f, %.6f, %.6f, %.6f, %.6f, %.6f, %.6f, %.6f, %.6f, %.6f, %.6f, %.6f]\n    }",
-                          mesh.name.c_str(), model.c_str(), hash, section->info->name.c_str(), mesh.positions.size(),
-                          mesh.TriangleCount(), m.m[0][0], m.m[0][1],
-                          m.m[0][2], m.m[1][0], m.m[1][1], m.m[1][2], m.m[2][0], m.m[2][1], m.m[2][2], m.m[3][0],
-                          m.m[3][1], m.m[3][2]);
-            manifestEntries += (manifestEntries.empty() ? "" : ",\n") + std::string(text);
-
-            ++out.staged;
-            ++out.created;
-            out.hashes.push_back(hash);
-            out.sections.push_back(target);
-            out.done += L"  " + name + L": new model " + Widen(model) + L" in section " + Widen(section->info->name) +
-                        L", " + std::to_wstring(mesh.positions.size()) + L" vertices, " +
-                        std::to_wstring(mesh.TriangleCount()) + L" triangles, placed where it stands\n";
+            if (!placeNew(mesh, mesh.name, why)) out.refused += L"  " + name + L": " + why + L"\n";
             continue;
         }
         const u32 hash = entry->second.hash;
         Shipped shipped;
         if (!FindShipped(world, hash, shipped, why)) {
-            out.refused += L"  " + name + L": " + why + L"\n";
+            replaceHere(mesh, entry->first, entry->second, why);
             continue;
         }
         const nfs::SolidObject& model = shipped.model;
@@ -1730,7 +1901,7 @@ bool ImportWorldMeshes(nfs::World& world, const std::wstring& tracksFolder, cons
             MeshEdit nothing;
             nothing.same = true;
             BuildObject(probe, nothing, why);
-            out.refused += L"  " + name + L": " + why + L"\n";
+            replaceAll(mesh, entry->first, entry->second, why);
             continue;
         }
 
@@ -1739,8 +1910,8 @@ bool ImportWorldMeshes(nfs::World& world, const std::wstring& tracksFolder, cons
         for (size_t g = 0; g < mesh.groups.size(); ++g)
             if ((groupMaterial[g] = MaterialFor(mesh.groups[g].material, model)) < 0) unknown = Widen(mesh.groups[g].material);
         if (!unknown.empty()) {
-            out.refused += L"  " + name + L": material " + unknown + L" is not one of the model's; a new "
-                           L"material or texture is not written yet\n";
+            // Another texture, or another model altogether: written as a new one here.
+            replaceAll(mesh, entry->first, entry->second, L"material " + unknown + L" is not one of the model's");
             continue;
         }
 
@@ -1787,7 +1958,7 @@ bool ImportWorldMeshes(nfs::World& world, const std::wstring& tracksFolder, cons
         std::fclose(f);
 
         if (!StageWorldMesh(world, hash, kept, why)) {
-            out.refused += L"  " + name + L": " + why + L"\n";
+            replaceAll(mesh, entry->first, entry->second, why);
             continue;
         }
         ++out.staged;
@@ -1797,6 +1968,21 @@ bool ImportWorldMeshes(nfs::World& world, const std::wstring& tracksFolder, cons
                     std::to_wstring(model.vertices.size()) + L", " + std::to_wstring(model.indices.size() / 3) +
                     (same ? L"), same layout, written over itself\n" : L"), rebuilt\n");
     }
+
+    // Blender sends its whole scene: an object it no longer holds was deleted
+    // there, or swapped for the new ones above, and its placement goes. The
+    // manifest keeps it, so a later save finds nothing left to take out.
+    if (wholeScene && manifested)
+        for (const auto& [object, entry] : manifest) {
+            if (seen.count(object)) continue;
+            if (entry.header) {
+                out.refused += L"  " + Widen(object) + L": not in the save, but placed by its own header: left\n";
+                continue;
+            }
+            if (!RemoveExportedPlacement(world, entry)) continue;   // gone already
+            ++out.removed;
+            out.done += L"  " + Widen(object) + L": not in the save any more, taken out of the map\n";
+        }
 
     // The new objects join the manifest (the one beside the OBJ, as a Blender
     // session has), so its next save edits them instead of making them again.
@@ -1824,7 +2010,7 @@ bool ImportWorldMeshes(nfs::World& world, const std::wstring& tracksFolder, cons
             }
         }
     }
-    return out.staged > 0;
+    return out.staged > 0 || out.removed > 0;
 }
 
 bool SectionHasMeshEdits(const nfs::World& world, const nfs::LoadedSection& loaded) {
@@ -1949,11 +2135,8 @@ bool WriteWorldMeshes(const nfs::World& world, const nfs::LoadedSection& loaded,
             if (node.id != nfs::kChunkSolidObject) continue;
             const auto found = kept.find(HashOf(node));
             if (found == kept.end()) continue;
-            size_t materials = 0, vertices = 0;
-            MeshEdit edit;
             std::wstring why;
-            if (!CountsOf(node, materials, vertices) || !ReadKeptMesh(found->second, materials, vertices, edit, why) ||
-                !BuildObject(node, edit, why)) {
+            if (!ReplacedNode(world, found->first, found->second, node, why)) {
                 wchar_t hash[16];
                 ::_snwprintf_s(hash, _TRUNCATE, L"%08X", found->first);
                 error = L"The edited mesh " + std::wstring(hash) + L" could not be written: " + why;

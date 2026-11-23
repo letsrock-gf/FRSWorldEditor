@@ -128,6 +128,8 @@ bool ApplyImport(const ImportPlan& plan, const std::wstring& gameFolder,
 struct ManifestObject {
     u32  hash = 0;
     Mat4 transform;
+    std::string section;     // the section the placement was picked in ("?" when unknown)
+    bool header = false;     // placed by its own header, not by a scenery record
 };
 bool ReadExportManifest(const std::wstring& objPath, std::unordered_map<std::string, ManifestObject>& objects,
                         Vec3& origin);

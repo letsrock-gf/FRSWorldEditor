@@ -29,6 +29,7 @@ struct ManifestEntry {
     size_t vertices = 0;
     Mat4   transform = Mat4::Identity();
     std::string model;
+    std::string section, placedBy;
 };
 
 std::string ReadWholeFile(const std::wstring& path) {
@@ -154,6 +155,8 @@ bool ReadManifest(const std::wstring& path,
             entry.hash     = (u32)std::strtoul(hashText.c_str(), nullptr, 16);
             entry.vertices = (size_t)vertices;
             FindString(text, open, close, "model", entry.model);
+            FindString(text, open, close, "section", entry.section);
+            FindString(text, open, close, "placedBy", entry.placedBy);
 
             entry.transform = Mat4::Identity();
             for (int row = 0; row < 3; ++row)
@@ -163,7 +166,9 @@ bool ReadManifest(const std::wstring& path,
             entry.transform.m[3][1] = (float)matrix[10];
             entry.transform.m[3][2] = (float)matrix[11];
 
-            entries.emplace(name, entry);
+            // A later entry of the same name wins: the NFS World import appends
+            // the new model a Blender object became (io/WorldMesh.cpp).
+            entries[name] = entry;
         }
 
         cursor = close + 1;
@@ -1591,6 +1596,7 @@ bool ReadExportManifest(const std::wstring& objPath, std::unordered_map<std::str
     std::unordered_map<std::string, ManifestEntry> entries;
     std::wstring used;
     if (!ReadObj(objPath, shapes) || !FindManifest(objPath, shapes, entries, origin, used)) return false;
-    for (const auto& [name, entry] : entries) objects[name] = { entry.hash, entry.transform };
+    for (const auto& [name, entry] : entries)
+        objects[name] = { entry.hash, entry.transform, entry.section, entry.placedBy == "header" };
     return true;
 }

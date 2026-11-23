@@ -241,6 +241,34 @@ def _obj_export(**options):
     bpy.ops.wm.obj_export(**{k: v for k, v in options.items() if k in known})
 
 
+def _images_on_disk():
+    # The OBJ names each material's image by its file (map_Kd), and the editor
+    # makes the game texture from that file. An image with no file of its own --
+    # packed into the scene, as a .glb or .fbx brings its textures, or painted
+    # and never saved -- would leave the material its flat colour. Each is
+    # written out first, beside the .blend.
+    folder = os.path.join(os.path.dirname(_obj_path()), "textures")
+    for image in bpy.data.images:
+        if image.type != 'IMAGE' or image.source not in ('FILE', 'GENERATED'):
+            continue
+        try:
+            if image.packed_file is not None:
+                image.unpack(method='WRITE_LOCAL')
+                continue
+            path = bpy.path.abspath(image.filepath) if image.filepath else ""
+            if path and os.path.exists(path) and not image.is_dirty:
+                continue
+            if not image.has_data:
+                continue
+            os.makedirs(folder, exist_ok=True)
+            safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in image.name) or "image"
+            image.filepath_raw = os.path.join(folder, safe + ".png")
+            image.file_format = 'PNG'
+            image.save()
+        except Exception as error:  # one image must not stop the export
+            print("FRS quick edit: could not write image", image.name, error)
+
+
 def _export(obj_path):
     # Object mode flushes any edit-mode changes into the mesh the exporter
     # reads. A save already does this, but "Send" from the menu does not.
@@ -267,6 +295,8 @@ def _export(obj_path):
         with open(obj_path + ".sent", "w", encoding="utf-8") as marker:
             marker.write("%f\n" % time.time())
         return
+
+    _images_on_disk()
 
     # Each option is here because the editor's importer depends on it:
     #  - the axes undo the Y-up the editor wrote, so vertices land where they were;
