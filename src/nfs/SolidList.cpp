@@ -71,12 +71,16 @@ struct WorldLayout {
     int uv;       // float[2]
     int color1 = -1;   // D3DCOLOR, the second colour (nfsw.exe effect table 0xC83018 vertex layouts)
     int tangent = -1;  // i16[4]
+    // CarShader / CARNORMALMAP (effects 8, 9): i16 position[4] (x / 32767 * 8
+    // metres, w 4096), i16 uv[2] (/ 4096), colour, i16 normal[4], i16 tangent[4]
+    // -- the car GEOMETRY.BIN layout (work/edge-car-import/solidio.py).
+    bool packed = false;
 };
 
-// Effects 8 and 9 (32 bytes, 296 buffers) pack their positions as integers
-// and are left out until that packing is read.
 bool WorldLayoutFor(u32 effect, u32 stride, WorldLayout& out) {
     switch (effect) {
+        case 0x8: case 0x9:
+            out = { 32, 16, 12, 8, -1, 24, true }; break;
         // WorldShader: position, SHORT4 normal, uv, colour, colour 1.
         case 0x0: case 0x1: case 0xA: case 0xC: case 0xF:
             out = { 36, 12, 28, 20, 32 }; break;
@@ -219,6 +223,7 @@ bool ParseWorldObject(const Chunk& objectChunk, SolidObject& out) {
 
     std::vector<Chunk> buffers;
     ByteSpan indexData, materialData;
+    ByteSpan placeRanges, placeMatrices;   // 0x134C05 / 0x134C06, see below
 
     while (reader.Next(child)) {
         if (child.id == kChunkSolidObjectHeader)       ParseHeader(child.data, out);
@@ -230,6 +235,8 @@ bool ParseWorldObject(const Chunk& objectChunk, SolidObject& out) {
                 if (part.id == kChunkMeshVertices)       buffers.push_back(part);
                 else if (part.id == kChunkMeshIndices)   indexData    = part.data;
                 else if (part.id == kChunkMeshMaterials) materialData = part.data;
+                else if (part.id == 0x00134C05u)         placeRanges   = part.data;
+                else if (part.id == 0x00134C06u)         placeMatrices = part.data;
             }
         }
     }
@@ -269,8 +276,9 @@ bool ParseWorldObject(const Chunk& objectChunk, SolidObject& out) {
         }
 
         if (base == 0) {
-            out.vertexFileOffset = buffers[bufferIndex].dataOffset;
-            out.vertexStride     = layout.stride;
+            // Packed positions cannot be written back as floats: no in-place edit.
+            out.vertexFileOffset = layout.packed ? 0 : buffers[bufferIndex].dataOffset;
+            out.vertexStride     = layout.packed ? 0 : layout.stride;
             out.hasNormals       = layout.normal >= 0;
         }
 
@@ -288,8 +296,13 @@ bool ParseWorldObject(const Chunk& objectChunk, SolidObject& out) {
                                   (float)source.read<i16>((size_t)layout.normal + 4) * scale };
             }
             vertex.color = source.read<u32>((size_t)layout.color);
-            vertex.uv    = { source.read<float>((size_t)layout.uv),
-                             source.read<float>((size_t)layout.uv + 4) };
+            if (layout.packed) {
+                const float p = 8.0f / 32767.0f, t = 1.0f / 4096.0f;
+                vertex.position = { source.read<i16>(0) * p, source.read<i16>(2) * p, source.read<i16>(4) * p };
+                vertex.uv = { source.read<i16>((size_t)layout.uv) * t, source.read<i16>((size_t)layout.uv + 2) * t };
+            } else {
+                vertex.uv = { source.read<float>((size_t)layout.uv), source.read<float>((size_t)layout.uv + 4) };
+            }
         }
         if (layout.color1 >= 0) {
             out.colors1.resize(out.vertices.size(), 0u);
@@ -306,6 +319,38 @@ bool ParseWorldObject(const Chunk& objectChunk, SolidObject& out) {
             }
         } else if (!out.tangents.empty()) {
             out.tangents.resize(out.vertices.size(), std::array<i16, 4>{});
+        }
+
+        // Several copies merged into one mesh (the "_DEINST" models: planters,
+        // bollards, hedges): each copy's vertices are stored at its own origin.
+        // nfsw.exe 0x64D5E0 / 0x645440 place them at load, in the first vertex
+        // buffer only: 0x134C05 holds 16-byte ranges {first vertex, last vertex
+        // (inclusive), matrix index, ?}, 0x134C06 64-byte row-major matrices
+        // (p' = x*row0 + y*row1 + z*row2 + row3); normal and tangent turn with them.
+        if (bufferIndex == 0 && !placeRanges.empty() && !placeMatrices.empty()) {
+            const size_t matrices = placeMatrices.size / 64;
+            for (size_t r = 0; r + 16 <= placeRanges.size; r += 16) {
+                const u32 firstVertex = placeRanges.read<u32>(r), lastVertex = placeRanges.read<u32>(r + 4);
+                const u32 matrix = placeRanges.read<u32>(r + 8);
+                if (matrix >= matrices) continue;
+                float m[16];
+                for (int k = 0; k < 16; ++k) m[k] = placeMatrices.read<float>((size_t)matrix * 64 + (size_t)k * 4);
+                const auto turn = [&](float x, float y, float z, int i) { return x * m[i] + y * m[4 + i] + z * m[8 + i]; };
+                for (u32 v = firstVertex; v <= lastVertex && v < runVertices; ++v) {
+                    SolidVertex& vertex = out.vertices[base + v];
+                    const Vec3 p = vertex.position, n = vertex.normal;
+                    vertex.position = { turn(p.x, p.y, p.z, 0) + m[12], turn(p.x, p.y, p.z, 1) + m[13], turn(p.x, p.y, p.z, 2) + m[14] };
+                    vertex.normal   = { turn(n.x, n.y, n.z, 0), turn(n.x, n.y, n.z, 1), turn(n.x, n.y, n.z, 2) };
+                    if (base + v < out.tangents.size()) {
+                        std::array<i16, 4>& tg = out.tangents[base + v];
+                        const float s = 1.0f / 32767.0f, x = tg[0] * s, y = tg[1] * s, z = tg[2] * s;
+                        for (int k = 0; k < 3; ++k) tg[k] = (i16)(turn(x, y, z, k) * 32767.0f);
+                    }
+                }
+            }
+            // The file keeps the unplaced copies: no in-place vertex edit.
+            out.vertexFileOffset = 0;
+            out.vertexStride     = 0;
         }
 
         for (size_t m = runFirst; m < end; ++m) {

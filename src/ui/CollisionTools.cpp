@@ -36,6 +36,8 @@ enum : int {
     kIdMove          = 44009,
     kIdGenerate      = 44010,
     kIdFlip          = 44011,
+    kIdBarrierShape  = 44012,   // + Line, Box, Triangle
+    kIdWallShape     = 44015,   // + Line, Box, Triangle
     kIdHeightFirst   = 44020,   // + preset index
     kIdSurfaceSelect = 44100,   // + surface index
     kIdSurfaceGround = 44200,
@@ -422,8 +424,16 @@ void CollisionTools::BuildMenu() {
     ::AppendMenuW(popup_, MF_STRING, ID_VIEW_COLLISION, L"&Show Collision\tCtrl+K");
     ::AppendMenuW(popup_, MF_STRING, kIdRaceGroups, L"Show &Race Barriers and Start Lines");
     ::AppendMenuW(popup_, MF_SEPARATOR, 0, nullptr);
-    ::AppendMenuW(popup_, MF_STRING, kIdBarrier, L"Draw &Barrier (no height limit)\tCtrl+Shift+W");
-    ::AppendMenuW(popup_, MF_STRING, kIdWall, L"Draw &Wall with Height\tCtrl+Shift+H");
+    // Each opens its shapes: point by point, or a box or triangle dragged out.
+    const auto shapes = [](int first) {
+        HMENU menu = ::CreatePopupMenu();
+        ::AppendMenuW(menu, MF_STRING, (UINT_PTR)(first + 0), L"&Linear (point by point)");
+        ::AppendMenuW(menu, MF_STRING, (UINT_PTR)(first + 1), L"&Box (click, drag, click)");
+        ::AppendMenuW(menu, MF_STRING, (UINT_PTR)(first + 2), L"&Triangle (click, drag, click)");
+        return menu;
+    };
+    ::AppendMenuW(popup_, MF_POPUP, (UINT_PTR)shapes(kIdBarrierShape), L"Draw &Barrier (no height limit)\tCtrl+Shift+W");
+    ::AppendMenuW(popup_, MF_POPUP, (UINT_PTR)shapes(kIdWallShape), L"Draw &Wall with Height\tCtrl+Shift+H");
     ::AppendMenuW(popup_, MF_STRING, kIdGround, L"Draw &Ground\tCtrl+Shift+G");
     ::AppendMenuW(popup_, MF_POPUP, (UINT_PTR)heights, L"Wall &Height");
     ::AppendMenuW(popup_, MF_POPUP, (UINT_PTR)surfaces(kIdSurfaceWall), L"Surface for New &Walls");
@@ -470,6 +480,10 @@ void CollisionTools::UpdateMenuChecks(HMENU menu) {
     check(kIdRaceGroups, Renderer().RaceGroupsVisible());
     check(kIdBarrier, mode_ == Mode::Barrier);
     check(kIdWall, mode_ == Mode::Wall);
+    for (int k = 0; k < 3; ++k) {
+        check(kIdBarrierShape + k, mode_ == Mode::Barrier && (int)shape_ == k);
+        check(kIdWallShape + k, mode_ == Mode::Wall && (int)shape_ == k);
+    }
     check(kIdGround, mode_ == Mode::Ground);
     for (size_t i = 0; i < std::size(kHeights); ++i)
         check(kIdHeightFirst + (int)i, std::fabs(kHeights[i] - wallHeight_) < 0.01f);
@@ -725,6 +739,16 @@ bool CollisionTools::OnCommand(int id) {
         UpdateOverlay();
         Status(Format(L"Walls will stand %.1f m tall.", wallHeight_));
         if (host_.menuChecks) host_.menuChecks();
+        return true;
+    }
+    if (id >= kIdBarrierShape && id < kIdBarrierShape + 3) {
+        shape_ = (Shape)(id - kIdBarrierShape);
+        StartTool(Mode::Barrier);
+        return true;
+    }
+    if (id >= kIdWallShape && id < kIdWallShape + 3) {
+        shape_ = (Shape)(id - kIdWallShape);
+        StartTool(Mode::Wall);
         return true;
     }
     switch (id) {
@@ -1039,6 +1063,113 @@ void CollisionTools::StopTool() {
     Renderer().SetToolOverlay({}, {});
 }
 
+std::vector<Vec3> CollisionTools::ShapePoints(const Vec3& from, const Vec3& to) const {
+    // The box lies along the view's own ground axes, so turning the camera
+    // turns the box; Shift makes it square.
+    const Camera& camera = host_.viewport->GetCamera();
+    Vec3 right = camera.Right();
+    right.z = 0.0f;
+    if (Length(right) < 1e-4f) right = { 1.0f, 0.0f, 0.0f };
+    right = Normalize(right);
+    const Vec3 ahead{ -right.y, right.x, 0.0f };
+    const Vec3 d = to - from;
+    float u = Dot(d, right), v = Dot(d, ahead);
+    if (::GetKeyState(VK_SHIFT) < 0) {
+        const float side = std::max(std::fabs(u), std::fabs(v));
+        u = u < 0.0f ? -side : side;
+        v = v < 0.0f ? -side : side;
+    }
+    const auto at = [&](float a, float b) {
+        Vec3 p = from + right * a + ahead * b;
+        // Each corner stands on what is below it; the clicks' height otherwise.
+        p.z = from.z + (to.z - from.z) * (std::fabs(u) + std::fabs(v) > 1e-4f
+                                              ? (std::fabs(a) + std::fabs(b)) / (std::fabs(u) + std::fabs(v)) : 0.0f);
+        float ground = 0.0f;
+        if (const nfs::World* world = World())
+            if (nfs::GroundHeight(*world, p.x, p.y, ground) && std::fabs(ground - p.z) < 5.0f) p.z = ground;
+        return p;
+    };
+    std::vector<Vec3> outline;
+    if (shape_ == Shape::Triangle) outline = { at(0, 0), at(u, 0), at(u * 0.5f, v) };
+    else                           outline = { at(0, 0), at(u, 0), at(u, v), at(0, v) };
+    // Clockwise seen from above: each face holds cars on its left, which is
+    // then the outside of the shape (I flips a face).
+    double area = 0.0;
+    for (size_t i = 0; i < outline.size(); ++i) {
+        const Vec3& a = outline[i];
+        const Vec3& b = outline[(i + 1) % outline.size()];
+        area += (double)a.x * b.y - (double)b.x * a.y;
+    }
+    if (area > 0.0) std::reverse(outline.begin(), outline.end());
+    outline.push_back(outline.front());
+    return outline;
+}
+
+// ---------------------------------------------------------------------------
+// Copy and paste
+// ---------------------------------------------------------------------------
+
+bool CollisionTools::Copy() {
+    nfs::World* world = World();
+    if (!world || !Renderer().CollisionVisible() || Renderer().CollisionSelection().empty()) return false;
+    clipboard_.clear();
+    for (const CollisionPick& pick : Renderer().CollisionSelection()) {
+        const auto& loaded = world->Loaded();
+        if (pick.section >= loaded.size() || pick.pack >= loaded[pick.section]->collision.size()) continue;
+        const auto& polygons = loaded[pick.section]->collision[pick.pack].polygons;
+        if (pick.polygon >= polygons.size()) continue;
+        const nfs::CollisionPolygon& polygon = polygons[pick.polygon];
+        // A copy in a neighbouring section is the same polygon: kept once.
+        const bool seen = std::any_of(clipboard_.begin(), clipboard_.end(), [&](const nfs::CollisionPolygon& other) {
+            for (int c = 0; c < 4; ++c)
+                if (Length(other.corners[c] - polygon.corners[c]) > 0.01f) return false;
+            return true;
+        });
+        if (!seen) clipboard_.push_back(polygon);
+    }
+    Status(Format(L"%zu collision polygons copied. Ctrl+V pastes them where the view is centred.", clipboard_.size()));
+    return !clipboard_.empty();
+}
+
+bool CollisionTools::Paste() {
+    if (clipboard_.empty() || !World()) return false;
+    // The group's middle in plan, at its lowest corner, lands on what the
+    // view is centred on; then it follows the mouse as G moves it.
+    RECT client{};
+    ::GetClientRect(host_.viewport->Handle(), &client);
+    Vec3 target;
+    if (!PointUnder(client.right / 2, client.bottom / 2, target)) {
+        Status(L"Nothing at the middle of the view to paste the collision onto.");
+        return true;
+    }
+    Vec3 pivot{};
+    float lowest = 1e30f;
+    size_t corners = 0;
+    for (const nfs::CollisionPolygon& polygon : clipboard_)
+        for (int c = 0; c < 4; ++c) {
+            pivot += polygon.corners[c];
+            lowest = std::min(lowest, polygon.corners[c].z);
+            ++corners;
+        }
+    pivot = pivot * (1.0f / (float)corners);
+    pivot.z = lowest;
+    const Vec3 shift = target - pivot;
+    std::vector<nfs::CollisionPolygon> moved = clipboard_;
+    for (nfs::CollisionPolygon& polygon : moved)
+        for (Vec3& corner : polygon.corners) corner += shift;
+    const auto added = editor_.Add(moved, L"Paste collision");
+    RefreshAfterEdit();
+    if (added.empty()) {
+        Status(L"There is no section collision there to paste into.");
+        return true;
+    }
+    SelectRefs(added);
+    BeginMove();
+    Status(Format(L"%zu collision polygons pasted: move the mouse, click to keep (Esc leaves them at the "
+                  L"middle of the view). Not written yet: Ctrl+Shift+S.", moved.size()));
+    return true;
+}
+
 bool CollisionTools::PointUnder(int x, int y, Vec3& point) const {
     nfs::World* world = World();
     if (!world) return false;
@@ -1126,6 +1257,7 @@ void CollisionTools::UpdateOverlay() {
     std::vector<WorldRenderer::OverlayVertex> triangles, lines;
     std::vector<Vec3> chain = points_;
     if (haveCursor_) chain.push_back(cursor_);
+    if (Dragging() && points_.size() == 1 && haveCursor_) chain = ShapePoints(points_.front(), cursor_);
 
     const D3DCOLOR pointColour = 0xFFFFFFFF;
     for (const Vec3& p : points_) {
@@ -1185,11 +1317,15 @@ void CollisionTools::Finish() {
         }
         label = L"Draw ground";
     } else {
+        if (Dragging() && points_.size() == 1 && haveCursor_) points_ = ShapePoints(points_.front(), cursor_);
         if (points_.size() < 2) { Status(L"A wall needs at least two points."); return; }
         collision::WallOptions options;
         options.kind = mode_ == Mode::Barrier ? collision::WallKind::Barrier : collision::WallKind::Vertical;
         options.surface = wallSurface_;
         options.height = wallHeight_;
+        // One face on the drawn line, as the game's own walls are: it holds
+        // cars on its red side (left of the way it was drawn); I flips it.
+        options.bothSides = false;
         collision::AppendWall(points_, options, polygons);
         label = mode_ == Mode::Barrier ? L"Draw barrier" : L"Draw wall";
     }
@@ -1205,7 +1341,7 @@ void CollisionTools::Finish() {
     std::set<u32> sections;
     for (const auto& ref : added) sections.insert(ref.section);
     Status(Format(L"%s: %zu polygons added to %zu sections (not written yet: Ctrl+Shift+S). "
-                  L"Ctrl+Z undoes.", label.c_str(), polygons.size(), sections.size()));
+                  L"Red side holds cars, I flips it. Ctrl+Z undoes.", label.c_str(), polygons.size(), sections.size()));
     if (host_.menuChecks) host_.menuChecks();
 }
 
@@ -1301,6 +1437,12 @@ bool CollisionTools::MouseDown(int x, int y, WPARAM keys) {
     }
     if (!points_.empty() && std::hypot(point.x - points_.back().x, point.y - points_.back().y) < 0.1f)
         return true;   // the same point twice
+    if (Dragging() && points_.size() == 1) {
+        cursor_ = point;
+        haveCursor_ = true;
+        Finish();
+        return true;
+    }
     points_.push_back(point);
     cursor_ = point;
     haveCursor_ = true;
@@ -1387,13 +1529,21 @@ bool CollisionTools::StatusText(std::wstring& text) const {
     }
     switch (mode_) {
         case Mode::Barrier:
+        case Mode::Wall:
+            if (Dragging()) {
+                text = Format(L"%s %s (%s): click a corner, move the mouse, click again to apply. Shift: square. "
+                              L"Esc stops.", mode_ == Mode::Barrier ? L"Barrier" : L"Wall",
+                              shape_ == Shape::Box ? L"box" : L"triangle", SurfaceLabel(wallSurface_).c_str());
+                return true;
+            }
+            if (mode_ == Mode::Wall) {
+                text = Format(L"Wall %.1f m (%s): click points, Enter finishes, +/- or Ctrl+wheel height, "
+                              L"Esc stops. %zu points", wallHeight_, SurfaceLabel(wallSurface_).c_str(),
+                              points_.size());
+                return true;
+            }
             text = Format(L"Barrier (%s): click points, Enter finishes, Backspace undoes a point, Esc stops. "
                           L"Alt places without snapping. %zu points", SurfaceLabel(wallSurface_).c_str(),
-                          points_.size());
-            return true;
-        case Mode::Wall:
-            text = Format(L"Wall %.1f m (%s): click points, Enter finishes, +/- or Ctrl+wheel height, "
-                          L"Esc stops. %zu points", wallHeight_, SurfaceLabel(wallSurface_).c_str(),
                           points_.size());
             return true;
         case Mode::Ground:

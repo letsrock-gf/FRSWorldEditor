@@ -93,4 +93,11 @@ bool LoadLighting(const std::wstring& globalFolder,
                   std::string& error,
                   LightingStatics* statics = nullptr);
 
+// The elements of an array field of a collection (its own, else its parents'), as raw 32-bit words: from the
+// layout (maxCount elements after the array's 16-byte header: ecar.TireOffsets, 4 x float4) or from the entry
+// table (count elements at the array's data offset: ecar.FECompressions, 2 floats). Used by io/WorldMesh.cpp
+// for placed cars. False when the class, collection or field is not there or the field is not an array.
+bool ReadVltArray(const std::wstring& globalFolder, u32 classKey, u32 collectionKey, u32 fieldKey,
+                  std::vector<float>& out, std::string& error);
+
 } // namespace gamelook

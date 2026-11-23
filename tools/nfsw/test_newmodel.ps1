@@ -11,7 +11,7 @@
 param([Parameter(Mandatory = $true)][string]$Out, [string]$Exe = "$(Split-Path (Split-Path $PSScriptRoot))\build-new\bin\Release",
       [int]$Section = 1012, [string]$Texture = '926F5A52', [string]$Texture2 = '20F08EAB',
       [string]$Copy = '0139B912', [string]$Refuse = '0000DC86',
-      [double]$X = 2110.74, [double]$Y = 783.60, [double]$Z = 154.04, [switch]$Replay, [string]$Start = 'A', [switch]$NewTextures, [switch]$OnlyA)
+      [double]$X = 2110.74, [double]$Y = 783.60, [double]$Z = 154.04, [switch]$Replay, [string]$Start = 'A', [switch]$NewTextures, [switch]$OnlyA, [string]$Append = '')
 if (Get-Process nfsw -ErrorAction SilentlyContinue) { "nfsw.exe is running: not starting the editor"; return }
 $tools = $PSScriptRoot
 $log = "$Exe\FRSWorldEditor.log"
@@ -178,6 +178,7 @@ try {
         New-Item -ItemType Directory -Force "$Out\tracks\frs-original" | Out-Null
         $real = "$(& $PSScriptRoot\game.ps1)\TRACKS\frs-original"
         Copy-Item "$real\L5RA-edits.txt" "$Out\tracks\frs-original\"
+        if ($Append) { Get-Content $Append | Add-Content -Path "$Out\tracks\frs-original\L5RA-edits.txt" -Encoding ascii }
         foreach ($dir in 'textures', 'meshes') { if (Test-Path "$real\$dir") { Copy-Item "$real\$dir" "$Out\tracks\frs-original\" -Recurse } }
         if (-not (Start-Editor)) { "editor window not found"; return }
         Lines 'NFS World edits|not applied' 4

@@ -76,6 +76,10 @@ public:
     void OnSaved() override;
     void EditRows(std::vector<EditsPanel::ExtraRow>& rows) override;
     void RevertRows(const std::vector<size_t>& indices) override;
+    // Ctrl+C / Ctrl+V on selected collision polygons.
+    bool Copy() override;
+    void ClearClipboard() override { clipboard_.clear(); }
+    bool Paste() override;
 
     // The collision log has a change in this section (the Edits tab lists
     // those one by one).
@@ -95,6 +99,9 @@ public:
 
 private:
     enum class Mode { None, Barrier, Wall, Ground };
+    // How a barrier or wall is drawn: point by point, or a closed outline
+    // dragged out from a first click to a second.
+    enum class Shape { Line, Box, Triangle };
 
     nfs::World* World() const { return host_.world ? host_.world() : nullptr; }
     WorldRenderer& Renderer() const { return host_.viewport->GetRenderer(); }
@@ -130,6 +137,9 @@ private:
     u64 seenRecorded_ = 0, seenUndone_ = 0;
 
     void StartTool(Mode mode);
+    // The closed outline of a Box or Triangle from the first click to `to`.
+    std::vector<Vec3> ShapePoints(const Vec3& from, const Vec3& to) const;
+    bool Dragging() const { return shape_ != Shape::Line && mode_ != Mode::Ground && mode_ != Mode::None; }
     void StopTool();
     void Finish();
     void UpdateOverlay();
@@ -152,6 +162,8 @@ private:
     collision::Editor editor_;
 
     Mode mode_ = Mode::None;
+    Shape shape_ = Shape::Line;
+    std::vector<nfs::CollisionPolygon> clipboard_;
     std::vector<Vec3> points_;
     Vec3 cursor_{};
     bool haveCursor_ = false;

@@ -375,6 +375,45 @@ std::vector<CollisionEdit> CutUnderRaised(const nfs::LoadedSection& loaded, cons
                 for (const Vec3& c : p.corners) all.Add(c);
             }
     if (raised.empty()) return out;
+    // The raised polygons by 32 m plan cell: each ground polygon is tried only against those whose cells its
+    // box touches, in their order in `raised`, which is what nfs::CutUnderRaised would not skip anyway. Against
+    // all of them a save with 160 000 added polygons spent 22 minutes here (measured 22/11).
+    constexpr float kCell = 32.0f;
+    constexpr int kWide = 64;   // cells; a polygon over more goes into `wide` (tried against everything)
+    auto cellsOf = [&](const nfs::CollisionPolygon& p, int& x0, int& x1, int& y0, int& y1) {
+        Aabb box;
+        for (int i = 0; i < (p.quad ? 4 : 3); ++i) box.Add(p.corners[i]);
+        x0 = (int)std::floor(box.min.x / kCell); x1 = (int)std::floor(box.max.x / kCell);
+        y0 = (int)std::floor(box.min.y / kCell); y1 = (int)std::floor(box.max.y / kCell);
+        return (long long)(x1 - x0 + 1) * (y1 - y0 + 1) <= kWide;
+    };
+    auto cellKey = [](int x, int y) { return ((unsigned long long)(u32)x << 32) | (u32)y; };
+    std::unordered_map<unsigned long long, std::vector<u32>> cells;
+    std::vector<u32> wide;
+    for (u32 r = 0; r < raised.size(); ++r) {
+        int x0, x1, y0, y1;
+        if (!cellsOf(*raised[r], x0, x1, y0, y1)) { wide.push_back(r); continue; }
+        for (int x = x0; x <= x1; ++x)
+            for (int y = y0; y <= y1; ++y) cells[cellKey(x, y)].push_back(r);
+    }
+    std::vector<const nfs::CollisionPolygon*> nearby;
+    std::vector<u32> picked;
+    // The raised polygons that may lie over `p`; all of them for a polygon over many cells.
+    auto over = [&](const nfs::CollisionPolygon& p) -> const std::vector<const nfs::CollisionPolygon*>& {
+        int x0, x1, y0, y1;
+        if (!cellsOf(p, x0, x1, y0, y1)) return raised;
+        picked = wide;
+        for (int x = x0; x <= x1; ++x)
+            for (int y = y0; y <= y1; ++y) {
+                const auto found = cells.find(cellKey(x, y));
+                if (found != cells.end()) picked.insert(picked.end(), found->second.begin(), found->second.end());
+            }
+        std::sort(picked.begin(), picked.end());
+        picked.erase(std::unique(picked.begin(), picked.end()), picked.end());
+        nearby.clear();
+        for (const u32 r : picked) nearby.push_back(raised[r]);
+        return nearby;
+    };
     for (const nfs::CollisionPack& pack : loaded.collision) {
         const Aabb& b = pack.bounds;
         if (b.max.x < all.min.x || b.min.x > all.max.x || b.max.y < all.min.y || b.min.y > all.max.y) continue;
@@ -383,7 +422,7 @@ std::vector<CollisionEdit> CutUnderRaised(const nfs::LoadedSection& loaded, cons
         if (edit != out.end()) {
             std::vector<nfs::CollisionPolygon> adds;
             for (const nfs::CollisionPolygon& p : edit->adds)
-                if (nfs::CutUnderRaised(p, raised, made)) { ++cut; pieces += made.size(); adds.insert(adds.end(), made.begin(), made.end()); }
+                if (nfs::CutUnderRaised(p, over(p), made)) { ++cut; pieces += made.size(); adds.insert(adds.end(), made.begin(), made.end()); }
                 else adds.push_back(p);
             edit->adds.swap(adds);
         }
@@ -394,7 +433,7 @@ std::vector<CollisionEdit> CutUnderRaised(const nfs::LoadedSection& loaded, cons
                                                                : std::unordered_set<u32>{};
         for (const nfs::CollisionPolygon& p : pack.polygons) {
             if (p.source == nfs::CollisionPolygon::kNoSource || cuts.count(p.source)) continue;
-            if (!nfs::CutUnderRaised(p, raised, made)) continue;
+            if (!nfs::CutUnderRaised(p, over(p), made)) continue;
             gone.push_back(p.source);
             extra.insert(extra.end(), made.begin(), made.end());
             ++cut; pieces += made.size();
@@ -412,6 +451,18 @@ std::vector<CollisionEdit> CutUnderRaised(const nfs::LoadedSection& loaded, cons
 // alignment; the caller sees the new size as it does a placed object's.
 // Collision grid of the section (cells of 96 m naming the instances in them).
 constexpr u32 kChunkWorldCollisionGrid = 0x0003B802;
+
+// Collision packs outside the grid's section file (a city's own sections): the boxes of their instances that got
+// polygons wait here for the grid's section, written later in the same pass (sections go in table order and
+// 25000 is near its end), and their new articles are numbered apart from that section's own.
+// ponytail: the grid's section is only reached when it has collision edits of its own (true of every list so
+// far); write it unconditionally when a list comes along with collision in own sections only.
+std::vector<nfs::GridEntry> pendingGrid;
+u32 foreignArticleId = 1000000;
+void ResetCollisionPass() {
+    pendingGrid.clear();
+    foreignArticleId = 1000000;
+}
 
 bool PatchCollision(const nfs::LoadedSection& loaded, const std::vector<CollisionEdit>& edits,
                     std::vector<u8>& bytes, WorldWriteReport& counts, std::wstring& error) {
@@ -437,6 +488,27 @@ bool PatchCollision(const nfs::LoadedSection& loaded, const std::vector<Collisio
     // for room; fine at one collision section, index the boxes if saves slow.
     struct Spill { u32 home; nfs::CollisionPolygon polygon; u8 atHome; size_t abroad = 0; };
     std::vector<Spill> spill;
+    // New articles (far polygons get instances of their own) carry the map's
+    // running article number on from the highest of all packs.
+    u32 nextArticleId = 0;
+    // FRS_COLLISION_STRETCH=1: the old way (the nearest box grows), to compare saves.
+    const bool stretch = std::getenv("FRS_COLLISION_STRETCH") != nullptr;
+    {
+        nfs::ChunkReader reader(ByteSpan{ bytes.data(), bytes.size() }, loaded.info->streamOffset);
+        nfs::Chunk chunk;
+        while (reader.Next(chunk))
+            if (chunk.id == nfs::kChunkWorldCollisionPack)
+                nextArticleId = std::max(nextArticleId, nfs::WorldCollisionArticleIdEnd(chunk.raw));
+    }
+    // FRS_COLLISION_ID_BASE=<n>: new articles numbered from n (an in-game test of whether the number matters).
+    if (const char* base = std::getenv("FRS_COLLISION_ID_BASE")) nextArticleId = (u32)std::strtoul(base, nullptr, 10);
+    bool gridHere = false;
+    {
+        nfs::ChunkReader reader(ByteSpan{ bytes.data(), bytes.size() }, loaded.info->streamOffset);
+        nfs::Chunk chunk;
+        while (reader.Next(chunk)) gridHere = gridHere || chunk.id == kChunkWorldCollisionGrid;
+    }
+    if (!gridHere) nextArticleId = std::max(nextArticleId, foreignArticleId);
     {
         nfs::ChunkReader reader(ByteSpan{ bytes.data(), bytes.size() }, loaded.info->streamOffset);
         nfs::Chunk chunk;
@@ -446,11 +518,13 @@ bool PatchCollision(const nfs::LoadedSection& loaded, const std::vector<Collisio
             if (edit == edits.end()) continue;
             size_t skipped = 0;
             std::vector<u8> scratch, placed;
+            u32 scratchId = nextArticleId;
             if (!nfs::RewriteWorldCollision(chunk.raw, *edit->pack, edit->cuts, edit->adds, skipped, scratch, error,
-                                            {}, &placed))
+                                            {}, &placed, nullptr, stretch ? nullptr : &scratchId))
                 return false;
+            // 3: far ground in an instance of its own; never cut into other packs' boxes.
             for (size_t i = 0; i < edit->adds.size(); ++i)
-                if (!edit->adds[i].barrier && placed[i] != 2)
+                if (!edit->adds[i].barrier && placed[i] != 2 && placed[i] != 3)
                     spill.push_back({ edit->pack->sectionNumber, edit->adds[i], placed[i] });
         }
     }
@@ -483,7 +557,7 @@ bool PatchCollision(const nfs::LoadedSection& loaded, const std::vector<Collisio
         const bool own = edit != edits.end();
         if (!nfs::RewriteWorldCollision(chunk.raw, own ? *edit->pack : bare, own ? edit->cuts : none,
                                         own ? edit->adds : nothing, skipped, splice.payload, error, foreign, &placed,
-                                        &boxes))
+                                        &boxes, stretch ? nullptr : &nextArticleId))
             return false;
         grown.insert(grown.end(), boxes.begin(), boxes.end());
         const size_t first = own ? edit->adds.size() : 0;
@@ -503,6 +577,13 @@ bool PatchCollision(const nfs::LoadedSection& loaded, const std::vector<Collisio
         if (!item.atHome && item.abroad && counts.collisionSkipped) { --counts.collisionSkipped; ++counts.collisionAdded; }
     // The instances that got polygons into every grid cell their box touches,
     // or the game finds the new ground only now and then (nfs::AddToCollisionGrid).
+    if (!haveGrid) {
+        pendingGrid.insert(pendingGrid.end(), grown.begin(), grown.end());
+        foreignArticleId = std::max(foreignArticleId, nextArticleId);
+    } else {
+        grown.insert(grown.end(), pendingGrid.begin(), pendingGrid.end());
+        pendingGrid.clear();
+    }
     if (haveGrid && !grown.empty()) {
         Splice splice;
         splice.at   = (size_t)(grid.raw.data - bytes.data());
@@ -1043,6 +1124,9 @@ size_t LoadWorldEdits(nfs::World& world, const std::wstring& realTracksFolder) {
             nfs::LoadedSection* section = found->second.first;
             const u32 packIndex = found->second.second;
             section->collision[packIndex].polygons.push_back(polygon);
+            // The pack's box follows what is added: a ground lookup (Launch Game's pose) skips a pack by its box,
+            // so ground added outside the shipped box was never found.
+            for (int i = 0; i < (polygon.quad ? 4 : 3); ++i) section->collision[packIndex].bounds.Add(polygon.corners[i]);
             auto& adds = section->savedCollisionAdds;
             auto row = std::find_if(adds.begin(), adds.end(),
                                     [&](const auto& entry) { return entry.first == packIndex; });
@@ -1060,6 +1144,15 @@ size_t LoadWorldEdits(nfs::World& world, const std::wstring& realTracksFolder) {
                 world.textureReplacements.push_back({ hash, fileName });
                 ++applied;
             }
+            continue;
+        }
+        if (line[0] == 'Z' && line[1] == 'M') {
+            // A point of an outline widened by hand, in order: section, game x, y.
+            unsigned section = 0;
+            float x = 0.0f, y = 0.0f;
+            if (std::sscanf(line, "ZM %u %f %f", &section, &x, &y) != 3) continue;
+            world.manualZoneOutlines[section].push_back({ x, y });
+            ++applied;
             continue;
         }
         if (line[0] == 'Z') {
@@ -1084,9 +1177,10 @@ size_t LoadWorldEdits(nfs::World& world, const std::wstring& realTracksFolder) {
         }
         if (line[0] == 'X') {
             // A new texture: its hash, the game texture it copies, its name, its kept image.
-            unsigned hash = 0, like = 0;
+            unsigned hash = 0, like = 0, host = 0;
             char name[64] = {}, kept[260] = {};
-            if (std::sscanf(line, "X %x %x %63s %259s", &hash, &like, name, kept) != 4) continue;
+            if (std::sscanf(line, "X %x %x %63s %259s %u", &hash, &like, name, kept, &host) < 4) continue;
+            SetNewTextureHost(hash, host);   // the texture section that takes it, when the line names one
             std::wstring why;
             if (StageNewWorldTexture(world, name, like,
                                      tracksFolder + kBackupFolder + L"\\textures\\" + std::wstring(kept, kept + std::strlen(kept)),
@@ -1108,6 +1202,26 @@ size_t LoadWorldEdits(nfs::World& world, const std::wstring& realTracksFolder) {
                 ++applied;
             else
                 LOG_WARN("new model %08X from the list not applied: %S", hash, why.c_str());
+            continue;
+        }
+        if (line[0] == 'K') {
+            // A placed car (io/WorldMesh.h StageCarModel): section, hash, model name, car, paint.
+            nfs::World::NewModel car;
+            char name[64] = {}, folder[64] = {};
+            int metallic = 0, gloss = 1;
+            if (std::sscanf(line, "K %u %x %63s %63s %f %f %f %d %d", &car.section, &car.hash, name, folder, &car.hue,
+                            &car.lightness, &car.saturation, &metallic, &gloss) != 9)
+                continue;
+            car.name = name;
+            car.car = folder;
+            car.metallic = metallic != 0;
+            car.gloss = gloss != 0;
+            const size_t slash = realTracksFolder.find_last_of(L"\\/");
+            std::wstring why;
+            if (StageCarModel(world, realTracksFolder.substr(0, slash == std::wstring::npos ? 0 : slash), car, why))
+                ++applied;
+            else
+                LOG_WARN("car %08X from the list not applied: %S", car.hash, why.c_str());
             continue;
         }
         if (line[0] == 'P') {
@@ -1173,6 +1287,9 @@ size_t LoadWorldEdits(nfs::World& world, const std::wstring& realTracksFolder) {
     // Staging marks sections as changed; these were written before.
     for (size_t i = 0; i < world.Loaded().size(); ++i)
         if (nfs::LoadedSection* section = world.MutableLoaded(i)) section->placementsChanged = false;
+    // A zone widened by hand and not again by the bake keeps its own outline.
+    for (const auto& [section, outline] : world.manualZoneOutlines)
+        world.zoneOutlines.emplace(section, outline);
     LOG_INFO("NFS World edits: %zu applied from the list, %zu collision polygons deleted by it", applied,
              cutPolygons);
     return applied;
@@ -1234,6 +1351,7 @@ size_t ResidentBytes(const u8* data, size_t size) {
 } // namespace
 
 bool WriteWorldEdits(nfs::World& world, const std::wstring& tracksFolder, WorldWriteReport& report) {
+    nfs::gridRowsWest = 0;   // set again by this save's collision grid, when it reaches west of the shipped one
     bool redirected = false;
     const std::wstring target = TargetFolder(tracksFolder, redirected);
     if (!redirected && GameIsRunning()) {
@@ -1272,12 +1390,25 @@ bool WriteWorldEdits(nfs::World& world, const std::wstring& tracksFolder, WorldW
         std::snprintf(line, sizeof(line), "T %08X %ls\n", replacement.hash, replacement.file.c_str());
         list += line;
     }
-    for (const auto& [section, outline] : world.zoneOutlines)
+    for (const auto& [section, outline] : world.manualZoneOutlines)
+        for (const Vec2& p : outline) {
+            char line[96];
+            std::snprintf(line, sizeof(line), "ZM %u %.9g %.9g\n", section, p.x, p.y);
+            list += line;
+        }
+    for (const auto& [section, outline] : world.zoneOutlines) {
+        // Only where the bake widened it again: the hand-made one is listed above.
+        const auto manual = world.manualZoneOutlines.find(section);
+        if (manual != world.manualZoneOutlines.end() && manual->second.size() == outline.size() &&
+            std::equal(outline.begin(), outline.end(), manual->second.begin(),
+                       [](const Vec2& a, const Vec2& b) { return a.x == b.x && a.y == b.y; }))
+            continue;
         for (const Vec2& p : outline) {
             char line[96];
             std::snprintf(line, sizeof(line), "Z %u %.9g %.9g\n", section, p.x, p.y);
             list += line;
         }
+    }
     for (const auto& replacement : world.meshReplacements) {
         const size_t slash = replacement.file.find_last_of(L"\\/");
         char line[400];
@@ -1292,20 +1423,36 @@ bool WriteWorldEdits(nfs::World& world, const std::wstring& tracksFolder, WorldW
     std::vector<u32> texturesInUse = NewTexturesInUse(world);
     const std::vector<u32> copiedTextures = StageCopiedTextures(world);
     texturesInUse.insert(texturesInUse.end(), copiedTextures.begin(), copiedTextures.end());
+    StageCarPaintTextures(world);
+    const std::vector<u32> carTextures = CarTexturesInUse(world);
+    texturesInUse.insert(texturesInUse.end(), carTextures.begin(), carTextures.end());
     std::unordered_set<const nfs::LoadedSection*> textureHosts;   // that write one of them
     for (const u32 hash : texturesInUse) {
         const nfs::World::NewTexture* texture = NewTextureOf(world, hash);
         for (const nfs::LoadedSection* host : NewTextureHosts(world, *texture)) textureHosts.insert(host);
         if (!texture->header.empty()) continue;
         char line[400];
-        std::snprintf(line, sizeof(line), "X %08X %08X %s %ls\n", texture->hash, texture->like, texture->name.c_str(),
-                      texture->file.c_str());
+        const u32 host = NewTextureHost(texture->hash);
+        if (host)
+            std::snprintf(line, sizeof(line), "X %08X %08X %s %ls %u\n", texture->hash, texture->like,
+                          texture->name.c_str(), texture->file.c_str(), host);
+        else
+            std::snprintf(line, sizeof(line), "X %08X %08X %s %ls\n", texture->hash, texture->like,
+                          texture->name.c_str(), texture->file.c_str());
         list += line;
     }
     // New models before the placements that use them; one nothing places is
     // left out, so taking its placement back takes the model back too.
     for (const auto& model : world.newModels) {
         if (!ModelPlaced(world, model.hash)) continue;
+        if (!model.car.empty()) {
+            char line[400];
+            std::snprintf(line, sizeof(line), "K %u %08X %s %s %.2f %.4f %.4f %d %d\n", model.section, model.hash,
+                          model.name.c_str(), model.car.c_str(), model.hue, model.lightness, model.saturation,
+                          model.metallic ? 1 : 0, model.gloss ? 1 : 0);
+            list += line;
+            continue;
+        }
         const size_t slash = model.file.find_last_of(L"\\/");
         char line[400];
         std::snprintf(line, sizeof(line), "N %u %08X %ls\n", model.section, model.hash,
@@ -1323,6 +1470,7 @@ bool WriteWorldEdits(nfs::World& world, const std::wstring& tracksFolder, WorldW
         const bool write = step >= sectionCount;
         const size_t i = step % sectionCount;
         if (step == sectionCount) { list.resize(listHead); propIds.added.clear(); }   // numbered again
+        if (step % sectionCount == 0) ResetCollisionPass();
         WorldWriteReport& counts = write ? report : rehearsal;
 
         nfs::LoadedSection* loaded = world.MutableLoaded(i);
@@ -1501,7 +1649,8 @@ bool WriteWorldEdits(nfs::World& world, const std::wstring& tracksFolder, WorldW
         const std::wstring name = world.Region() + L".BUN";
         const std::wstring live = target + L"\\" + name, kept = backups + L"\\" + name;
         const bool zones = !world.zoneOutlines.empty();
-        if (!grownSections.empty() || !propIds.added.empty() || zones || Exists(kept)) {
+        const bool gridWest = nfs::gridRowsWest > 0;
+        if (!grownSections.empty() || !propIds.added.empty() || zones || gridWest || Exists(kept)) {
             std::vector<u8> layout;
             // The shipped table: the copy kept here, else the one kept in the
             // game's own folder (a scripted run writes elsewhere, and the
@@ -1527,7 +1676,7 @@ bool WriteWorldEdits(nfs::World& world, const std::wstring& tracksFolder, WorldW
                 return false;
             }
 
-            if (grownSections.empty() && propIds.added.empty() && !zones) {
+            if (grownSections.empty() && propIds.added.empty() && !zones && !gridWest) {
                 if (!WriteWhole(live, layout.data(), layout.size())) {
                     report.error = L"Could not put back " + live;
                     return false;
@@ -1573,6 +1722,13 @@ bool WriteWorldEdits(nfs::World& world, const std::wstring& tracksFolder, WorldW
                         const u32 value = Read<u32>(at) + grown.delta;
                         std::memcpy(at, &value, sizeof(value));
                     }
+                }
+                if (gridWest) {
+                    if (!nfs::GrowCollisionGridWest(layout, nfs::gridRowsWest)) {
+                        report.error = L"The collision grid of " + live + L" could not be widened to the west.";
+                        return false;
+                    }
+                    LOG_INFO("NFS World: collision grid widened %d rows to the west in %S", nfs::gridRowsWest, live.c_str());
                 }
                 if (!propIds.added.empty() || zones) {
                     // The HOT index comes and goes with the region file.

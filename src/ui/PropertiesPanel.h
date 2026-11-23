@@ -40,6 +40,8 @@ public:
         // The value names a picture the image provider knows (a texture, a
         // model): it is shown under the rows, and the choices with theirs.
         bool preview = false;
+        // An editable number with maximum > minimum is a slider between them.
+        float minimum = 0.0f, maximum = 0.0f;
     };
 
     struct View {
@@ -59,6 +61,14 @@ public:
             std::wstring help;      // shown at the foot while the pointer is on it
         };
         std::vector<Action> actions;
+        // A right click on the panel's tab or heading opens these, each
+        // posting its command to the parent window; none, no menu.
+        struct MenuItem {
+            std::wstring label;
+            int command = 0;
+            bool enabled = true;
+        };
+        std::vector<MenuItem> menu;
     };
 
     // `parent` receives the commands. The font is unused: ImGui has its own.

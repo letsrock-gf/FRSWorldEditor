@@ -261,6 +261,11 @@ public:
         u32 hash = 0;
         u32 section = 0;          // the section's number
         std::wstring file;
+        // A car of CARS (nfs/CarGeometry.h) instead of a kept OBJ: its folder
+        // name and paint (hue 0..360, lightness and saturation 0..1).
+        std::string car, name;   // name: the model's, hash = its bStringHash
+        float hue = 0.0f, lightness = 0.5f, saturation = 0.0f;
+        bool metallic = false, gloss = true;
     };
     std::vector<NewModel> newModels;
 
@@ -279,6 +284,9 @@ public:
         // that need it whose packs take it too. Made again at every Save.
         std::vector<u8> header;
         std::vector<u32> moreLikes;
+        // From a car's TEXTURES.BIN (io/WorldTexture.h StageCarTexture): in no
+        // shipped world pack, though one in memory holds it for the view.
+        bool fromCar = false;
     };
     std::deque<NewTexture> newTextures;
 
@@ -287,6 +295,9 @@ public:
     // a road leaves so the car stays in a zone along all of it: outside every
     // one nfsw.exe streams no section at all (io/WorldWrite.h).
     std::map<u32, std::vector<Vec2>> zoneOutlines;
+    // Outlines widened by hand (edit list ZM lines), kept when the bake widens
+    // again: its corridors start from these instead of the shipped outline.
+    std::map<u32, std::vector<Vec2>> manualZoneOutlines;
 
     // A model the editor made, put into a loaded section (a solid list of its
     // own) and into the index FindModel reads. Replaces one of the same hash.

@@ -6,6 +6,9 @@
 
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <unordered_map>
 
 // What is written here was measured on the shipped files (tools/nfsw/
 // tex_layout_stats.py), on every third section file of the map:
@@ -294,8 +297,18 @@ std::wstring HexOf(u32 value) {
 
 void WriteVecU32(std::vector<u8>& bytes, size_t at, u32 value) { std::memcpy(bytes.data() + at, &value, 4); }
 
-// Whether the pack of this section takes the texture: it holds one it copies.
+// New textures given a texture section of their own by the edit list (X line, fifth field): hash -> section number.
+// ponytail: kept here, not in World::NewTexture, so the shared header nfs/World.h stays as it is.
+std::unordered_map<u32, u32>& GivenHosts() {
+    static std::unordered_map<u32, u32> hosts;
+    return hosts;
+}
+
+// Whether the pack of this section takes the texture: the section the list names for it, else one that holds
+// a texture it copies.
 bool HostedBy(const nfs::World::NewTexture& texture, const nfs::LoadedSection& loaded) {
+    const auto given = GivenHosts().find(texture.hash);
+    if (given != GivenHosts().end()) return loaded.info && loaded.info->number == given->second;
     if (PackHolds(loaded, texture.like)) return true;
     for (const u32 like : texture.moreLikes)
         if (PackHolds(loaded, like)) return true;
@@ -328,6 +341,16 @@ std::string NewTextureName(const nfs::World& world, const std::string& wanted) {
         const std::string number = "_" + std::to_string(n);
         name = base.substr(0, 31 - number.size()) + number;
     }
+}
+
+void SetNewTextureHost(u32 hash, u32 section) {
+    if (section) GivenHosts()[hash] = section;
+    else GivenHosts().erase(hash);
+}
+
+u32 NewTextureHost(u32 hash) {
+    const auto given = GivenHosts().find(hash);
+    return given == GivenHosts().end() ? 0u : given->second;
 }
 
 std::vector<const nfs::LoadedSection*> TextureHosts(const nfs::World& world, u32 like) {
@@ -421,6 +444,94 @@ bool StageCopiedWorldTexture(nfs::World& world, u32 hash, u32 like, std::wstring
     return true;
 }
 
+bool StageCarTexture(nfs::World& world, const nfs::Texture& texture, const std::vector<u8>& header, u32 like,
+                     std::wstring& error) {
+    if (NewTextureOf(world, texture.hash)) return true;
+    const std::vector<const nfs::LoadedSection*> hosts = TextureHosts(world, like);
+    if (hosts.empty()) { error = L"texture " + HexOf(like) + L" is in no texture section"; return false; }
+    // Block-compressed, or D3DFMT_A8R8G8B8 (21: 4 bytes a pixel), which some imported cars ship (458ITALIA's
+    // lights, tyre, interior: sized as DXT, only a quarter of each was copied and the lights drew black, 21/11).
+    const u32 block = (texture.fourCc == 0x31545844 || texture.fourCc == 0x31495441) ? 8u : 16u;   // DXT1, ATI1
+    const auto levelBytes = [&](u32 w, u32 h) {
+        return texture.fourCc == 21 ? (size_t)w * h * 4 : (size_t)std::max(1u, (w + 3) / 4) * std::max(1u, (h + 3) / 4) * block;
+    };
+    u32 width = texture.width, height = texture.height, mips = std::max<u32>(texture.mipCount, 1);
+    size_t skip = 0;
+    while (mips > 1 && std::max(width, height) > kMaxNewSide) {
+        skip += levelBytes(width, height);
+        width = std::max(1u, width / 2);
+        height = std::max(1u, height / 2);
+        --mips;
+    }
+    size_t bytes = 0;
+    for (u32 m = 0, w = width, h = height; m < mips; ++m, w = std::max(1u, w / 2), h = std::max(1u, h / 2)) bytes += levelBytes(w, h);
+    if (skip + bytes > texture.pixels.size) { error = L"car texture " + HexOf(texture.hash) + L" has fewer pixels than its levels"; return false; }
+
+    nfs::World::NewTexture& entry = world.newTextures.emplace_back();
+    entry.hash      = texture.hash;
+    entry.like      = like;
+    entry.name      = texture.name;
+    entry.width     = width;
+    entry.height    = height;
+    entry.mips      = mips;
+    entry.fourCc    = texture.fourCc;
+    entry.baseBytes = (u32)levelBytes(width, height);
+    entry.pixels.assign(texture.pixels.data + skip, texture.pixels.data + skip + bytes);
+    entry.header    = header;
+    entry.fromCar   = true;
+
+    nfs::Texture shown = texture;
+    shown.width = (u16)width;
+    shown.height = (u16)height;
+    shown.mipCount = (u8)mips;
+    shown.baseLevelSize = entry.baseBytes;
+    shown.pixels = { entry.pixels.data(), entry.pixels.size() };
+    nfs::LoadedSection* first = world.MutableLoaded(0);
+    for (size_t i = 0; i < world.Loaded().size(); ++i)
+        if (world.Loaded()[i].get() == hosts.front()) first = world.MutableLoaded(i);
+    if (first && !first->texturePacks.empty()) first->texturePacks.front()->Add(shown);
+    LOG_INFO("car texture %s %08X staged (%ux%u, %u levels) beside texture %08X", texture.name.c_str(), texture.hash,
+             width, height, mips, like);
+    return true;
+}
+
+// EncodeForSlot, with the result kept beside the image in cache\<image>.<w>x<h>.<fourcc>.<levels>.bin: the image's
+// size and time of writing, then the levels. A kept image that was written again is compressed again.
+// ponytail: one small file per texture; one file per folder if thousands of opens/reads show up as slow.
+bool EncodeCached(const std::wstring& image, u32 width, u32 height, u32 fourCc, u32 mips, std::vector<u8>& pixels,
+                  std::wstring& error) {
+    namespace fs = std::filesystem;
+    std::error_code failed;
+    const fs::path source(image);
+    const u64 stamp[2] = { (u64)fs::file_size(source, failed),
+                           (u64)fs::last_write_time(source, failed).time_since_epoch().count() };
+    wchar_t tail[64];
+    ::swprintf_s(tail, L".%ux%u.%08X.%u.bin", width, height, fourCc, mips);
+    const fs::path kept = source.parent_path() / L"cache" / (source.filename().wstring() + tail);
+    if (!failed) {
+        std::ifstream in(kept, std::ios::binary | std::ios::ate);
+        const std::streamoff size = in ? (std::streamoff)in.tellg() : 0;
+        u64 had[2] = {};
+        if (size > (std::streamoff)sizeof(had)) {
+            in.seekg(0);
+            in.read((char*)had, sizeof(had));
+            if (had[0] == stamp[0] && had[1] == stamp[1]) {
+                pixels.resize((size_t)size - sizeof(had));
+                in.read((char*)pixels.data(), (std::streamsize)pixels.size());
+                if (in) return true;
+            }
+        }
+    }
+    if (!EncodeForSlot(image, width, height, fourCc, mips, pixels, error)) return false;
+    if (!failed) {
+        fs::create_directories(kept.parent_path(), failed);
+        std::ofstream out(kept, std::ios::binary | std::ios::trunc);
+        out.write((const char*)stamp, sizeof(stamp));
+        out.write((const char*)pixels.data(), (std::streamsize)pixels.size());
+    }
+    return true;
+}
+
 bool StageNewWorldTexture(nfs::World& world, const std::string& name, u32 like, const std::wstring& keptFile,
                           std::wstring& error) {
     const std::vector<const nfs::LoadedSection*> hosts = TextureHosts(world, like);
@@ -442,7 +553,7 @@ bool StageNewWorldTexture(nfs::World& world, const std::string& name, u32 like, 
                        nfs::AlphaIsOpacity(*model);
     const u32 fourCc = alpha ? kFourCcDxt5 : kFourCcDxt1;
     std::vector<u8> pixels;
-    if (!EncodeForSlot(keptFile, width, height, fourCc, mips, pixels, error)) return false;
+    if (!EncodeCached(keptFile, width, height, fourCc, mips, pixels, error)) return false;
 
     const u32 hash = NameHash(name);
     auto* entry = const_cast<nfs::World::NewTexture*>(NewTextureOf(world, hash));
@@ -484,6 +595,40 @@ bool StageNewWorldTexture(nfs::World& world, const std::string& name, u32 like, 
     return true;
 }
 
+// The header (0x90 bytes, length byte, name) and the 32-byte format row of a shipped texture, from the first
+// texture section whose pack holds it, as shipped. For a new texture whose own section does not hold what it copies.
+bool ShippedTextureRows(const nfs::World& world, u32 hash, std::vector<u8>& header, std::vector<u8>& format) {
+    const std::vector<const nfs::LoadedSection*> hosts = TextureHosts(world, hash);
+    if (hosts.empty() || !hosts.front()->info) return false;
+    const ByteSpan shipped = world.SectionBytes(*hosts.front()->info);
+    const std::vector<u8> bytes(shipped.data, shipped.data + shipped.size);
+    const std::vector<Node> top = Children(bytes, 0, bytes.size());
+    const Node* pack = Find(top, nfs::kChunkTexturePack);
+    if (!pack) return false;
+    const std::vector<Node> parts = Children(bytes, pack->begin, pack->end);
+    const Node* info = Find(parts, nfs::kChunkTpkInfoBlock);
+    if (!info) return false;
+    const std::vector<Node> infoParts = Children(bytes, info->begin, info->end);
+    const Node* hashes  = Find(infoParts, nfs::kChunkTpkHashTable);
+    const Node* headers = Find(infoParts, nfs::kChunkTpkTextureHeaders);
+    const Node* formats = Find(infoParts, nfs::kChunkTpkFormatTable);
+    if (!hashes || !headers || !formats) return false;
+    size_t at = headers->begin;
+    for (size_t i = 0; i < (hashes->end - hashes->begin) / 8; ++i) {
+        if (at + kTexHeader + 1 > headers->end) return false;
+        const size_t size = kTexHeader + 1 + bytes[at + kTexHeader];
+        if (at + size > headers->end || formats->begin + (i + 1) * 32 > formats->end) return false;
+        if (ReadU32(bytes, hashes->begin + i * 8) == hash) {
+            header.assign(bytes.begin() + (std::ptrdiff_t)at, bytes.begin() + (std::ptrdiff_t)(at + size));
+            format.assign(bytes.begin() + (std::ptrdiff_t)(formats->begin + i * 32),
+                          bytes.begin() + (std::ptrdiff_t)(formats->begin + (i + 1) * 32));
+            return true;
+        }
+        at += size;
+    }
+    return false;
+}
+
 bool WriteNewTextures(const nfs::World& world, const nfs::LoadedSection& loaded, const std::vector<u32>& inUse,
                       std::vector<u8>& bytes, size_t& added, std::wstring& error) {
     if (!IsTextureSection(loaded)) return true;
@@ -492,7 +637,7 @@ bool WriteNewTextures(const nfs::World& world, const nfs::LoadedSection& loaded,
         // A made texture is in its first host's pack in memory (for the view), never
         // in a shipped one; a copied game texture is left out where it shipped.
         if (std::find(inUse.begin(), inUse.end(), texture.hash) != inUse.end() && HostedBy(texture, loaded) &&
-            (texture.header.empty() || !PackHolds(loaded, texture.hash)))
+            (texture.header.empty() || texture.fromCar || !PackHolds(loaded, texture.hash)))
             mine.push_back(&texture);
     if (mine.empty()) return true;
     const auto fail = [&](const wchar_t* why) {
@@ -550,14 +695,20 @@ bool WriteNewTextures(const nfs::World& world, const nfs::LoadedSection& loaded,
         for (const u32 more : texture->moreLikes)
             if (like == entries.end())
                 like = std::find_if(entries.begin(), entries.end(), [&](const Entry& e) { return e.hash == more; });
-        if (like == entries.end()) return fail(L"does not hold the texture a new one copies");
+        // In a section the list names for it: what it copies is taken from that texture's own pack.
+        const Entry* from = like == entries.end() ? nullptr : &*like;
+        Entry borrowed;
+        if (!from && NewTextureHost(texture->hash) &&
+            ShippedTextureRows(world, texture->like, borrowed.header, borrowed.format))
+            from = &borrowed;
+        if (!from) return fail(L"does not hold the texture a new one copies");
         if (std::any_of(entries.begin(), entries.end(), [&](const Entry& e) { return e.hash == texture->hash; }))
             return fail(L"already holds a texture of a new one's name");
         Entry entry;
         entry.hash = texture->hash;
         // A copied game texture keeps its own header, a new one takes the one it copies.
         if (texture->header.size() == kTexHeader) entry.header = texture->header;
-        else entry.header.assign(like->header.begin(), like->header.begin() + (std::ptrdiff_t)kTexHeader);
+        else entry.header.assign(from->header.begin(), from->header.begin() + (std::ptrdiff_t)kTexHeader);
         const size_t length = ((kTexHeader + 1 + texture->name.size() + 1 + 3) & ~(size_t)3) - kTexHeader - 1;
         entry.header.push_back((u8)length);
         entry.header.insert(entry.header.end(), texture->name.begin(), texture->name.end());

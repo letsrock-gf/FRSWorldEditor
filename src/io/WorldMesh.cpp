@@ -6,10 +6,14 @@
 #include "io/TextureImport.h"
 #include "io/WorldTexture.h"
 #include "io/WorldWrite.h"
+#include "nfs/CarGeometry.h"
+#include "render/GameLookAttributes.h"
 #include "nfs/ChunkReader.h"
 #include "nfs/SolidList.h"
+#include "nfs/TextureDecode.h"
 
 #include <algorithm>
+#include <filesystem>
 #include <array>
 #include <cmath>
 #include <cstdio>
@@ -776,8 +780,31 @@ bool FindDonorIn(const nfs::World& world, const std::vector<u32>& models, u32 te
     return false;
 }
 
+// Donors found before, by where they were looked for (a section's number, or kAnywhere) and texture. A donor
+// is a shipped material, so the answer holds for as long as the same sections are loaded. Without it a list
+// of 2100 new models spent 575 of the 667 s of opening looking the same few donors up again, and as long
+// twice more in every save (measured 22/11).
+constexpr u32 kAnywhere = 0xFFFFFFFFu;
+bool DonorKnown(const nfs::World& world, u32 where, u32 texture, Donor& out, bool** have, Donor** kept) {
+    static std::unordered_map<u64, std::pair<bool, Donor>> known;
+    static const void* of = nullptr;
+    static size_t count = 0;
+    const void* now = world.Loaded().empty() ? nullptr : (const void*)world.Loaded().front().get();
+    if (now != of || count != world.Loaded().size()) { known.clear(); of = now; count = world.Loaded().size(); }
+    const auto [at, fresh] = known.try_emplace((u64)where << 32 | texture);
+    *have = &at->second.first;
+    *kept = &at->second.second;
+    if (!fresh && at->second.first) out = at->second.second;
+    return !fresh;
+}
+
 bool FindDonor(const nfs::World& world, const nfs::LoadedSection& target, u32 texture, Donor& out) {
-    return FindDonorIn(world, LoadedWith(target), texture, out);
+    bool* have = nullptr;
+    Donor* kept = nullptr;
+    if (DonorKnown(world, target.info ? target.info->number : kAnywhere - 1, texture, out, &have, &kept)) return *have;
+    *have = FindDonorIn(world, LoadedWith(target), texture, out);
+    if (*have) *kept = out;
+    return *have;
 }
 
 // The same, from any shipped model of the region that draws with `texture`
@@ -786,6 +813,9 @@ bool FindDonor(const nfs::World& world, const nfs::LoadedSection& target, u32 te
 // diffuse; tools/nfsw/texture_users.py). Models are tried in hash order, so
 // the choice is the same every time.
 bool FindDonorAnywhere(const nfs::World& world, u32 texture, Donor& out) {
+    bool* have = nullptr;
+    Donor* kept = nullptr;
+    if (DonorKnown(world, kAnywhere, texture, out, &have, &kept)) return *have;
     std::vector<u32> users;
     for (const nfs::SolidObject* model : world.AllModels())
         if (model && std::find(model->textureHashes.begin(), model->textureHashes.end(), texture) !=
@@ -793,7 +823,9 @@ bool FindDonorAnywhere(const nfs::World& world, u32 texture, Donor& out) {
             users.push_back(model->hash);
     std::sort(users.begin(), users.end());
     users.erase(std::unique(users.begin(), users.end()), users.end());
-    return FindDonorIn(world, users, texture, out);
+    *have = FindDonorIn(world, users, texture, out);
+    if (*have) *kept = out;
+    return *have;
 }
 
 // The texture an OBJ material names: tex_<hash> (the editor's own), else the
@@ -876,6 +908,29 @@ u32 PickLikeTexture(const nfs::World& world, const nfs::LoadedSection& target, b
 }
 
 
+// ReadObjMeshes for a new model's kept OBJ, parsed once for as long as the file stays as it is (size and time of
+// writing): opening the list read each twice and every save three times more.
+// ponytail: the parsed meshes stay in memory (about twice the OBJ text; 170 MB of OBJ on 22/11); drop the
+// entries of models no longer in world.newModels if that ever weighs.
+bool ReadKeptObj(const std::wstring& path, std::vector<ObjMesh>& out, std::wstring& why) {
+    struct Kept { u64 size = 0, time = 0; std::vector<ObjMesh> meshes; };
+    static std::unordered_map<std::wstring, Kept> known;
+    std::error_code failed;
+    const std::filesystem::path file(path);
+    const u64 size = (u64)std::filesystem::file_size(file, failed);
+    const u64 time = (u64)std::filesystem::last_write_time(file, failed).time_since_epoch().count();
+    if (failed) return ReadObjMeshes(path, out, why);
+    Kept& kept = known[path];
+    if (kept.size != size || kept.time != time || kept.meshes.empty()) {
+        kept = Kept{};
+        if (!ReadObjMeshes(path, kept.meshes, why)) { known.erase(path); return false; }
+        kept.size = size;
+        kept.time = time;
+    }
+    out = kept.meshes;
+    return true;
+}
+
 // A new model's object, from its kept OBJ: every material over a donor (see
 // WorldMesh.h), the vertices and triangles the OBJ's own.
 bool BuildNewNode(const nfs::World& world, const nfs::World::NewModel& entry, const std::string& name, Node& out,
@@ -883,7 +938,7 @@ bool BuildNewNode(const nfs::World& world, const nfs::World::NewModel& entry, co
     const nfs::LoadedSection* target = SectionNumbered(world, entry.section);
     if (!target) { why = L"its section " + std::to_wstring(entry.section) + L" is not loaded"; return false; }
     std::vector<ObjMesh> meshes;
-    if (!ReadObjMeshes(entry.file, meshes, why) || meshes.empty() || meshes.front().indices.size() < 3) {
+    if (!ReadKeptObj(entry.file, meshes, why) || meshes.empty() || meshes.front().indices.size() < 3) {
         if (why.empty()) why = L"the kept mesh " + entry.file + L" holds no faces";
         return false;
     }
@@ -909,6 +964,10 @@ bool BuildNewNode(const nfs::World& world, const nfs::World::NewModel& entry, co
             const nfs::World::NewTexture* made = NewTextureOf(world, texture);
             Donor donor;
             bool have = FindDonor(world, *target, made ? made->like : texture, donor);
+            // A new texture whose `like` no model of this section draws with (a
+            // scripted list spreading many models over sections): the material
+            // of any shipped model that draws with `like` first.
+            if (!have && made) have = FindDonorAnywhere(world, made->like, donor);
             if (!have && !made) {
                 // A game texture no model of the section draws with (the road
                 // bake's): the material a shipped model elsewhere draws it
@@ -1107,10 +1166,35 @@ const nfs::World::NewModel* NewModelOf(const nfs::World& world, u32 hash) {
     return nullptr;
 }
 
+// A staged car model's object (StageCarModel), and its materials whose light
+// material is the paint, in object order.
+struct CarBuilt {
+    Node node;
+    std::vector<size_t> painted;
+    // The paint, as the game can show it on a world model: a copy of the car's <CAR>_SKIN1, named
+    // FRS_SKIN_<model hash>, that only the paint strips draw with, tinted to the paint when saved
+    // (StageCarPaintTextures). The light material carries no colour there (21/11 in game: even the
+    // game's METPAINTBLUE left the car grey). The view draws it untinted, under the vertex-colour preview.
+    nfs::Texture skin;             // hash = the copy's; pixels point into skinPixels (untinted)
+    std::vector<u8> skinPixels, skinHeader;
+    u32 skinLike = 0;
+};
+// ponytail: one table for the editor's one world; StageCarModel fills it again on every open.
+std::unordered_map<u32, CarBuilt>& CarsBuilt() {
+    static std::unordered_map<u32, CarBuilt> cars;
+    return cars;
+}
+
 // The object of a model as the game would read it now: a new one built from
 // its kept OBJ, a shipped one with its mesh edit applied.
 bool SourceNode(const nfs::World& world, u32 hash, Node& out, std::wstring& why) {
     if (const nfs::World::NewModel* entry = NewModelOf(world, hash)) {
+        if (!entry->car.empty()) {
+            const auto built = CarsBuilt().find(hash);
+            if (built == CarsBuilt().end()) { why = L"the car model " + Hex(hash) + L" is not staged"; return false; }
+            out = built->second.node;
+            return true;
+        }
         const nfs::SolidObject* model = world.FindModel(hash);
         if (!model) { why = L"the new model " + Hex(hash) + L" is not staged"; return false; }
         return BuildNewNode(world, *entry, model->name, out, why);
@@ -1252,7 +1336,7 @@ std::vector<u32> NewTexturesInUse(const nfs::World& world) {
         if (!ModelPlaced(world, model.hash)) continue;
         std::vector<ObjMesh> meshes;
         std::wstring ignored;
-        if (!ReadObjMeshes(model.file, meshes, ignored)) continue;
+        if (!ReadKeptObj(model.file, meshes, ignored)) continue;
         for (const ObjMesh& mesh : meshes)
             for (const ObjFaceGroup& group : mesh.groups) {
                 unsigned hash = 0;
@@ -1275,7 +1359,7 @@ bool StageNewWorldModel(nfs::World& world, u32 sectionNumber, u32 hash, const st
     }
     // The name is the kept OBJ's object name (o line).
     std::vector<ObjMesh> meshes;
-    if (!ReadObjMeshes(keptPath, meshes, error) || meshes.empty()) {
+    if (!ReadKeptObj(keptPath, meshes, error) || meshes.empty()) {
         if (error.empty()) error = L"the kept mesh " + keptPath + L" holds no faces";
         return false;
     }
@@ -1770,6 +1854,20 @@ bool WriteWorldMeshes(const nfs::World& world, const nfs::LoadedSection& loaded,
     // New models of this section that something places, and the models its
     // placements need copied in (WorldMesh.h): objects to add to its file.
     std::vector<Node> added;
+    // The paint of the cars among them (0x135200 chunks), loaded before their objects.
+    std::vector<u8> paints;
+    const auto addPaint = [&](u32 hash) {
+        const nfs::World::NewModel* car = NewModelOf(world, hash);
+        if (!car || car->car.empty()) return;
+        float rgb[3];
+        nfs::HlsToRgb(car->hue, car->lightness, car->saturation, rgb);
+        const std::vector<u8> material = nfs::CarPaintMaterial(CarPaintName(hash), rgb, car->metallic, car->gloss);
+        const size_t at = paints.size();
+        paints.resize(at + 8);
+        Write<u32>(paints.data() + at, 0x00135200u);
+        Write<u32>(paints.data() + at + 4, (u32)material.size());
+        paints.insert(paints.end(), material.begin(), material.end());
+    };
     if (loaded.info) {
         for (const auto& entry : world.newModels) {
             if (entry.section != loaded.info->number || !ModelPlaced(world, entry.hash)) continue;
@@ -1780,6 +1878,7 @@ bool WriteWorldMeshes(const nfs::World& world, const nfs::LoadedSection& loaded,
                 return false;
             }
             added.push_back(std::move(node));
+            addPaint(entry.hash);
         }
         std::vector<WorldModelCopy> copies;
         if (!SectionModelCopies(world, loaded, copies, error)) return false;
@@ -1793,6 +1892,7 @@ bool WriteWorldMeshes(const nfs::World& world, const nfs::LoadedSection& loaded,
             Node* header = ChildOf(node, nfs::kChunkSolidObjectHeader);
             header->payload = HeaderWithName(header->payload, copy.name);
             added.push_back(std::move(node));
+            addPaint(copy.source);
         }
     }
     if (kept.empty() && added.empty()) return true;
@@ -1814,6 +1914,17 @@ bool WriteWorldMeshes(const nfs::World& world, const nfs::LoadedSection& loaded,
             error = L"Section " + Widen(loaded.info->name) + L" has no solid list the editor can add a model to.";
             return false;
         }
+    }
+    if (!paints.empty()) {
+        // Before the solid list, padded (chunk 0) to a whole 128 bytes so what
+        // follows keeps its alignment, as when a list grows.
+        const size_t total = (paints.size() + 8 + 127) / 128 * 128;
+        const size_t at = paints.size();
+        paints.resize(total, 0);
+        Write<u32>(paints.data() + at, 0u);
+        Write<u32>(paints.data() + at + 4, (u32)(total - at - 8));
+        bytes.insert(bytes.begin() + (std::ptrdiff_t)addTo, paints.begin(), paints.end());
+        addTo += total;
     }
 
     size_t position = 0;
@@ -1890,6 +2001,614 @@ bool WriteWorldMeshes(const nfs::World& world, const nfs::LoadedSection& loaded,
         position = next;
     }
     return true;
+}
+
+// --- cars ---------------------------------------------------------------------------
+namespace {
+
+struct CarMaterial {
+    std::vector<u8> entry, shaderName;
+    std::array<u32, 5> slots{};   // texture hashes, 0 where 0xFF
+    u32 light = 0;
+    std::vector<u16> indices;     // counting from the run's start
+};
+// One vertex buffer of a part and the materials drawing from it.
+struct CarRun {
+    u32 effect = 0;
+    std::vector<u8> vertices;
+    u32 count = 0;
+    std::vector<CarMaterial> materials;
+};
+
+u32 CarStride(u32 effect) {
+    if (effect == 0x8 || effect == 0x9) return 32;
+    Layout layout;
+    return LayoutFor(effect, layout) ? layout.stride : 0;
+}
+
+// Where a part goes in the merged car: x and z scaled by `scale` (a tyre to its wheel's radius), turned 180
+// degrees about z when `flip` (the left wheels: a wheel's local +y points inboard), then moved by `move`.
+struct CarPlace {
+    float scale = 1.0f;
+    bool flip = false;
+    Vec3 move{};
+};
+
+// How the game dresses a car when it draws it (CarRenderInfo, nfsw.exe REA 21/11): the textures it puts in place
+// of the ones the parts name (table at CarRenderInfo +0x9E8, filled by 0x737E00 / 0x709260 / 0x709590), and the
+// wheels (ecar.TireOffsets, 0x72AED0). rea-car-textures-wheels.md in the session notes has the evidence.
+struct CarSetup {
+    std::unordered_map<u32, u32> textures;   // named -> drawn
+    bool wheels = false;
+    float offsets[16] = {};                  // TireOffsets: per wheel 0 FL, 1 FR, 2 RR, 3 RL: X, Y (tyre outer face), Z, radius
+    float compression[2] = {};               // FECompressions, front and rear axle
+    u32 skin = 0, paintedSkin = 0;           // the paint strips draw with paintedSkin where they name skin
+};
+
+void PlaceVertices(std::vector<u8>& vertices, u32 effect, const CarPlace& place) {
+    const float unpack = 8.0f / 32767.0f, pack = 32767.0f / 8.0f;
+    const auto quantize = [](float v) { return (i16)std::lround(std::clamp(v, -32767.0f, 32767.0f)); };
+    Layout layout;
+    if (effect != 0x8 && effect != 0x9 && LayoutFor(effect, layout)) {   // a float position first
+        for (size_t at = 0; at + layout.stride <= vertices.size(); at += layout.stride) {
+            u8* v = vertices.data() + at;
+            Vec3 p = ReadVec3(v);
+            p.x *= place.scale;
+            p.z *= place.scale;
+            if (place.flip) {
+                p.x = -p.x;
+                p.y = -p.y;
+                if (layout.normal >= 0)
+                    for (int k = 0; k < 2; ++k) Write<i16>(v + layout.normal + 2 * k, (i16)-Read<i16>(v + layout.normal + 2 * k));
+            }
+            WriteVec3(v, p + place.move);
+        }
+        return;
+    }
+    for (size_t at = 0; at + 32 <= vertices.size(); at += 32) {
+        u8* v = vertices.data() + at;
+        float x = Read<i16>(v) * unpack * place.scale, y = Read<i16>(v + 2) * unpack, z = Read<i16>(v + 4) * unpack * place.scale;
+        if (place.flip) { x = -x; y = -y; }
+        Write<i16>(v, quantize((x + place.move.x) * pack));
+        Write<i16>(v + 2, quantize((y + place.move.y) * pack));
+        Write<i16>(v + 4, quantize((z + place.move.z) * pack));
+        if (place.flip)
+            for (size_t o : { size_t(16), size_t(24) }) {   // normal, tangent
+                Write<i16>(v + o, (i16)-Read<i16>(v + o));
+                Write<i16>(v + o + 2, (i16)-Read<i16>(v + o + 2));
+            }
+    }
+}
+
+bool CarRuns(const nfs::CarPart& part, std::vector<CarRun>& runs, double& area, Node& firstHeader, Node& firstDesc,
+             const CarPlace& place, const CarSetup& setup, std::wstring& why) {
+    std::vector<Node> nodes = ParseNodes(ByteSpan{ part.object.data(), part.object.size() }, 0);
+    const auto fail = [&](const wchar_t* what) { why = Widen(part.name) + L": " + what; return false; };
+    if (nodes.size() != 1 || nodes[0].id != nfs::kChunkSolidObject) return fail(L"not one solid object");
+    Node& object = nodes[0];
+    Node* header = ChildOf(object, nfs::kChunkSolidObjectHeader);
+    Node* textures = ChildOf(object, nfs::kChunkSolidObjectTexRefs);
+    Node* lights = ChildOf(object, nfs::kChunkSolidObjectShaders);
+    Node* mesh = ChildOf(object, nfs::kChunkMeshContainer);
+    Node* desc = mesh ? ChildOf(*mesh, nfs::kChunkMeshDescriptor) : nullptr;
+    Node* mats = mesh ? ChildOf(*mesh, nfs::kChunkMeshMaterials) : nullptr;
+    Node* index = mesh ? ChildOf(*mesh, nfs::kChunkMeshIndices) : nullptr;
+    if (!header || header->payload.size() < kHdrSize || !textures || !desc || desc->payload.size() < kDescSize ||
+        !mats || mats->payload.size() % kMatSize || !index)
+        return fail(L"chunks missing");
+    if (firstHeader.payload.empty()) { firstHeader = *header; firstDesc = *desc; }
+    area += Read<float>(header->payload.data() + kHdrArea);
+    std::vector<Node*> buffers, names;
+    for (Node& child : mesh->children) {
+        if (child.id == nfs::kChunkMeshVertices) buffers.push_back(&child);
+        if (child.id == kChunkShaderName) names.push_back(&child);
+    }
+    const size_t count = mats->payload.size() / kMatSize, indexCount = index->payload.size() / 2;
+    if (names.size() != count) return fail(L"not one shader name per material");
+    const auto listed = [](const Node* list, u8 i) {
+        return list && (size_t)i * 8 + 4 <= list->payload.size() ? Read<u32>(list->payload.data() + (size_t)i * 8) : 0u;
+    };
+    size_t buffer = 0;
+    for (size_t m = 0; m < count; ++m) {
+        const u8* entry = mats->payload.data() + m * kMatSize;
+        const u32 effect = Read<u32>(entry + kMatEffect);
+        if (m == 0 || effect != Read<u32>(entry - kMatSize + kMatEffect)) {
+            const u32 stride = CarStride(effect);
+            if (buffer >= buffers.size() || !stride || buffers[buffer]->payload.size() % stride)
+                return fail(L"a vertex buffer in a layout the editor does not know");
+            CarRun& run = runs.emplace_back();
+            run.effect = effect;
+            run.vertices = buffers[buffer++]->payload;
+            run.count = (u32)(run.vertices.size() / stride);
+            PlaceVertices(run.vertices, effect, place);
+        }
+        CarMaterial material;
+        material.entry.assign(entry, entry + kMatSize);
+        material.shaderName = names[m]->payload;
+        {   // its box, moved the same way
+            Aabb box;
+            const Vec3 lo = ReadVec3(entry + kMatMin), hi = ReadVec3(entry + kMatMax);
+            for (int c = 0; c < 8; ++c) {
+                Vec3 p{ (c & 1 ? hi.x : lo.x) * place.scale, c & 2 ? hi.y : lo.y, (c & 4 ? hi.z : lo.z) * place.scale };
+                if (place.flip) { p.x = -p.x; p.y = -p.y; }
+                box.Add(p + place.move);
+            }
+            WriteVec3(material.entry.data() + kMatMin, box.min);
+            WriteVec3(material.entry.data() + kMatMax, box.max);
+        }
+        for (size_t s = 0; s < 5; ++s) {
+            material.slots[s] = entry[kMatSlots + s] == 0xFF ? 0u : listed(textures, entry[kMatSlots + s]);
+            const auto drawn = setup.textures.find(material.slots[s]);
+            if (drawn != setup.textures.end()) material.slots[s] = drawn->second;
+        }
+        material.light = entry[kMatSlots + 5] == 0xFF ? 0u : listed(lights, entry[kMatSlots + 5]);
+        const u32 first = Read<u32>(entry + kMatFirst), n = Read<u32>(entry + kMatIndices);
+        if ((size_t)first + n > indexCount) return fail(L"indices out of range");
+        const u8* at = index->payload.data() + (size_t)first * 2;
+        for (u32 i = 0; i < n; ++i) material.indices.push_back(Read<u16>(at + (size_t)i * 2));
+        runs.back().materials.push_back(std::move(material));
+    }
+    return true;
+}
+
+// The car's parts as one object: runs of one effect side by side (0x64D5E0
+// gives a buffer to every following material of the same effect).
+bool BuildCarNode(const std::vector<nfs::CarPart>& parts, const std::string& name, u32 paintHash,
+                  const CarSetup& setup, CarBuilt& out, std::wstring& why) {
+    std::vector<CarRun> runs;
+    double area = 0.0;
+    Node firstHeader, firstDesc;
+    // With wheels, the whole car goes up so its tyres stand on z = 0 (the model's origin, where it is placed).
+    // A wheel's centre is TireOffsets.Z + FECompressions[axle] above the body's origin (0x710410, garage).
+    const auto centreZ = [&](int wheel) { return setup.offsets[wheel * 4 + 2] + setup.compression[wheel < 2 ? 0 : 1]; };
+    const float lift = setup.wheels ? setup.offsets[3] - centreZ(0) : 0.0f;
+    for (const nfs::CarPart& part : parts) {
+        const bool tyre = part.name.find("_FRONT_TIRE_") != std::string::npos;
+        // Brakes and, on cars that model the disc apart (458ITALIA, LAMBOHURACAN: KIT00_FRONT_ROTOR /
+        // REAR_ROTOR, the exe's FRONT_ROTOR / REAR_ROTOR slots), the discs: at the wheels of their axle.
+        const bool frontBrake = part.name.find("_FRONT_BRAKE_") != std::string::npos ||
+                                part.name.find("_FRONT_ROTOR_") != std::string::npos;
+        const bool rearBrake = part.name.find("_REAR_BRAKE_") != std::string::npos ||
+                               part.name.find("_REAR_ROTOR_") != std::string::npos;
+        if (!tyre && !frontBrake && !rearBrake) {
+            CarPlace body;
+            body.move.z = lift;
+            if (!CarRuns(part, runs, area, firstHeader, firstDesc, body, setup, why)) return false;
+            continue;
+        }
+        if (!setup.wheels) continue;
+        // The tyre is scaled to each wheel's radius: radius / half its x extent (0x72AED0). Its origin is its
+        // outer face, local +y inboard; the left wheels (+y) are turned about z. The car has one tyre (front)
+        // for all four wheels; brakes front for 0 and 1, rear for 2 and 3.
+        float halfX = 0.0f;
+        if (tyre) {
+            float lo = 0.0f, hi = 0.0f;
+            for (Node& object : ParseNodes(ByteSpan{ part.object.data(), part.object.size() }, 0))
+                if (Node* mesh = ChildOf(object, nfs::kChunkMeshContainer))
+                    for (Node& child : mesh->children)
+                        if (child.id == nfs::kChunkMeshVertices && child.payload.size() % 32 == 0)
+                            for (size_t at = 0; at + 32 <= child.payload.size(); at += 32) {
+                                const float x = Read<i16>(child.payload.data() + at) * (8.0f / 32767.0f);
+                                lo = std::min(lo, x);
+                                hi = std::max(hi, x);
+                            }
+            halfX = (hi - lo) * 0.5f;
+            if (halfX <= 0.01f) { why = Widen(part.name) + L": no tyre size"; return false; }
+        }
+        for (int wheel = 0; wheel < 4; ++wheel) {
+            if ((frontBrake && wheel >= 2) || (rearBrake && wheel < 2)) continue;
+            const float* o = setup.offsets + wheel * 4;
+            CarPlace place;
+            place.scale = tyre ? o[3] / halfX : 1.0f;
+            place.flip = o[1] > 0.0f;
+            place.move = { o[0], o[1], centreZ(wheel) + lift };
+            if (!CarRuns(part, runs, area, firstHeader, firstDesc, place, setup, why)) return false;
+        }
+    }
+    std::stable_sort(runs.begin(), runs.end(), [](const CarRun& a, const CarRun& b) { return a.effect < b.effect; });
+
+    std::vector<u32> textures, lights;
+    const auto slot = [](std::vector<u32>& list, u32 hash) {
+        const auto at = std::find(list.begin(), list.end(), hash);
+        if (at != list.end()) return (u8)(at - list.begin());
+        list.push_back(hash);
+        return (u8)(list.size() - 1);
+    };
+    std::vector<u8> materials;
+    std::vector<u16> indices;
+    std::vector<std::vector<u8>> buffers;
+    std::vector<Node> shaderNames;
+    u32 flags = 0, runVertices = 0, runEffect = 0;
+    Aabb bounds;
+    out.painted.clear();
+    for (const CarRun& run : runs) {
+        if (buffers.empty() || run.effect != runEffect) {
+            buffers.emplace_back();
+            runVertices = 0;
+            runEffect = run.effect;
+        }
+        if (runVertices + run.count > 0xFFFF) { why = L"a run of its materials needs more than 65535 vertices"; return false; }
+        buffers.back().insert(buffers.back().end(), run.vertices.begin(), run.vertices.end());
+        u32 counted = 0;
+        for (size_t k = 0; k < run.materials.size(); ++k) {
+            const CarMaterial& source = run.materials[k];
+            std::vector<u8> entry = source.entry;
+            const bool paint = source.light == nfs::kCarPaintLightMaterial;
+            for (size_t s = 0; s < 5; ++s)
+                if (entry[kMatSlots + s] != 0xFF)
+                    entry[kMatSlots + s] = slot(textures, paint && setup.skin && source.slots[s] == setup.skin
+                                                              ? setup.paintedSkin : source.slots[s]);
+            if (entry[kMatSlots + 5] != 0xFF) entry[kMatSlots + 5] = slot(lights, paint ? paintHash : source.light);
+            if (paint) out.painted.push_back(materials.size() / kMatSize);
+            // A material's first vertex is the sum of the counts before it in
+            // its buffer (0x64D5E0 +0x70): the last of a part's run takes what
+            // is left, so the next part starts where its vertices do.
+            // ponytail: EA counts that overlap (more than the buffer holds) leave the last at 0.
+            u32 vertices = Read<u32>(entry.data() + kMatVertices);
+            if (k + 1 == run.materials.size()) vertices = run.count > counted ? run.count - counted : 0;
+            counted += vertices;
+            Write<u32>(entry.data() + kMatVertices, vertices);
+            Write<u32>(entry.data() + 0x0C, 0);   // the game puts its shader here
+            Write<u32>(entry.data() + kMatFirst, (u32)indices.size());
+            for (u16 i : source.indices) indices.push_back((u16)(runVertices + i));
+            flags |= Read<u32>(entry.data());
+            bounds.Add(ReadVec3(entry.data() + kMatMin));
+            bounds.Add(ReadVec3(entry.data() + kMatMax));
+            materials.insert(materials.end(), entry.begin(), entry.end());
+            Node shader;
+            shader.id = kChunkShaderName;
+            shader.payload = source.shaderName;
+            shaderNames.push_back(std::move(shader));
+        }
+        runVertices += run.count;
+    }
+    if (textures.size() > 255 || lights.size() > 255) { why = L"it draws with more than 255 textures or light materials"; return false; }
+    if (indices.empty()) { why = L"no triangles"; return false; }
+
+    const u32 triangles = (u32)(indices.size() / 3);
+    Node header = firstHeader;
+    header.aligned = true;
+    header.payload = HeaderWithName(firstHeader.payload, name);
+    u8* h = header.payload.data();
+    Write<u32>(h + kHdrTriangles, triangles);
+    h[kHdrCounts + 1] = (u8)textures.size();
+    h[kHdrCounts + 2] = (u8)lights.size();
+    h[kHdrCounts + 3] = 0;   // the parts' 0x13401A markers are not carried
+    WriteVec3(h + kHdrMin, bounds.min);
+    Write<u32>(h + kHdrMin + 12, 0);
+    WriteVec3(h + kHdrMax, bounds.max);
+    Write<u32>(h + kHdrMax + 12, 0);
+    for (int i = 0; i < 16; ++i) Write<float>(h + kHdrMatrix + (size_t)i * 4, i % 5 == 0 ? 1.0f : 0.0f);
+    Write<float>(h + kHdrArea, (float)area);
+    Write<float>(h + kHdrDensity, area > 0.0 ? (float)(triangles / area) : 0.0f);
+
+    const auto table = [](u32 id, const std::vector<u32>& hashes) {
+        Node list;
+        list.id = id;
+        for (u32 hash : hashes) {
+            const size_t at = list.payload.size();
+            list.payload.resize(at + 8, 0);
+            Write<u32>(list.payload.data() + at, hash);
+        }
+        return list;
+    };
+    Node meshNode;
+    meshNode.id = nfs::kChunkMeshContainer;
+    Node desc = firstDesc;
+    desc.aligned = true;
+    Write<u32>(desc.payload.data() + kDescFlags, flags);
+    Write<u32>(desc.payload.data() + kDescMaterials, (u32)(materials.size() / kMatSize));
+    Write<u32>(desc.payload.data() + kDescBuffers, (u32)buffers.size());
+    Write<u32>(desc.payload.data() + kDescIndices, (u32)indices.size());
+    Node mats;
+    mats.id = nfs::kChunkMeshMaterials;
+    mats.aligned = true;
+    mats.payload = std::move(materials);
+    Node index;
+    index.id = nfs::kChunkMeshIndices;
+    index.aligned = true;
+    index.payload.assign((const u8*)indices.data(), (const u8*)indices.data() + indices.size() * 2);
+    if (indices.size() % 2) index.payload.resize(index.payload.size() + 2, 0);
+    meshNode.children.push_back(std::move(desc));
+    meshNode.children.push_back(std::move(mats));
+    meshNode.children.push_back(std::move(index));
+    for (std::vector<u8>& buffer : buffers) {
+        Node vertices;
+        vertices.id = nfs::kChunkMeshVertices;
+        vertices.aligned = true;
+        vertices.payload = std::move(buffer);
+        meshNode.children.push_back(std::move(vertices));
+    }
+    for (Node& shader : shaderNames) meshNode.children.push_back(std::move(shader));
+
+    out.node = Node{};
+    out.node.id = nfs::kChunkSolidObject;
+    out.node.children.push_back(std::move(header));
+    out.node.children.push_back(table(nfs::kChunkSolidObjectTexRefs, textures));
+    out.node.children.push_back(table(nfs::kChunkSolidObjectShaders, lights));
+    out.node.children.push_back(std::move(meshNode));
+    return true;
+}
+
+} // namespace
+
+namespace {
+
+CarSetup ReadCarSetup(const std::wstring& gameFolder, const std::string& car, const std::vector<nfs::CarTexture>& carTextures) {
+    CarSetup setup;
+    const auto has = [&](const std::string& name) {
+        const u32 hash = StringHash(name);
+        return std::any_of(carTextures.begin(), carTextures.end(), [&](const nfs::CarTexture& t) { return t.texture.hash == hash; });
+    };
+    const auto pick = [&](const std::string& named, std::initializer_list<std::string> drawn) {
+        for (const std::string& name : drawn)
+            if (has(name)) { setup.textures[StringHash(named)] = StringHash(name); return; }
+    };
+    // Side windows: WINDOW_FRONT undamaged (0x709590). Lights: the car's own KIT00 textures (0x709260, 0x71E780
+    // names): headlights off when the car has them, else on; brakelights on.
+    // ponytail: WINDOW_REAR (458ITALIA's rear glass, in no pack) is not in the REA table; drawn as WINDOW_FRONT too.
+    for (const char* window : { "WINDOW_LEFT_FRONT", "WINDOW_RIGHT_FRONT", "WINDOW_LEFT_REAR", "WINDOW_RIGHT_REAR", "WINDOW_REAR" })
+        setup.textures[StringHash(window)] = StringHash("WINDOW_FRONT");
+    const std::string kit = car + "_KIT00_";
+    for (const char* side : { "LEFT", "RIGHT" }) {
+        pick(std::string("HEADLIGHT_") + side, { kit + "HEADLIGHT_OFF", kit + "HEADLIGHT_ON" });
+        pick(std::string("HEADLIGHT_GLASS_") + side, { kit + "HEADLIGHT_GLASS_OFF", kit + "HEADLIGHT_GLASS_ON" });
+    }
+    for (const char* side : { "LEFT", "RIGHT", "CENTRE" }) {
+        // Lit: in a world model the light materials do nothing (21/11 in game), and _OFF draws black there.
+        pick(std::string("BRAKELIGHT_") + side, { kit + "BRAKELIGHT_ON", kit + "BRAKELIGHT_OFF" });
+        pick(std::string("BRAKELIGHT_GLASS_") + side, { kit + "BRAKELIGHT_GLASS_OFF", kit + "BRAKELIGHT_GLASS_ON" });
+    }
+    // Brake discs keep the game's ROTORn: an opaque copy drew square (21/11 in game), and the 911's disc showed
+    // with ROTORn itself.
+    // Some parts name the off glass directly, which some cars ship only lit.
+    for (const char* light : { "HEADLIGHT", "BRAKELIGHT" })
+        if (!has(kit + light + "_GLASS_OFF")) pick(kit + light + "_GLASS_OFF", { kit + light + "_GLASS_ON" });
+
+    // ecar (0xA5B543B7) of the car, keyed by lookup2 of its lower-case name: TireOffsets 0x5E39D209.
+    std::string lower = car;
+    for (char& c : lower) c = (char)std::tolower((unsigned char)c);
+    const std::wstring global = gameFolder + L"\\GLOBAL";
+    std::vector<float> offsets, compression;
+    std::string error;
+    if (gamelook::ReadVltArray(global, 0xA5B543B7u, gamelook::VltHash(lower), 0x5E39D209u, offsets, error) && offsets.size() >= 16) {
+        std::copy(offsets.begin(), offsets.begin() + 16, setup.offsets);
+        setup.wheels = setup.offsets[3] > 0.05f && setup.offsets[7] > 0.05f && setup.offsets[11] > 0.05f && setup.offsets[15] > 0.05f;
+        if (gamelook::ReadVltArray(global, 0xA5B543B7u, gamelook::VltHash(lower), gamelook::VltHash("FECompressions"),
+                                   compression, error) && compression.size() >= 2)
+            std::copy(compression.begin(), compression.begin() + 2, setup.compression);
+        else
+            LOG_WARN("car %s: no ecar.FECompressions (%s): wheel centres at TireOffsets.Z", car.c_str(), error.c_str());
+    }
+    if (!setup.wheels) LOG_WARN("car %s: no ecar.TireOffsets (%s): no wheels", car.c_str(), error.c_str());
+    else
+        LOG_INFO("car %s: wheels FL %.2f %.2f %.2f r %.2f, RL %.2f %.2f %.2f r %.2f, compression %.2f %.2f", car.c_str(),
+                 setup.offsets[0], setup.offsets[1], setup.offsets[2], setup.offsets[3], setup.offsets[12], setup.offsets[13],
+                 setup.offsets[14], setup.offsets[15], setup.compression[0], setup.compression[1]);
+    return setup;
+}
+
+} // namespace
+
+std::string CarPaintName(u32 hash) {
+    char name[32];
+    std::snprintf(name, sizeof name, "FRS_PAINT_%08X", hash);
+    return name;
+}
+
+nfs::World::NewModel* CarModelOf(nfs::World& world, u32 hash) {
+    for (auto& entry : world.newModels)
+        if (entry.hash == hash && !entry.car.empty()) return &entry;
+    return nullptr;
+}
+
+bool StageCarModel(nfs::World& world, const std::wstring& gameFolder, const nfs::World::NewModel& entry,
+                   std::wstring& error) {
+    size_t index = SIZE_MAX;
+    if (!SectionNumbered(world, entry.section, &index)) {
+        error = L"section " + std::to_wstring(entry.section) + L" is not loaded";
+        return false;
+    }
+    if (StringHash(entry.name) != entry.hash) { error = L"the car model's hash is not its name's"; return false; }
+    std::vector<nfs::CarPart> parts;
+    if (!nfs::ReadCarParts(gameFolder, entry.car, 'B', parts, error)) return false;
+    CarBuilt built;
+    // FRS_CAR_PAINT_TEST=<a GlobalB light material, e.g. METPAINTBLUE>: the paint strips name that one, always
+    // loaded by the game, instead of the car's own 0x135200 -- tells a section chunk not found from a draw
+    // that ignores the light material (21/11 in-game test: the paint did not show).
+    u32 paintHash = StringHash(CarPaintName(entry.hash));
+    char test[64] = {};
+    if (::GetEnvironmentVariableA("FRS_CAR_PAINT_TEST", test, sizeof test) && test[0]) {
+        paintHash = StringHash(test);
+        LOG_WARN("car %s: paint strips name the game's light material %s (FRS_CAR_PAINT_TEST)", entry.name.c_str(), test);
+    }
+    std::vector<nfs::CarTexture> carTextures;
+    std::wstring textureWhy;
+    nfs::ReadCarTextures(gameFolder, entry.car, carTextures, textureWhy);
+    CarSetup setup = ReadCarSetup(gameFolder, entry.car, carTextures);
+    const auto skin = std::find_if(carTextures.begin(), carTextures.end(), [&](const nfs::CarTexture& c) {
+        return c.texture.hash == StringHash(entry.car + "_SKIN1");
+    });
+    if (skin != carTextures.end() && skin->header.size() >= 0x10) {
+        char name[32];
+        std::snprintf(name, sizeof name, "FRS_SKIN_%08X", entry.hash);
+        setup.skin = skin->texture.hash;
+        setup.paintedSkin = StringHash(name);
+        built.skinPixels = skin->pixels;
+        built.skinHeader = skin->header;
+        Write<u32>(built.skinHeader.data() + 0x0C, setup.paintedSkin);
+        built.skin = skin->texture;
+        built.skin.name = name;
+        built.skin.hash = setup.paintedSkin;
+    } else {
+        LOG_WARN("car %s: no %s_SKIN1 in its pack: the paint is not shown in the game", entry.car.c_str(), entry.car.c_str());
+    }
+    if (!BuildCarNode(parts, entry.name, paintHash, setup, built, error)) return false;
+    std::vector<u8> bytes;
+    Emit(bytes, { built.node }, 0);
+    nfs::SolidObject model;
+    if (!ParseModel(bytes, 0, model) || model.hash != entry.hash || model.vertices.empty()) {
+        error = L"the car model does not read back";
+        return false;
+    }
+
+    // The textures it draws with that the region does not have, from the car's packs.
+    std::vector<u32> shipped;
+    for (u32 h : LoadedWith(*world.Loaded()[index]))
+        if (!NewModelOf(world, h)) shipped.push_back(h);
+    u32 like = 0;
+    for (const u32 t : SectionTextures(world, shipped))
+        if (!NewTextureOf(world, t) && !TextureHosts(world, t).empty()) { like = t; break; }
+    size_t copied = 0, missing = 0;
+    for (const u32 t : model.textureHashes) {
+        if (world.FindTexture(t)) continue;
+        const auto car = std::find_if(carTextures.begin(), carTextures.end(),
+                                      [&](const nfs::CarTexture& c) { return c.texture.hash == t; });
+        std::wstring why;
+        if (car == carTextures.end() || !like || !StageCarTexture(world, car->texture, car->header, like, why)) {
+            ++missing;   // GlobalB's car textures are loaded by the game everywhere
+            continue;
+        }
+        ++copied;
+    }
+
+    const size_t vertices = model.vertices.size(), triangles = model.indices.size() / 3;
+    world.AddModel(index, std::move(model));
+    CarBuilt& stored = CarsBuilt()[entry.hash] = std::move(built);
+    stored.skinLike = like;
+    if (stored.skin.hash && like) {   // the view's copy, untinted, in the first host's pack in memory
+        stored.skin.pixels = { stored.skinPixels.data(), stored.skinPixels.size() };
+        const std::vector<const nfs::LoadedSection*> hosts = TextureHosts(world, like);
+        for (size_t i = 0; i < world.Loaded().size() && !hosts.empty(); ++i)
+            if (world.Loaded()[i].get() == hosts.front() && !world.Loaded()[i]->texturePacks.empty())
+                world.MutableLoaded(i)->texturePacks.front()->Add(stored.skin);
+    }
+    auto& list = world.newModels;
+    list.erase(std::remove_if(list.begin(), list.end(), [&](const auto& m) { return m.hash == entry.hash; }), list.end());
+    list.push_back(entry);
+    world.MutableLoaded(index)->placementsChanged = true;
+    ShowCarPaint(world, entry.hash);
+    LOG_INFO("car %s staged as %s %08X in section %u: %zu parts, %zu vertices, %zu triangles, %zu textures copied, "
+             "%zu not in its packs", entry.car.c_str(), entry.name.c_str(), entry.hash, entry.section, parts.size(),
+             vertices, triangles, copied, missing);
+    return true;
+}
+
+void ShowCarPaint(nfs::World& world, u32 hash) {
+    const nfs::World::NewModel* entry = CarModelOf(world, hash);
+    const auto built = CarsBuilt().find(hash);
+    nfs::SolidObject* model = const_cast<nfs::SolidObject*>(world.FindModel(hash));
+    if (!entry || built == CarsBuilt().end() || !model) return;
+    float rgb[3];
+    nfs::HlsToRgb(entry->hue, entry->lightness, entry->saturation, rgb);
+    const u32 colour = 0xFF000000u | (u32)std::lround(rgb[0] * 255) << 16 | (u32)std::lround(rgb[1] * 255) << 8 |
+                       (u32)std::lround(rgb[2] * 255);
+    for (const size_t m : built->second.painted) {
+        if (m >= model->materials.size()) continue;
+        const nfs::SolidMaterial& material = model->materials[m];
+        for (u32 i = material.firstIndex; i < material.firstIndex + material.indexCount && i < model->indices.size(); ++i)
+            if (model->indices[i] < model->vertices.size()) model->vertices[model->indices[i]].color = colour;
+    }
+}
+
+int CarModelSelfTest(const std::wstring& gameFolder, const std::string& car, const std::wstring& outFile) {
+    nfs::ActiveGame() = nfs::Game::World;   // the chunk alignments (no region opened it)
+    const std::string name = "FRS_" + car + "_1";
+    const u32 hash = StringHash(name);
+    std::wstring why;
+    std::vector<nfs::CarPart> parts;
+    CarBuilt built;
+    std::vector<nfs::CarTexture> textures;
+    nfs::ReadCarTextures(gameFolder, car, textures, why);
+    if (!nfs::ReadCarParts(gameFolder, car, 'B', parts, why) ||
+        !BuildCarNode(parts, name, StringHash(CarPaintName(hash)), ReadCarSetup(gameFolder, car, textures), built, why)) {
+        LOG_ERROR("cars selftest %s: %S", car.c_str(), why.c_str());
+        return 1;
+    }
+    std::vector<u8> bytes;
+    const float rgb[3] = { 0.9f, 0.1f, 0.1f };
+    const std::vector<u8> paint = nfs::CarPaintMaterial(CarPaintName(hash), rgb, true, false);
+    bytes.resize(8);
+    Write<u32>(bytes.data(), 0x00135200u);
+    Write<u32>(bytes.data() + 4, (u32)paint.size());
+    bytes.insert(bytes.end(), paint.begin(), paint.end());
+    const size_t at = bytes.size(), object = 384;   // a chunk 0 pads the object to a 16-aligned offset
+    bytes.resize(object, 0);
+    Write<u32>(bytes.data() + at + 4, (u32)(object - at - 8));
+    std::vector<u8> objectBytes;
+    Emit(objectBytes, { built.node }, object);
+    bytes.insert(bytes.end(), objectBytes.begin(), objectBytes.end());
+    nfs::SolidObject model;
+    const bool back = ParseModel(objectBytes, object, model) && model.hash == hash && !model.vertices.empty();
+    size_t found = 0;
+    for (u32 t : model.textureHashes)
+        found += std::any_of(textures.begin(), textures.end(), [&](const nfs::CarTexture& c) { return c.texture.hash == t; });
+    LOG_INFO("cars selftest %s: %zu parts, %zu materials (%zu painted), %zu vertices, %zu triangles, %zu textures "
+             "(%zu in its packs, %zu read), read back %s", car.c_str(), parts.size(), model.materials.size(),
+             built.painted.size(), model.vertices.size(), model.indices.size() / 3, model.textureHashes.size(), found,
+             textures.size(), back ? "yes" : "NO");
+    std::ofstream out(outFile, std::ios::binary);
+    out.write((const char*)bytes.data(), (std::streamsize)bytes.size());
+    return back && out ? 0 : 1;
+}
+
+void StageCarPaintTextures(nfs::World& world) {
+    for (const auto& entry : world.newModels) {
+        if (entry.car.empty() || !ModelPlaced(world, entry.hash)) continue;
+        const auto built = CarsBuilt().find(entry.hash);
+        if (built == CarsBuilt().end() || !built->second.skin.hash || !built->second.skinLike) continue;
+        const CarBuilt& car = built->second;
+        std::vector<u32> bgra;
+        u32 width = 0, height = 0;
+        if (!nfs::DecodeTexture(car.skin, 0, bgra, width, height) || width % 4 || height % 4) {
+            LOG_WARN("car %s: its skin does not decode: the paint is not written", entry.name.c_str());
+            continue;
+        }
+        float rgb[3];
+        nfs::HlsToRgb(entry.hue, entry.lightness, entry.saturation, rgb);
+        for (u32& pixel : bgra) {   // BGRA: the skin times the paint, alpha kept
+            const auto channel = [&](int shift, float k) { return (u32)std::lround(((pixel >> shift) & 0xFF) * k) << shift; };
+            pixel = (pixel & 0xFF000000u) | channel(16, rgb[0]) | channel(8, rgb[1]) | channel(0, rgb[2]);
+        }
+        NewTexture tinted;
+        TextureFromPixels(car.skin.name, bgra, width, height, tinted);
+        if (tinted.fourcc != car.skin.fourCc) {
+            LOG_WARN("car %s: its skin is %08X, the tinted copy would be %08X: the paint is not written", entry.name.c_str(),
+                     car.skin.fourCc, tinted.fourcc);
+            continue;
+        }
+        auto* texture = const_cast<nfs::World::NewTexture*>(NewTextureOf(world, car.skin.hash));
+        if (!texture) texture = &world.newTextures.emplace_back();
+        texture->hash      = car.skin.hash;
+        texture->like      = car.skinLike;
+        texture->name      = car.skin.name;
+        texture->width     = width;
+        texture->height    = height;
+        texture->mips      = 1;   // the largest level only
+        texture->fourCc    = tinted.fourcc;
+        texture->baseBytes = tinted.baseLevelSize;
+        texture->pixels.assign(tinted.pixels.begin(), tinted.pixels.begin() + tinted.baseLevelSize);
+        texture->header    = car.skinHeader;
+        texture->header[0x31] = 1;
+        Write<u32>(texture->header.data() + 0x1C, tinted.baseLevelSize);
+        Write<u32>(texture->header.data() + 0x4C, tinted.baseLevelSize);
+        texture->fromCar   = true;
+        LOG_INFO("car %s: paint %.0f/%.2f/%.2f written as %s (%ux%u)", entry.name.c_str(), entry.hue, entry.lightness,
+                 entry.saturation, car.skin.name.c_str(), width, height);
+    }
+}
+
+std::vector<u32> CarTexturesInUse(const nfs::World& world) {
+    std::vector<u32> used;
+    for (const auto& entry : world.newModels) {
+        if (entry.car.empty() || !ModelPlaced(world, entry.hash)) continue;
+        if (const nfs::SolidObject* model = world.FindModel(entry.hash))
+            for (const u32 t : model->textureHashes)
+                if (NewTextureOf(world, t)) used.push_back(t);
+    }
+    std::sort(used.begin(), used.end());
+    used.erase(std::unique(used.begin(), used.end()), used.end());
+    return used;
 }
 
 } // namespace io

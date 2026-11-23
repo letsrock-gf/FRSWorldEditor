@@ -1,5 +1,6 @@
 #include "GameLookAttributes.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <functional>
@@ -398,6 +399,80 @@ bool LoadLighting(const std::wstring& globalFolder,
     if (!foundTod) { error = "class timeofdaylighting not found"; return false; }
     if (!foundSun) { error = "class sunandsky not found"; return false; }
     return true;
+}
+
+bool ReadVltArray(const std::wstring& globalFolder, u32 classKey, u32 collectionKey, u32 fieldKey,
+                  std::vector<float>& out, std::string& error) {
+    out.clear();
+    std::wstring path = globalFolder;
+    if (!path.empty() && path.back() != L'\\' && path.back() != L'/') path += L'\\';
+    path += L"attributes.bin";
+    std::ifstream file(path, std::ios::binary);
+    if (!file) { error = "cannot open attributes.bin"; return false; }
+    std::vector<u8> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    ByteSpan all{ bytes.data(), bytes.size() };
+    if (all.read<u32>(0) != kPackMagic) { error = "attributes.bin is not a VPAK pack"; return false; }
+    const u32 numVaults = all.read<u32>(4);
+    for (u32 vi = 0; vi < numVaults; ++vi) {
+        const size_t h = 0x10 + size_t(vi) * 20;
+        const u32 binSize = all.read<u32>(h + 4), vltSize = all.read<u32>(h + 8);
+        const u32 binOff = all.read<u32>(h + 12), vltOff = all.read<u32>(h + 16);
+        if (size_t(binOff) + binSize > all.size || size_t(vltOff) + vltSize > all.size) continue;
+        Vault v;
+        v.bin = all.sub(binOff, binSize);
+        v.vlt = all.sub(vltOff, vltSize);
+        std::string ignored;
+        if (!ParseVault(v, ignored)) continue;
+        const auto cls = v.classes.find(classKey);
+        if (cls == v.classes.end()) continue;
+        const FieldDef* field = nullptr;
+        for (const FieldDef& f : cls->second.fields)
+            if (f.key == fieldKey) field = &f;
+        if (!field || !(field->flags & kFieldArray)) {
+            error = "the field is not an array";
+            return false;
+        }
+        if (!(field->flags & kFieldInLayout)) {
+            // In the collection's entry table: a pointer to {u16 capacity, u16 count, u16 element size, u16 data
+            // offset} then the elements (ecar.FECompressions: 2, 2, 4, 8, two floats; read 21/11).
+            for (u32 key = collectionKey, guard = 0; key && guard < 16; ++guard) {
+                const auto col = std::find_if(v.collections.begin(), v.collections.end(), [&](const CollectionDef& c) {
+                    return c.key == key && v.vlt.read<u32>(c.vltOffset + 4) == classKey;
+                });
+                if (col == v.collections.end()) break;
+                const size_t entries = col->vltOffset + 0x20 + 4 * size_t(col->typesCap);
+                for (u32 i = 0; i < col->numEntries; ++i) {
+                    const size_t e = entries + size_t(i) * 12;
+                    if (v.vlt.read<u32>(e) != fieldKey) continue;
+                    const auto at = v.vltPtr.find(u32(e + 4));
+                    if (at == v.vltPtr.end()) break;
+                    const u16 count = v.bin.read<u16>(at->second + 2), size = v.bin.read<u16>(at->second + 4);
+                    const u16 data = v.bin.read<u16>(at->second + 6);
+                    out = WordsFrom(v.bin, at->second + data, u32(count) * size);
+                    return true;
+                }
+                key = col->parent;
+            }
+            error = "no entry for the field";
+            return false;
+        }
+        for (u32 key = collectionKey, guard = 0; key && guard < 16; ++guard) {
+            const auto col = std::find_if(v.collections.begin(), v.collections.end(), [&](const CollectionDef& c) {
+                return c.key == key && v.vlt.read<u32>(c.vltOffset + 4) == classKey;
+            });
+            if (col == v.collections.end()) break;
+            const auto layout = v.vltPtr.find(u32(col->vltOffset + 28));
+            if (layout != v.vltPtr.end()) {
+                out = WordsFrom(v.bin, layout->second + field->offset + 16, u32(field->maxCount) * field->size);
+                return true;
+            }
+            key = col->parent;
+        }
+        error = "the collection has no layout for the field";
+        return false;
+    }
+    error = "class not found";
+    return false;
 }
 
 } // namespace gamelook

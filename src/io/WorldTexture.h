@@ -49,6 +49,10 @@ std::vector<const nfs::LoadedSection*> TextureHosts(const nfs::World& world, u32
 // Encodes the image `keptFile` (its full path) for a new texture `name` that
 // copies `like`, puts it into the first host's pack in memory (so the view
 // draws it) and records it. Again with the same name replaces it.
+// The texture section (by number) that alone takes a new texture, when the edit list names one; 0 = none named.
+void SetNewTextureHost(u32 hash, u32 section);
+u32 NewTextureHost(u32 hash);
+
 bool StageNewWorldTexture(nfs::World& world, const std::string& name, u32 like, const std::wstring& keptFile,
                           std::wstring& error);
 
@@ -63,6 +67,12 @@ std::vector<const nfs::LoadedSection*> NewTextureHosts(const nfs::World& world, 
 // Its levels as the editor has them loaded (pack and larger levels), at most
 // 512 a side. Again with another `like` adds that one's sections.
 bool StageCopiedWorldTexture(nfs::World& world, u32 hash, u32 like, std::wstring& error);
+
+// A texture of a car's TEXTURES.BIN (nfs/CarGeometry.h) a placed car draws
+// with, the same way: its own header, its levels (at most 512 a side), beside
+// `like`; and into the first host's pack in memory, for the view.
+bool StageCarTexture(nfs::World& world, const nfs::Texture& texture, const std::vector<u8>& header, u32 like,
+                     std::wstring& error);
 
 // Whether a staged new texture names this section as a host.
 bool HostsNewTextures(const nfs::World& world, const nfs::LoadedSection& loaded);

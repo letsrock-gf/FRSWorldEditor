@@ -10,7 +10,9 @@ public static class Post {
 '@
 $bytes = New-Object byte[] 20
 [Buffer]::BlockCopy([single[]]@($X, $Y, $Z, $Yaw, $Pitch), 0, $bytes, 0, 20)
-New-Item -Path 'HKCU:\Software\FRSWorldEditorNFSW' -Force | Out-Null
+# Only when the key is missing: New-Item -Force on an existing registry key replaces it, which wiped Gui's
+# saved view settings, panel sizes and region cameras on 22/11.
+if (-not (Test-Path 'HKCU:\Software\FRSWorldEditorNFSW')) { New-Item -Path 'HKCU:\Software\FRSWorldEditorNFSW' | Out-Null }
 Set-ItemProperty -Path 'HKCU:\Software\FRSWorldEditorNFSW' -Name Camera -Value $bytes -Type Binary
 $h = (Get-Process -Id $ProcessId).MainWindowHandle
 [Post]::PostMessageW($h, 0x0111, [IntPtr]$Command, [IntPtr]::Zero) | Out-Null

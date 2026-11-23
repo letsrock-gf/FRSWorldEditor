@@ -160,6 +160,7 @@ void PropertiesPanel::Show(const View& view) {
                             view.removed == shown_.removed;
     if (sameObject && SameRows(view.rows, shown_.rows, false)) {
         shown_.actions = view.actions;
+        shown_.menu = view.menu;
         return;
     }
 
@@ -248,6 +249,21 @@ void PropertiesPanel::DrawRow(size_t index, IDirect3DDevice9* device) {
     ImGui::SetNextItemWidth(-FLT_MIN);
     const std::string value = Utf8(values_[index]);
 
+    if (numeric && row.maximum > row.minimum) {
+        // A slider: the view follows while it moves, a few times a second.
+        float slid = number;
+        if (ImGui::SliderFloat("##value", &slid, row.minimum, row.maximum, "%.2f", ImGuiSliderFlags_AlwaysClamp)) {
+            wchar_t text[32];
+            ::swprintf_s(text, L"%.4g", slid);
+            values_[index] = text;
+            Fill(buffers_[index], values_[index]);
+            if (ImGui::GetTime() - lastLiveCommit_ > 0.15) { lastLiveCommit_ = ImGui::GetTime(); Commit(index); }
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) Commit(index);
+        if (ImGui::IsItemHovered()) hoverHelp_ = row.description;
+        ImGui::PopID();
+        return;
+    }
     if (row.editable && !row.choices.empty()) {
         if (row.preview)
             if (void* picture = Picture(device, values_[index], kCellPicture)) {
@@ -404,6 +420,15 @@ void PropertiesPanel::Draw(IDirect3DDevice9* device) {
         ImGui::End();
         return;
     }
+    // Right after Begin the last item is the window's tab (docked) or title
+    // bar; the heading below opens the same menu.
+    const auto contextMenu = [&](const char* id) {
+        if (shown_.menu.empty() || !ImGui::BeginPopupContextItem(id)) return;
+        for (const View::MenuItem& item : shown_.menu)
+            if (ImGui::MenuItem(Utf8(item.label).c_str(), nullptr, false, item.enabled)) Post(item.command);
+        ImGui::EndPopup();
+    };
+    contextMenu("##properties-tab");
     const ImGuiStyle& style = ImGui::GetStyle();
     hoverHelp_.clear();
 
@@ -415,6 +440,7 @@ void PropertiesPanel::Draw(IDirect3DDevice9* device) {
     ImGui::TextUnformatted(heading.c_str());
     ImGui::PopTextWrapPos();
     ImGui::PopFont();
+    contextMenu("##properties-heading");
     ImGui::SameLine(ImGui::GetContentRegionMax().x - switches);
     const auto toggle = [&](const char* icon, bool on, const char* tip) {
         if (on) ImGui::PushStyleColor(ImGuiCol_Button, style.Colors[ImGuiCol_HeaderActive]);

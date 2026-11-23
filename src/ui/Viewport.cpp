@@ -180,11 +180,14 @@ LRESULT Viewport::Handle(UINT message, WPARAM wParam, LPARAM lParam) {
                 u32 section = 0;
                 int placement = -1;
                 Mat4 transform;
-                gizmoHot_ = GizmoTarget(section, placement, transform)
-                                ? GizmoHit(gizmoMode_, { transform.m[3][0], transform.m[3][1], transform.m[3][2] },
-                                           CurrentGizmoView(), (float)GET_X_LPARAM(lParam),
-                                           (float)GET_Y_LPARAM(lParam))
-                                : kGizmoNone;
+                if (GizmoTarget(section, placement, transform)) {
+                    GizmoView view = CurrentGizmoView();
+                    SetGizmoFrame(view, transform);
+                    gizmoHot_ = GizmoHit(gizmoMode_, { transform.m[3][0], transform.m[3][1], transform.m[3][2] },
+                                         view, (float)GET_X_LPARAM(lParam), (float)GET_Y_LPARAM(lParam));
+                } else {
+                    gizmoHot_ = kGizmoNone;
+                }
             }
             if (looking_) {
                 POINT cursor;
@@ -504,7 +507,7 @@ void Viewport::Tick(float deltaSeconds) {
         Mat4 transform;
         const bool show = GizmoTarget(section, placement, transform);
         renderer_.SetGizmo(show, gizmoMode_, { transform.m[3][0], transform.m[3][1], transform.m[3][2] },
-                           gizmoActive_ != kGizmoNone ? gizmoActive_ : gizmoHot_);
+                           gizmoActive_ != kGizmoNone ? gizmoActive_ : gizmoHot_, transform);
     }
 
     // A dialog opened from inside a frame would paint the view again while
@@ -1146,7 +1149,9 @@ bool Viewport::BeginGizmoDrag(int x, int y) {
     Mat4 transform;
     if (!GizmoTarget(section, placement, transform)) return false;
     const Vec3 origin{ transform.m[3][0], transform.m[3][1], transform.m[3][2] };
-    const int handle = GizmoHit(gizmoMode_, origin, CurrentGizmoView(), (float)x, (float)y);
+    GizmoView frameView = CurrentGizmoView();
+    SetGizmoFrame(frameView, transform);
+    const int handle = GizmoHit(gizmoMode_, origin, frameView, (float)x, (float)y);
     if (handle == kGizmoNone) return false;
     // A point only turns about the vertical and has no size.
     if (placement == kGizmoPoint &&
@@ -1162,7 +1167,7 @@ bool Viewport::BeginGizmoDrag(int x, int y) {
 
     const Ray ray = RayAt(x, y);
     gizmoAxisStart_ = 0.0f;
-    if (gizmoMode_ == GizmoMode::Move) {
+    if (gizmoMode_ == GizmoMode::Move && handle != kGizmoFree) {
         if (handle == kGizmoCentre ? !OnGround(ray, origin.z, gizmoPlaneStart_)
                                    : !ClosestOnAxis(origin, GizmoAxis(handle), ray, gizmoAxisStart_))
             return false;
@@ -1195,6 +1200,8 @@ void Viewport::UpdateGizmoDrag(int x, int y, bool fine) {
     // pointer of its own, which covers a tenth of the mouse's way while the
     // key is down. Pressing or letting go of it in mid-drag makes no jump,
     // since only the way from here on is scaled.
+    // Ctrl scales all three axes alike (Shift stays the fine adjustment).
+    const bool uniform = gizmoMode_ == GizmoMode::Scale && (::GetKeyState(VK_CONTROL) & 0x8000);
     const float pace = fine ? 0.1f : 1.0f;
     gizmoPointer_.x += ((float)x - gizmoMouseLast_.x) * pace;
     gizmoPointer_.y += ((float)y - gizmoMouseLast_.y) * pace;
@@ -1204,7 +1211,50 @@ void Viewport::UpdateGizmoDrag(int x, int y, bool fine) {
     if (gizmoMode_ == GizmoMode::Move) {
         const Ray ray = RayThrough(pointerX, pointerY);
         Vec3 position = origin;
-        if (gizmoActive_ == kGizmoCentre) {
+        if (gizmoActive_ == kGizmoFree) {
+            // The object's origin follows what is under the pointer (itself
+            // left out), held softly by the nearest vertex, then edge, of the
+            // triangle hit; over nothing it slides at its own height.
+            if (gizmoPlacement_ >= 0 || IsNativeHandle(gizmoPlacement_))
+                renderer_.SetPickExclusion(gizmoSection_, gizmoPlacement_);
+            PickResult hit;
+            const bool found = renderer_.Pick(ray, hit);
+            renderer_.SetPickExclusion(0, -1);
+            if (found) {
+                position = ray.origin + ray.direction * hit.distance;
+                const GizmoView view = CurrentGizmoView();
+                const Vec2 mouse{ pointerX, pointerY };
+                Vec2 p[3];
+                bool all = true;
+                for (int k = 0; k < 3; ++k) all = all && GizmoProject(view, hit.triangle[k], p[k]);
+                if (all) {
+                    const auto distance = [](const Vec2& a, const Vec2& b) { return std::hypot(a.x - b.x, a.y - b.y); };
+                    int vertex = -1;
+                    float best = 14.0f;
+                    for (int k = 0; k < 3; ++k)
+                        if (distance(mouse, p[k]) < best) { best = distance(mouse, p[k]); vertex = k; }
+                    if (vertex >= 0) {
+                        position = hit.triangle[vertex];
+                    } else {
+                        best = 8.0f;
+                        for (int k = 0; k < 3; ++k) {
+                            const Vec2 a = p[k], b = p[(k + 1) % 3];
+                            const Vec2 ab{ b.x - a.x, b.y - a.y };
+                            const float length2 = ab.x * ab.x + ab.y * ab.y;
+                            if (length2 < 1e-6f) continue;
+                            const float t = std::clamp(((mouse.x - a.x) * ab.x + (mouse.y - a.y) * ab.y) / length2, 0.0f, 1.0f);
+                            const Vec2 on{ a.x + ab.x * t, a.y + ab.y * t };
+                            if (distance(mouse, on) < best) {
+                                best = distance(mouse, on);
+                                position = hit.triangle[k] + (hit.triangle[(k + 1) % 3] - hit.triangle[k]) * t;
+                            }
+                        }
+                    }
+                }
+            } else if (!OnGround(ray, origin.z, position)) {
+                return;
+            }
+        } else if (gizmoActive_ == kGizmoCentre) {
             // The square moves on both ground axes at once and keeps the
             // height, as Blender's plane handle does: the object follows the
             // pointer and nothing else. Dropping it onto whatever lay under
@@ -1251,15 +1301,40 @@ void Viewport::UpdateGizmoDrag(int x, int y, bool fine) {
             change = AxisRotation(axis, angle);
         } else {
             // Scale by how much nearer to or further from the centre the
-            // pointer is than where the grab began; one factor on all three
-            // axes, as the game's placements are scaled.
-            const float from = std::max(4.0f, std::sqrt(x0 * x0 + y0 * y0));
-            const float to = std::max(1.0f, std::sqrt(x1 * x1 + y1 * y1));
-            const float startScale = Length(Vec3{ gizmoStart_.m[0][0], gizmoStart_.m[0][1], gizmoStart_.m[0][2] });
-            const float factor = std::clamp(startScale * to / from, 0.05f, 3.9f) / std::max(1e-4f, startScale);
-            change = Mat4::Identity();
-            change.m[0][0] = change.m[1][1] = change.m[2][2] = factor;
+            // pointer is than where the grab began. An axis handle measures
+            // along that axis on screen and scales the object's own axis;
+            // the middle box, or Shift, scales all three alike.
+            float from = std::max(4.0f, std::sqrt(x0 * x0 + y0 * y0));
+            float to = std::max(1.0f, std::sqrt(x1 * x1 + y1 * y1));
+            int axis = -1;
+            if (gizmoActive_ >= 0 && gizmoActive_ < 3) {
+                GizmoView frameView = view;
+                SetGizmoFrame(frameView, gizmoStart_);
+                Vec2 end;
+                if (GizmoProject(frameView, origin + frameView.axes[gizmoActive_] * GizmoSize(origin, frameView), end)) {
+                    Vec2 d{ end.x - centre.x, end.y - centre.y };
+                    const float length = std::hypot(d.x, d.y);
+                    if (length > 1.0f) {
+                        d = { d.x / length, d.y / length };
+                        from = std::max(4.0f, x0 * d.x + y0 * d.y);
+                        to = std::max(1.0f, x1 * d.x + y1 * d.y);
+                    }
+                }
+                if (!uniform) axis = gizmoActive_;
+            }
+            float factors[3];
+            for (int row = 0; row < 3; ++row) {
+                const float startScale = Length(Vec3{ gizmoStart_.m[row][0], gizmoStart_.m[row][1], gizmoStart_.m[row][2] });
+                factors[row] = (axis < 0 || axis == row)
+                                   ? std::clamp(startScale * to / from, 0.05f, 3.9f) / std::max(1e-4f, startScale)
+                                   : 1.0f;
+            }
+            // Rows are the object's own axes: each takes its own factor.
+            for (int row = 0; row < 3; ++row)
+                for (int column = 0; column < 3; ++column)
+                    transform.m[row][column] = gizmoStart_.m[row][column] * factors[row];
         }
+        if (gizmoMode_ == GizmoMode::Rotate)
         for (int row = 0; row < 3; ++row) {
             const Vec3 r{ gizmoStart_.m[row][0], gizmoStart_.m[row][1], gizmoStart_.m[row][2] };
             for (int column = 0; column < 3; ++column)

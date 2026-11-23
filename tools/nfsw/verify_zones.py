@@ -78,14 +78,19 @@ else:
     print("   (no L5RA.HOT written)")
 
 zlines = {}
+manual = {}   # ZM: widened by hand; a Z outline of the same zone (the bake's) replaces it
 alines = []
 for line in open(os.path.join(out, "frs-original", "L5RA-edits.txt")):
     w = line.split()
     if w and w[0] == "Z":
         zlines.setdefault(int(w[1]), []).append((float(w[2]), float(w[3])))
+    elif w and w[0] == "ZM":
+        manual.setdefault(int(w[1]), []).append((float(w[2]), float(w[3])))
     elif w and w[0] == "A" and w[5] == "-1":
         f = [float(x) for x in w[11:23]]
         alines.append([(f[i], f[i + 1]) for i in range(0, 12, 3)])
+for sec, pts in manual.items():
+    zlines.setdefault(sec, pts)
 _, _, _, srecs, _ = zones(ship)
 sby = {sec: raw for sec, cnt, raw in srecs}
 same = sum(1 for sec, cnt, raw in recs if sec not in zlines and sby.get(sec) == raw)

@@ -23,6 +23,7 @@
 #include "imgui.h"
 #include "imgui_internal.h"
 
+#include <unordered_map>
 #include <commctrl.h>
 
 #include <algorithm>
@@ -533,13 +534,22 @@ void MainWindow::UpdateShellDrag() {
     if (libDragging_) EndLibraryDrag(overMap);
 }
 
+// The Edits panel's copy of the list is read again when this is set (see DrawShellEdits).
+// ponytail: an edit swapped for another without the count changing shows its old text until Refresh; give the
+// native list a change counter if that ever confuses.
+static bool shellEditsStale = true;
+
 void MainWindow::DrawShellEdits() {
     HWND list = edits_.ListHandle();
-    if (ImGui::Button(ICON_PH_ARROW_COUNTER_CLOCKWISE "  Revert ticked"))
+    if (ImGui::Button(ICON_PH_ARROW_COUNTER_CLOCKWISE "  Revert ticked")) {
         ::PostMessageW(window_, WM_COMMAND, MAKEWPARAM(IDC_EDITS_REVERT, BN_CLICKED), 0);
+        shellEditsStale = true;
+    }
     ImGui::SameLine();
-    if (ImGui::Button(ICON_PH_ARROWS_CLOCKWISE "  Refresh"))
+    if (ImGui::Button(ICON_PH_ARROWS_CLOCKWISE "  Refresh")) {
         ::PostMessageW(window_, WM_COMMAND, MAKEWPARAM(IDC_EDITS_REFRESH, BN_CLICKED), 0);
+        shellEditsStale = true;
+    }
     if (!list) return;
 
     HWND header = (HWND)::SendMessageW(list, LVM_GETHEADER, 0, 0);
@@ -573,13 +583,30 @@ void MainWindow::DrawShellEdits() {
     // One group per kind of change (the Change column), in the order they
     // first appear. A group's line runs the whole width, over the columns;
     // its box ticks or clears every edit in it.
+    // The groups and the ticks are read from the list when it changes size, when a tick is set here or Refresh
+    // is pressed (nothing else ticks a row: the native list is hidden); the rows are read only while in view. Read whole on every frame, a
+    // list of 28 000 edits (a converted city) cost 800 ms a frame and the editor ran at under 2 fps (22/11).
     const int kindColumn = columns > 1 ? 1 : 0;
-    std::vector<std::pair<std::string, std::vector<int>>> groups;
-    for (int i = 0; i < items; ++i) {
-        const std::string kind = cellText(i, kindColumn);
-        auto found = std::find_if(groups.begin(), groups.end(), [&](const auto& g) { return g.first == kind; });
-        if (found == groups.end()) groups.push_back({ kind, { i } });
-        else found->second.push_back(i);
+    static std::vector<std::pair<std::string, std::vector<int>>> groups;
+    static std::vector<char> tickedNow;
+    static int readItems = -1;
+    bool& stale = shellEditsStale;
+    if (stale || items != readItems) {
+        const bool regroup = stale || items != readItems;
+        if (regroup) {
+            groups.clear();
+            std::unordered_map<std::string, size_t> byKind;
+            for (int i = 0; i < items; ++i) {
+                const std::string kind = cellText(i, kindColumn);
+                const auto [at, fresh] = byKind.try_emplace(kind, groups.size());
+                if (fresh) groups.push_back({ kind, {} });
+                groups[at->second].second.push_back(i);
+            }
+        }
+        tickedNow.resize((size_t)items);
+        for (int i = 0; i < items; ++i) tickedNow[(size_t)i] = isTicked(i) ? 1 : 0;
+        readItems = items;
+        stale = false;
     }
 
     // The rows of every group are tables with one id, so their columns keep
@@ -609,13 +636,15 @@ void MainWindow::DrawShellEdits() {
     if (beginRows(true)) ImGui::EndTable();
     for (const auto& [kind, rows] : groups) {
         size_t tickedCount = 0;
-        for (int i : rows) tickedCount += isTicked(i) ? 1 : 0;
+        for (int i : rows) tickedCount += tickedNow[(size_t)i] ? 1 : 0;
         ImGui::PushID(("group" + kind).c_str());
         bool all = tickedCount == rows.size();
         const bool mixed = tickedCount > 0 && !all;
         if (mixed) ImGui::PushItemFlag(ImGuiItemFlags_MixedValue, true);
-        if (ImGui::Checkbox("##group", &all))
+        if (ImGui::Checkbox("##group", &all)) {
             for (int i : rows) setTicked(i, mixed ? true : all);
+            stale = true;
+        }
         if (mixed) ImGui::PopItemFlag();
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Tick every \"%s\" edit, to revert them together", kind.c_str());
         ImGui::SameLine();
@@ -626,18 +655,22 @@ void MainWindow::DrawShellEdits() {
                                             "%s", label.c_str());
         ImGui::PopID();
         if (!open || !beginRows(false)) continue;
-        for (int i : rows) {
-            ImGui::TableNextRow();
-            ImGui::PushID(i);
-            ImGui::TableSetColumnIndex(0);
-            bool ticked = isTicked(i);
-            if (ImGui::Checkbox("##tick", &ticked)) setTicked(i, ticked);
-            for (int c = 0; c < columns; ++c) {
-                ImGui::TableSetColumnIndex(c + 1);
-                ImGui::TextUnformatted(cellText(i, c).c_str());
+        ImGuiListClipper clipper;
+        clipper.Begin((int)rows.size());
+        while (clipper.Step())
+            for (int r = clipper.DisplayStart; r < clipper.DisplayEnd; ++r) {
+                const int i = rows[(size_t)r];
+                ImGui::TableNextRow();
+                ImGui::PushID(i);
+                ImGui::TableSetColumnIndex(0);
+                bool ticked = isTicked(i);
+                if (ImGui::Checkbox("##tick", &ticked)) { setTicked(i, ticked); stale = true; }
+                for (int c = 0; c < columns; ++c) {
+                    ImGui::TableSetColumnIndex(c + 1);
+                    ImGui::TextUnformatted(cellText(i, c).c_str());
+                }
+                ImGui::PopID();
             }
-            ImGui::PopID();
-        }
         ImGui::EndTable();
     }
     ImGui::EndChild();

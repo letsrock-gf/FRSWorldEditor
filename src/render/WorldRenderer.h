@@ -67,6 +67,7 @@ struct PickResult {
     Aabb        worldBounds;
     float       distance = 0.0f;
     bool        fromInstance = false;   // placed by scenery rather than its own matrix
+    Vec3        triangle[3];            // the triangle hit, in world space
 
     // Where the mesh lives on the GPU, so the selection can be painted rather
     // than merely boxed. Indices rather than pointers: a region reload rebuilds
@@ -493,8 +494,8 @@ public:
     void ReleaseThumbnailTargets();
 
     // The handles over the selected object, drawn over everything else.
-    void SetGizmo(bool visible, GizmoMode mode, const Vec3& origin, int hot) {
-        gizmoVisible_ = visible; gizmoMode_ = mode; gizmoOrigin_ = origin; gizmoHot_ = hot;
+    void SetGizmo(bool visible, GizmoMode mode, const Vec3& origin, int hot, const Mat4& frame = Mat4::Identity()) {
+        gizmoVisible_ = visible; gizmoMode_ = mode; gizmoOrigin_ = origin; gizmoHot_ = hot; gizmoFrame_ = frame;
     }
 
     // --- MINIMAP PREVIEW (temporary) --------------------------------------
@@ -616,6 +617,7 @@ private:
     bool      gizmoVisible_ = false;
     GizmoMode gizmoMode_ = GizmoMode::Move;
     Vec3      gizmoOrigin_;
+    Mat4      gizmoFrame_ = Mat4::Identity();
     int       gizmoHot_ = kGizmoNone;
     IDirect3DTexture9* thumbTarget_   = nullptr;
     IDirect3DSurface9* thumbDepth_    = nullptr;

@@ -484,11 +484,27 @@ bool CutUnderRaised(const CollisionPolygon& ground, const std::vector<const Coll
     return true;
 }
 
+u32 WorldCollisionArticleIdEnd(ByteSpan whole) {
+    size_t filler = 0;
+    while (filler < 16 && filler < whole.size && whole.data[filler] == 0x11) ++filler;
+    const ByteSpan data = whole.sub(filler, whole.size);
+    if (data.size < 0x30 || data.read<u32>(0x10) != kTagPack || data.read<u32>(0x20) != kTagArticles) return 0;
+    const u32 rowCount = data.read<u32>(0x28);
+    u32 next = 0;
+    for (u32 r = 0; r < rowCount && 0x30 + (size_t)(r + 1) * 16 <= data.size; ++r) {
+        const size_t row = 0x30 + (size_t)r * 16;
+        if ((data.read<u32>(row) >> 16) != kTagArticle) continue;
+        const size_t at = row + data.read<u32>(row + 12);
+        if (at + 16 <= data.size) next = std::max(next, data.read<u32>(at + 12) + 1);
+    }
+    return next;
+}
+
 bool RewriteWorldCollision(ByteSpan whole, const CollisionPack& pack, const std::vector<u32>& removed,
                            const std::vector<CollisionPolygon>& added, size_t& skipped,
                            std::vector<u8>& out, std::wstring& error,
                            const std::vector<CollisionPolygon>& spill, std::vector<u8>* placed,
-                           std::vector<GridEntry>* grown) {
+                           std::vector<GridEntry>* grown, u32* nextArticleId) {
     if (placed) placed->assign(added.size() + spill.size(), 0);
     if (grown) grown->clear();
     const u8* payload = whole.data;
@@ -573,6 +589,9 @@ bool RewriteWorldCollision(ByteSpan whole, const CollisionPack& pack, const std:
     std::vector<std::vector<u32>> newSurfaces(rows.size());
     constexpr u32 kAsphaltSurface = kWorldAsphalt;
     std::vector<u8> instanceBody;
+    // New articles (far polygons, see below), each with its 'ca' row to add.
+    struct Fresh { std::vector<u8> base, strips, barriers, body; std::vector<u32> surfaces; };
+    std::vector<Fresh> fresh;
     {
         const Row& list = rows[(size_t)instanceRow];
         instanceBody.assign(data.data + list.at, data.data + list.at + list.size);
@@ -581,6 +600,129 @@ bool RewriteWorldCollision(ByteSpan whole, const CollisionPack& pack, const std:
         auto article16 = [&](size_t at) { u16 v; std::memcpy(&v, instanceBody.data() + at + 0x1A, 2); return v; };
 
         std::vector<bool> grew(instanceCount, false);
+        // Polygons far from every shipped box: index in `added`, barrier or not,
+        // primitives (game axes), article bytes they cost.
+        struct Homeless { size_t n; bool barrier; std::vector<Vec3> points; size_t cost; };
+        std::vector<Homeless> homeless;
+        // ponytail: 96 m of growth (one grid cell) keeps today's stretched box;
+        // beyond it a new instance. Tune if near ground needs its own boxes too.
+        constexpr float kFar = 96.0f;
+        // Writes one polygon's primitives (game axes) into the article of the instance
+        // at `at` of instanceBody: `article` is that article as it is (its surface
+        // table), the lists what it gets added.
+        auto writeInto = [&](const CollisionPolygon& polygon, bool barrier, bool foreign,
+                             const std::vector<Vec3>& primitives, size_t at, ByteSpan article,
+                             std::vector<u8>& strips, std::vector<u8>& barrierList, std::vector<u32>& more) {
+            const bool shipped = polygon.source != CollisionPolygon::kNoSource;
+            const int pieceCount = (int)primitives.size();
+            const Vec3 shift{ field(at + 0x30), field(at + 0x34), field(at + 0x38) };
+            // Game axes to the article's own: (x, up, z) = (-y, z, x) + shift.
+            float tall = field(at + 0x14), around = field(at + 0x3C);
+            std::vector<Vec3> local((size_t)pieceCount);
+            for (int k = 0; k < pieceCount; ++k) {
+                local[k] = { shift.x - primitives[k].y, primitives[k].z + shift.y, primitives[k].x + shift.z };
+                tall = std::max(tall, std::fabs(local[k].y) + 0.01f);
+                around = std::max(around, std::hypot(local[k].x, local[k].z) + 0.01f);
+            }
+            // The height, and the radius the game tests instances by in plan
+            // round a point (0x6f2570: centre distance < +0x3C + query radius).
+            std::memcpy(instanceBody.data() + at + 0x14, &tall, 4);
+            std::memcpy(instanceBody.data() + at + 0x3C, &around, 4);
+
+            // Its surface: the same hash when the article has it (a shipped
+            // polygon that was moved), else the article's first.
+            const size_t surfaceCount = article.read<u8>(9);
+            const size_t surfaces = 16 + (size_t)article.read<u16>(2) + article.read<u16>(6);
+            u32 hash = 0;
+            std::memcpy(&hash, polygon.attributes, 4);
+            u8 surface = 0;
+            bool known = false;
+            // An added polygon that names a surface of its own (the road
+            // bake's asphalt, concrete, grass: IsWorldSurface) keeps it.
+            const bool named = shipped || IsWorldSurface(hash);
+            for (size_t s = 0; s < surfaceCount; ++s)
+                if (named && article.read<u32>(surfaces + s * 4) == hash) { surface = (u8)s; known = true; }
+            if (!known && !shipped && named) {
+                const auto slot = std::find(more.begin(), more.end(), hash);
+                surface = (u8)(surfaceCount + (size_t)(slot - more.begin()));
+                if (slot == more.end()) more.push_back(hash);
+                known = true;
+            }
+            if (!known || (hash == 0 && !polygon.barrier)) {
+                // Never the null surface (hash 0) on ground that was added, moved
+                // or given another surface: the car's reset behaviour (nfsw.exe
+                // 0x85c7c0 -> 0x858a20) puts a player car back on its last safe
+                // spot as soon as the body and two wheels stand on
+                // SimSurface::kNull, which is how the shipped map fences off
+                // ground it does not want driven on (Set Surface of Selection on
+                // such ground opens it). The article's first surface that is not
+                // null, else asphalt added to its table.
+                // ponytail: first non-null, not the nearest triangle's surface;
+                // pick by neighbour if grip/sound on new ground looks wrong.
+                surface = 0xFF;
+                for (size_t s = 0; s < surfaceCount && surface == 0xFF; ++s)
+                    if (article.read<u32>(surfaces + s * 4) != 0) surface = (u8)s;
+                if (surface == 0xFF) {
+                    const auto slot = std::find(more.begin(), more.end(), kAsphaltSurface);
+                    surface = (u8)(surfaceCount + (size_t)(slot - more.begin()));
+                    if (slot == more.end()) more.push_back(kAsphaltSurface);
+                }
+            }
+            const u8 flags = shipped ? polygon.flags : 0;
+
+            if (barrier) {
+                for (int k = 0; k + 1 < pieceCount; k += 2) {
+                    u8 record[32] = {};
+                    const float plan = std::hypot(local[k + 1].x - local[k].x, local[k + 1].z - local[k].z);
+                    const float inverse = plan > 1e-4f ? 1.0f / plan : 0.0f;
+                    std::memcpy(record, &local[k], 12);
+                    record[12] = surface;
+                    record[13] = polygon.barrier && shipped ? flags : 2;   // 2: what 96 % of the map's carry
+                    std::memcpy(record + 16, &local[k + 1], 12);
+                    std::memcpy(record + 28, &inverse, 4);
+                    // The same record twice is written once. A face and its twin
+                    // (the editor stores upright faces both ways round) come out
+                    // as reversed records -- each blocks on its own front -- so
+                    // both stay and the wall holds from both sides.
+                    std::vector<u8>& list = barrierList;
+                    bool twice = false;
+                    for (size_t r = 0; r + 32 <= list.size() && !twice; r += 32)
+                        twice = std::memcmp(list.data() + r, record, 12) == 0 &&
+                                std::memcmp(list.data() + r + 16, record + 16, 12) == 0;
+                    if (!twice) list.insert(list.end(), record, record + 32);
+                }
+                return;
+            }
+            for (int k = 0; k + 2 < pieceCount; k += 3) {
+                Vec3 a = local[k], b = local[k + 1], c = local[k + 2];
+                // Winding 0 is a strip whose first triangle looks up as stored.
+                if ((b.z - a.z) * (c.x - a.x) - (b.x - a.x) * (c.z - a.z) < 0.0f) std::swap(a, b);
+                const Vec3 centre = (a + b + c) * (1.0f / 3.0f);
+                float reach = 0.0f;
+                bool fits = true;
+                u8 strip[40] = {};
+                std::memcpy(strip, &centre, 12);
+                const Vec3 corner[3] = { a, b, c };
+                for (int v = 0; v < 3; ++v) {
+                    const Vec3 d = corner[v] - centre;
+                    reach = std::max(reach, std::hypot(d.x, d.z));
+                    const float scaled[3] = { d.x * 128.0f, d.y * 128.0f, d.z * 128.0f };
+                    for (int axis = 0; axis < 3; ++axis) {
+                        fits = fits && std::fabs(scaled[axis]) < 32767.0f;
+                        const i16 value = (i16)std::lround(scaled[axis]);
+                        std::memcpy(strip + 16 + v * 8 + axis * 2, &value, 2);
+                    }
+                }
+                if (!fits) { skipped += !foreign; continue; }
+                const u16 radius = (u16)std::min(65535.0f, std::ceil(reach * 16.0f) + 1.0f);
+                std::memcpy(strip + 12, &radius, 2);
+                strip[16 + 6] = 3;                              // vertex 0: the count
+                strip[24 + 6] = polygon.Vertical() ? 2 : 0;     // vertex 1: winding, 2 = both faces
+                strip[32 + 6] = surface;                        // vertex 2: surface and flags
+                strip[32 + 7] = flags;
+                strips.insert(strips.end(), strip, strip + 40);
+            }
+        };
         for (size_t n = 0; n < added.size() + spill.size(); ++n) {
             // `spill`: another pack's ground no box there held whole, cut into ours.
             const bool foreign = n >= added.size();
@@ -708,6 +850,44 @@ bool RewriteWorldCollision(ByteSpan whole, const CollisionPack& pack, const std:
                     jobs.push_back({ (int)i, std::move(pieces) });
                 }
             if (blocked) jobs.clear();
+            // With new instances allowed: what of cut ground lies outside every box
+            // it was cut into goes to an instance of its own (before, only other
+            // packs' boxes could take it, and where none did it was a hole, which a
+            // box stretched for far ground sometimes happened to cover).
+            bool remainder = false;
+            if (nextArticleId && !foreign && !barrier && best < 0 && !jobs.empty()) {
+                std::vector<std::vector<Vec3>> rest;
+                for (int k = 0; k + 2 < count; k += 3) rest.push_back({ points[k], points[k + 1], points[k + 2] });
+                for (const auto& job : jobs) {
+                    const size_t at = (size_t)job.first * kInstanceSize;
+                    const float width = field(at + 0x0C), length = field(at + 0x2C);
+                    const float sx = field(at + 0x30), sz = field(at + 0x38);
+                    const float x0 = -sz - length, x1 = -sz + length, y0 = sx - width, y1 = sx + width;
+                    std::vector<std::vector<Vec3>> next;
+                    for (const std::vector<Vec3>& part : rest) {
+                        std::vector<Vec3> in = part;
+                        for (int side = 0; side < 4 && in.size() >= 3; ++side) {
+                            auto inside = [&](const Vec3& p) {
+                                return side == 0 ? p.x - x0 : side == 1 ? x1 - p.x : side == 2 ? p.y - y0 : y1 - p.y;
+                            };
+                            std::vector<Vec3> outside = ClipHalf(in, [&](const Vec3& p) { return -inside(p); });
+                            // ponytail: 1 cm^2 slivers along box edges are dropped, as in CutUnderRaised.
+                            if (outside.size() >= 3 && PlanArea(outside) > 1e-4f) next.push_back(std::move(outside));
+                            in = ClipHalf(in, inside);
+                        }
+                    }
+                    rest.swap(next);
+                }
+                if (!rest.empty()) {
+                    std::vector<Vec3> pieces;
+                    for (const std::vector<Vec3>& part : rest)
+                        for (size_t v = 1; v + 1 < part.size(); ++v)
+                            for (const Vec3& p : { part[0], part[v], part[v + 1] }) pieces.push_back(p);
+                    const size_t pieceCost = pieces.size() / 3 * 40;
+                    homeless.push_back({ n, false, std::move(pieces), pieceCost });
+                    remainder = true;
+                }
+            }
             // Held by no box (a barrier, or ground outside them all): the nearest
             // box in plan grows to hold it, however far. The grid and the radius
             // follow below (AddToCollisionGrid, +0x3C), so the game reaches it
@@ -717,6 +897,32 @@ bool RewriteWorldCollision(ByteSpan whole, const CollisionPack& pack, const std:
             // listing the grown box reach it.
             // ponytail: one box stretched over the gap; an instance and article of
             // its own when far-away ground fills an article (about 1600 triangles).
+            // Far from every box as shipped (more than kFar of growth), or no box
+            // with room: an instance and article of its own instead (below, after
+            // every polygon is known), when the caller allows new instances.
+            // Measured against the shipped box, so boxes grown by near ground do
+            // not creep outwards polygon by polygon.
+            if (jobs.empty() && !foreign && nextArticleId) {
+                float farthest = 1e30f;
+                bool room = false;
+                for (size_t i = 0; i < instanceCount; ++i) {
+                    if (!usable(i)) continue;
+                    room = room || fits(i);
+                    const size_t at = list.at + i * kInstanceSize;
+                    const float width = data.read<float>(at + 0x0C), length = data.read<float>(at + 0x2C);
+                    const float sx = data.read<float>(at + 0x30), sz = data.read<float>(at + 0x38);
+                    float worst = 0.0f;
+                    for (int k = 0; k < count; ++k)
+                        worst = std::max({ worst, std::fabs(sx - points[k].y) - width,
+                                           std::fabs(points[k].x + sz) - length });
+                    farthest = std::min(farthest, worst);
+                }
+                if (farthest > kFar || !room) {
+                    homeless.push_back({ n, barrier, std::vector<Vec3>(points, points + count), cost });
+                    if (placed) (*placed)[n] = 3;
+                    continue;
+                }
+            }
             if (jobs.empty() && !foreign) {
                 int nearest = -1;
                 float gap = 1e30f;
@@ -745,125 +951,165 @@ bool RewriteWorldCollision(ByteSpan whole, const CollisionPack& pack, const std:
                     jobs.push_back({ nearest, std::vector<Vec3>(points, points + count) });
                 }
             }
-            if (placed) (*placed)[n] = jobs.empty() ? 0 : best >= 0 && !foreign ? 2 : 1;
+            if (placed) (*placed)[n] = jobs.empty() ? 0 : remainder ? 3 : best >= 0 && !foreign ? 2 : 1;
             if (jobs.empty()) { skipped += !foreign; continue; }
             for (const auto& [box, primitives] : jobs) {
                 grew[(size_t)box] = true;
-                const int pieceCount = (int)primitives.size();
                 const size_t at = (size_t)box * kInstanceSize;
                 const size_t row = (size_t)articleRow[article16(at)];
-                const ByteSpan article = data.sub(rows[row].at, rows[row].size);
-                const Vec3 shift{ field(at + 0x30), field(at + 0x34), field(at + 0x38) };
-                // Game axes to the article's own: (x, up, z) = (-y, z, x) + shift.
-                float tall = field(at + 0x14), around = field(at + 0x3C);
-                std::vector<Vec3> local((size_t)pieceCount);
-                for (int k = 0; k < pieceCount; ++k) {
-                    local[k] = { shift.x - primitives[k].y, primitives[k].z + shift.y, primitives[k].x + shift.z };
-                    tall = std::max(tall, std::fabs(local[k].y) + 0.01f);
-                    around = std::max(around, std::hypot(local[k].x, local[k].z) + 0.01f);
-                }
-                // The height, and the radius the game tests instances by in plan
-                // round a point (0x6f2570: centre distance < +0x3C + query radius).
-                std::memcpy(instanceBody.data() + at + 0x14, &tall, 4);
-                std::memcpy(instanceBody.data() + at + 0x3C, &around, 4);
-
-                // Its surface: the same hash when the article has it (a shipped
-                // polygon that was moved), else the article's first.
-                const size_t surfaceCount = article.read<u8>(9);
-                const size_t surfaces = 16 + (size_t)article.read<u16>(2) + article.read<u16>(6);
-                u32 hash = 0;
-                std::memcpy(&hash, polygon.attributes, 4);
-                u8 surface = 0;
-                bool known = false;
-                // An added polygon that names a surface of its own (the road
-                // bake's asphalt, concrete, grass: IsWorldSurface) keeps it.
-                const bool named = shipped || IsWorldSurface(hash);
-                for (size_t s = 0; s < surfaceCount; ++s)
-                    if (named && article.read<u32>(surfaces + s * 4) == hash) { surface = (u8)s; known = true; }
-                if (!known && !shipped && named) {
-                    auto& more = newSurfaces[row];
-                    const auto slot = std::find(more.begin(), more.end(), hash);
-                    surface = (u8)(surfaceCount + (size_t)(slot - more.begin()));
-                    if (slot == more.end()) more.push_back(hash);
-                    known = true;
-                }
-                if (!known || (hash == 0 && !polygon.barrier)) {
-                    // Never the null surface (hash 0) on ground that was added, moved
-                    // or given another surface: the car's reset behaviour (nfsw.exe
-                    // 0x85c7c0 -> 0x858a20) puts a player car back on its last safe
-                    // spot as soon as the body and two wheels stand on
-                    // SimSurface::kNull, which is how the shipped map fences off
-                    // ground it does not want driven on (Set Surface of Selection on
-                    // such ground opens it). The article's first surface that is not
-                    // null, else asphalt added to its table.
-                    // ponytail: first non-null, not the nearest triangle's surface;
-                    // pick by neighbour if grip/sound on new ground looks wrong.
-                    surface = 0xFF;
-                    for (size_t s = 0; s < surfaceCount && surface == 0xFF; ++s)
-                        if (article.read<u32>(surfaces + s * 4) != 0) surface = (u8)s;
-                    if (surface == 0xFF) {
-                        auto& more = newSurfaces[row];
-                        const auto slot = std::find(more.begin(), more.end(), kAsphaltSurface);
-                        surface = (u8)(surfaceCount + (size_t)(slot - more.begin()));
-                        if (slot == more.end()) more.push_back(kAsphaltSurface);
-                    }
-                }
-                const u8 flags = shipped ? polygon.flags : 0;
-
-                if (barrier) {
-                    for (int k = 0; k + 1 < pieceCount; k += 2) {
-                        u8 record[32] = {};
-                        const float plan = std::hypot(local[k + 1].x - local[k].x, local[k + 1].z - local[k].z);
-                        const float inverse = plan > 1e-4f ? 1.0f / plan : 0.0f;
-                        std::memcpy(record, &local[k], 12);
-                        record[12] = surface;
-                        record[13] = polygon.barrier && shipped ? flags : 2;   // 2: what 96 % of the map's carry
-                        std::memcpy(record + 16, &local[k + 1], 12);
-                        std::memcpy(record + 28, &inverse, 4);
-                        // The same record twice is written once. A face and its twin
-                        // (the editor stores upright faces both ways round) come out
-                        // as reversed records -- each blocks on its own front -- so
-                        // both stay and the wall holds from both sides.
-                        std::vector<u8>& list = newBarriers[row];
-                        bool twice = false;
-                        for (size_t r = 0; r + 32 <= list.size() && !twice; r += 32)
-                            twice = std::memcmp(list.data() + r, record, 12) == 0 &&
-                                    std::memcmp(list.data() + r + 16, record + 16, 12) == 0;
-                        if (!twice) list.insert(list.end(), record, record + 32);
-                    }
-                    continue;
-                }
-                for (int k = 0; k + 2 < pieceCount; k += 3) {
-                    Vec3 a = local[k], b = local[k + 1], c = local[k + 2];
-                    // Winding 0 is a strip whose first triangle looks up as stored.
-                    if ((b.z - a.z) * (c.x - a.x) - (b.x - a.x) * (c.z - a.z) < 0.0f) std::swap(a, b);
-                    const Vec3 centre = (a + b + c) * (1.0f / 3.0f);
-                    float reach = 0.0f;
-                    bool fits = true;
-                    u8 strip[40] = {};
-                    std::memcpy(strip, &centre, 12);
-                    const Vec3 corner[3] = { a, b, c };
-                    for (int v = 0; v < 3; ++v) {
-                        const Vec3 d = corner[v] - centre;
-                        reach = std::max(reach, std::hypot(d.x, d.z));
-                        const float scaled[3] = { d.x * 128.0f, d.y * 128.0f, d.z * 128.0f };
-                        for (int axis = 0; axis < 3; ++axis) {
-                            fits = fits && std::fabs(scaled[axis]) < 32767.0f;
-                            const i16 value = (i16)std::lround(scaled[axis]);
-                            std::memcpy(strip + 16 + v * 8 + axis * 2, &value, 2);
-                        }
-                    }
-                    if (!fits) { skipped += !foreign; continue; }
-                    const u16 radius = (u16)std::min(65535.0f, std::ceil(reach * 16.0f) + 1.0f);
-                    std::memcpy(strip + 12, &radius, 2);
-                    strip[16 + 6] = 3;                              // vertex 0: the count
-                    strip[24 + 6] = polygon.Vertical() ? 2 : 0;     // vertex 1: winding, 2 = both faces
-                    strip[32 + 6] = surface;                        // vertex 2: surface and flags
-                    strip[32 + 7] = flags;
-                    newStrips[row].insert(newStrips[row].end(), strip, strip + 40);
-                }
+                writeInto(polygon, barrier, foreign, primitives, at, data.sub(rows[row].at, rows[row].size),
+                          newStrips[row], newBarriers[row], newSurfaces[row]);
             }
         }
+
+        // --- far polygons: instances and articles of their own -------------------
+        // Clustered by the grid's 96 m cells (collision axes, by centre): a block
+        // of 2 x 2 cells per article when it fits, else one cell, else a cell's
+        // polygons in runs that fit. Each cluster gets an identity-rotation
+        // instance whose box is its content (shipped: local extent = half width /
+        // height / length, radius = hypot(width, length) for all 10 524), its
+        // fields otherwise copied from the pack's nearest shipped instance (+0x10
+        // is a query stamp the game overwrites, 0x6f2570; +0x12 / +0x18 are 0).
+        size_t farTotal = homeless.size(), farLeft = 0;
+        if (!homeless.empty()) {
+            constexpr size_t kBudget = 0xFFFF - 0x1000;   // per article, strip bytes and barrier bytes, as above
+            constexpr size_t kSurfaceRoom = 0xF0;
+            // ponytail: shipped packs hold at most 81 instances and 110 864 bytes;
+            // no game limit was found (key and article index are u16), so these
+            // ceilings are ours. Raise only after the game has loaded a pack this big.
+            constexpr size_t kMaxInstances = 1024, kMaxPackBytes = 16u << 20;
+            auto centre = [&](const Homeless& h) {   // collision x (-game y), z (game x)
+                float x = 0.0f, z = 0.0f;
+                for (const Vec3& p : h.points) { x -= p.y; z += p.x; }
+                return std::pair<float, float>{ x / (float)h.points.size(), z / (float)h.points.size() };
+            };
+            auto cell = [&](const Homeless& h, int size) {
+                const auto [x, z] = centre(h);
+                return std::pair<int, int>{ (int)std::floor((x - kGridOriginX) / (kGridCell * (float)size)),
+                                            (int)std::floor((z - kGridOriginZ) / (kGridCell * (float)size)) };
+            };
+            auto hashOf = [&](const Homeless& h) { u32 v; std::memcpy(&v, added[h.n].attributes, 4); return v; };
+            auto fitsOne = [&](const std::vector<size_t>& items) {
+                size_t strips = 0, barriers = 0;
+                std::vector<u32> hashes;
+                for (size_t i : items) {
+                    (homeless[i].barrier ? barriers : strips) += homeless[i].cost;
+                    if (std::find(hashes.begin(), hashes.end(), hashOf(homeless[i])) == hashes.end())
+                        hashes.push_back(hashOf(homeless[i]));
+                }
+                return strips <= kBudget && barriers <= kBudget && hashes.size() <= kSurfaceRoom;
+            };
+            std::vector<size_t> order(homeless.size());
+            for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+            // Block, then cell, then position: equal keys stay together.
+            auto key = [&](size_t i) {
+                const auto block = cell(homeless[i], 2), one = cell(homeless[i], 1);
+                const auto c = centre(homeless[i]);
+                return std::make_tuple(block.second, block.first, one.second, one.first, c.second, c.first);
+            };
+            std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return key(a) < key(b); });
+            std::vector<std::vector<size_t>> clusters;
+            for (size_t b = 0; b < order.size();) {
+                size_t e = b;
+                while (e < order.size() && cell(homeless[order[e]], 2) == cell(homeless[order[b]], 2)) ++e;
+                std::vector<size_t> block(order.begin() + (long long)b, order.begin() + (long long)e);
+                if (fitsOne(block)) clusters.push_back(block);
+                else
+                    for (size_t c = b; c < e;) {
+                        size_t d = c;
+                        while (d < e && cell(homeless[order[d]], 1) == cell(homeless[order[c]], 1)) ++d;
+                        std::vector<size_t> run;
+                        for (size_t k = c; k < d; ++k) {
+                            run.push_back(order[k]);
+                            if (!fitsOne(run)) {
+                                run.pop_back();
+                                if (!run.empty()) clusters.push_back(run);
+                                run = { order[k] };
+                            }
+                        }
+                        if (!run.empty()) clusters.push_back(run);
+                        c = d;
+                    }
+                b = e;
+            }
+
+            // The nearest shipped instance in plan lends its other fields.
+            auto nearestShipped = [&](float x, float z) {
+                size_t best = 0;
+                float distance = 1e30f;
+                for (size_t i = 0; i < instanceCount; ++i) {
+                    const float d = std::hypot(-field(i * kInstanceSize + 0x30) - x, -field(i * kInstanceSize + 0x38) - z);
+                    if (d < distance) { distance = d; best = i; }
+                }
+                return best;
+            };
+            size_t packBytes = data.size;
+            const u32 section = data.read<u32>(4);
+            for (const std::vector<size_t>& cluster : clusters) {
+                size_t strips = 0, barriers = 0;
+                for (size_t i : cluster) (homeless[i].barrier ? barriers : strips) += homeless[i].cost;
+                const size_t index = instanceCount + fresh.size();
+                const size_t bytes = 16 + kInstanceSize + 64 + strips + barriers + 0x3F0;   // row, instance, article, surfaces
+                if (instanceCount == 0 || index >= kMaxInstances || articleRow.size() + fresh.size() >= 0xFFFF ||
+                    packBytes + bytes > kMaxPackBytes) {
+                    farLeft += cluster.size();
+                    skipped += cluster.size();
+                    continue;
+                }
+                packBytes += bytes;
+                // The box: the content's in collision axes (x, up, z) = (-y, z, x).
+                Vec3 lo{ 1e30f, 1e30f, 1e30f }, hi{ -1e30f, -1e30f, -1e30f };
+                for (size_t i : cluster)
+                    for (const Vec3& p : homeless[i].points) {
+                        const Vec3 c{ -p.y, p.z, p.x };
+                        lo = { std::min(lo.x, c.x), std::min(lo.y, c.y), std::min(lo.z, c.z) };
+                        hi = { std::max(hi.x, c.x), std::max(hi.y, c.y), std::max(hi.z, c.z) };
+                    }
+                // 5 cm round the content keeps every local point inside and the
+                // radius at hypot(width, length) after writeInto's +0.01.
+                const Vec3 middle = (lo + hi) * 0.5f;
+                const float width = (hi.x - lo.x) * 0.5f + 0.05f, height = (hi.y - lo.y) * 0.5f + 0.05f;
+                const float length = (hi.z - lo.z) * 0.5f + 0.05f, radius = std::hypot(width, length);
+                u8 instance[kInstanceSize];
+                std::memcpy(instance, instanceBody.data() + nearestShipped(middle.x, middle.z) * kInstanceSize, kInstanceSize);
+                const float one = 1.0f, zero = 0.0f;
+                const Vec3 shift = middle * -1.0f;
+                for (size_t at : { 0x00, 0x04, 0x08, 0x20, 0x24, 0x28 })
+                    std::memcpy(instance + at, at == 0x00 || at == 0x28 ? &one : &zero, 4);
+                std::memcpy(instance + 0x0C, &width, 4);
+                std::memcpy(instance + 0x14, &height, 4);
+                const u16 article = (u16)(articleRow.size() + fresh.size());
+                std::memcpy(instance + 0x1A, &article, 2);
+                std::memset(instance + 0x1C, 0, 4);   // the article's address, set by the loader (0x6d00b0)
+                std::memcpy(instance + 0x2C, &length, 4);
+                std::memcpy(instance + 0x30, &shift, 12);
+                std::memcpy(instance + 0x3C, &radius, 4);
+                const size_t at = instanceBody.size();
+                instanceBody.insert(instanceBody.end(), instance, instance + kInstanceSize);
+
+                // An empty article: header only, its +0x0C the next of the map's
+                // running article numbers (shipped: 0 .. 10 526, one per article,
+                // ascending through the file; what the game reads it for was not
+                // found, so it is kept unique and in sequence).
+                Fresh made;
+                made.base.assign(64, 0);
+                const u32 id = (*nextArticleId)++;
+                std::memcpy(made.base.data() + 12, &id, 4);
+                fresh.push_back(std::move(made));
+                Fresh& target = fresh.back();
+                for (size_t i : cluster)
+                    writeInto(added[homeless[i].n], homeless[i].barrier, false, homeless[i].points, at,
+                              ByteSpan{ target.base.data(), target.base.size() }, target.strips, target.barriers,
+                              target.surfaces);
+                if (grown) grown->push_back({ (section << 16) | (u32)index, lo.x, hi.x, lo.z, hi.z });
+            }
+            LOG_INFO("collision section %u: %zu polygons (or parts outside the boxes they were cut into) far from "
+                     "its shipped boxes or without room there, %zu written in %zu new "
+                     "instances (%zu -> %zu instances), %zu left out by the ceilings (%zu instances, %zu bytes a pack)",
+                     section, farTotal, farTotal - farLeft, fresh.size(), instanceCount, instanceCount + fresh.size(),
+                     farLeft, kMaxInstances, kMaxPackBytes);
+        }
+
         // Instances that got polygons, with their boxes in the grid's axes
         // (collision x = -game y, z = game x), for AddToCollisionGrid.
         const u32 section = data.read<u32>(4);
@@ -889,7 +1135,12 @@ bool RewriteWorldCollision(ByteSpan whole, const CollisionPack& pack, const std:
             return fail(L"would hold more collision in one article than the format allows (about 1600 "
                         L"triangles); nothing was written.");
     }
-    if (std::memcmp(instanceBody.data(), data.data + rows[(size_t)instanceRow].at, instanceBody.size()) != 0)
+    for (Fresh& made : fresh)
+        if (!RebuildArticle(ByteSpan{ made.base.data(), made.base.size() }, {}, made.body, made.strips, made.barriers,
+                            made.surfaces))
+            return fail(L"could not lay out a new collision article; nothing was written.");
+    if (instanceBody.size() != rows[(size_t)instanceRow].size ||
+        std::memcmp(instanceBody.data(), data.data + rows[(size_t)instanceRow].at, instanceBody.size()) != 0)
         bodies[(size_t)instanceRow] = instanceBody;
 
     // The pack laid out again: with nothing replaced it has to come out as it
@@ -919,7 +1170,53 @@ bool RewriteWorldCollision(ByteSpan whole, const CollisionPack& pack, const std:
         return true;
     };
     if (!lay(false) || packed.size() != end || std::memcmp(packed.data(), data.data, end) != 0) return fail(kOdd);
-    lay(true);
+    if (fresh.empty()) lay(true);
+    else {
+        // New 'ca' rows go between the last article's row and the 'ci' row, as
+        // every shipped pack orders them (Name, ca 0 .. n-1, ci: tags ascending;
+        // the loader 0x6d00b0 looks each up by tag, 0x770250). The row table
+        // grows by 16 a row; the first body sits on 16 + a multiple of 0x100
+        // (all 747 packs; 0xAA in between), so it moves to the next one when the
+        // table reaches it. 'Arti' counts the rows, 'ci' the instances.
+        const size_t ci = (size_t)instanceRow;
+        auto firstBody = [](size_t rowCount) { return 16 + ((0x30 + rowCount * 16 - 16 + 0xFF) & ~(size_t)0xFF); };
+        bool ordered = ci + 1 == rows.size() && firstBody(rows.size()) == start && articleRow.size() + 2 == rows.size();
+        for (size_t a = 0; ordered && a < articleRow.size(); ++a) ordered = articleRow[a] == (int)a + 1;
+        if (!ordered) return fail(kOdd);
+        const size_t articleKind = rows[ci - 1].info & 0xFF, articleCount = data.read<u32>(rows[ci - 1].row + 8);
+        const size_t total = rows.size() + fresh.size(), first = firstBody(total);
+        struct Laid { const u8* body; size_t bytes; u32 tag, kind, count; };
+        std::vector<Laid> order;
+        for (size_t r = 0; r < ci; ++r)
+            order.push_back({ bodies[r].empty() ? data.data + rows[r].at : bodies[r].data(),
+                              bodies[r].empty() ? rows[r].size : bodies[r].size(), data.read<u32>(rows[r].row),
+                              rows[r].info & 0xFF, data.read<u32>(rows[r].row + 8) });
+        for (size_t k = 0; k < fresh.size(); ++k)
+            order.push_back({ fresh[k].body.data(), fresh[k].body.size(), (kTagArticle << 16) | (u32)(articleRow.size() + k),
+                              (u32)articleKind, (u32)articleCount });
+        order.push_back({ instanceBody.data(), instanceBody.size(), kTagInstances, rows[ci].info & 0xFF,
+                          (u32)(instanceBody.size() / kInstanceSize) });
+        size_t cursor = first;
+        for (const Laid& row : order) cursor += (row.bytes + 15) & ~(size_t)15;
+        size_t newEnd = end;
+        while (newEnd < cursor) newEnd += 0x100;
+        packed.assign(newEnd, 0xAA);
+        std::memcpy(packed.data(), data.data, 0x30);
+        Put<u32>(packed, 0, (u32)(newEnd - 16));
+        Put<u32>(packed, 0x28, (u32)total);
+        cursor = first;
+        for (size_t r = 0; r < order.size(); ++r) {
+            const size_t row = 0x30 + r * 16;
+            Put<u32>(packed, row, order[r].tag);
+            Put<u32>(packed, row + 4, (u32)(order[r].bytes << 8) | order[r].kind);
+            Put<u32>(packed, row + 8, order[r].count);
+            Put<u32>(packed, row + 12, (u32)(cursor - row));
+            std::memcpy(packed.data() + cursor, order[r].body, order[r].bytes);
+            cursor += (order[r].bytes + 15) & ~(size_t)15;
+        }
+        LOG_INFO("collision section %u: %zu new articles and instances, pack %zu -> %zu bytes", data.read<u32>(4),
+                 fresh.size(), end, newEnd);
+    }
 
     out.assign(payload, payload + filler);
     out.insert(out.end(), packed.begin(), packed.end());
@@ -935,9 +1232,50 @@ bool RewriteWorldCollision(ByteSpan whole, const CollisionPack& pack, const std:
 // ground added elsewhere in its box is found only now and then (the car reads
 // SimSurface::kNull there and is reset). Every cell a grown box touches gets it.
 // Grid origin and size: L5RA.BUN CGrd (x -5088, z 0, 96 m, 80 x 115 cells).
+int gridRowsWest = 0;
+
+// The grid's header in the region file: origin x, y, z, 1, cell, 1 / cell,
+// then u32 rows and columns (nfsw.exe 0x6cff40 reads origin, 1 / cell, rows
+// and columns from it), and 48 bytes on the rectangle of cells section 25000
+// owns: u16 section, first row, first column, columns, rows (0x6d8d20 drops a
+// cell outside it). In game 22/11: without the rectangle the car fell through
+// Palmont, with it the widened grid held it.
+bool GrowCollisionGridWest(std::vector<u8>& region, int rows) {
+    const float head[6] = { kGridOriginX, 0.0f, kGridOriginZ, 1.0f, kGridCell, 1.0f / kGridCell };
+    size_t at = 0;
+    for (; at + 64 <= region.size(); at += 4)
+        if (!std::memcmp(region.data() + at, head, sizeof(head))) break;
+    if (at + 64 > region.size()) return false;
+    u32 size[2];
+    u16 owned[5];
+    std::memcpy(size, region.data() + at + 24, sizeof(size));
+    std::memcpy(owned, region.data() + at + 48, sizeof(owned));
+    if (size[0] != (u32)kGridRows || size[1] != (u32)kGridColumns || owned[0] != 25000 || owned[1] != 2 ||
+        owned[4] != kGridRows - 3 || (kGridRows + rows) * kGridColumns > 0xFFFF)
+        return false;
+    const float originZ = kGridOriginZ - kGridCell * (float)rows;
+    const u32 grownRows = (u32)(kGridRows + rows);
+    const u16 ownedRows = (u16)(owned[4] + rows);
+    std::memcpy(region.data() + at + 8, &originZ, 4);
+    std::memcpy(region.data() + at + 24, &grownRows, 4);
+    std::memcpy(region.data() + at + 56, &ownedRows, 2);
+    return true;
+}
+
 bool AddToCollisionGrid(ByteSpan raw, const std::vector<GridEntry>& entries, std::vector<u8>& out) {
-    constexpr float kOriginX = kGridOriginX, kOriginZ = kGridOriginZ, kCell = kGridCell;
-    constexpr int kColumns = kGridColumns, kRowsZ = kGridRows;
+    // Collision west of the shipped grid (lower game x = collision z): whole
+    // rows are added before row 0, so the origin moves and every shipped cell's
+    // index grows by rows * columns. The region file's header follows at Save
+    // (GrowCollisionGridWest, gridRowsWest).
+    float west = kGridOriginZ;
+    for (const GridEntry& entry : entries) west = std::min(west, entry.z0);
+    // +2: the rectangle section 25000 owns starts at row 2 (0x6d8d20 drops a cell
+    // before it), so the westmost box stays in owned rows.
+    const int rowsWest = west < kGridOriginZ ? (int)std::ceil((kGridOriginZ - west) / kGridCell) + 2 : 0;
+    if ((kGridRows + rowsWest) * kGridColumns > 0xFFFF) return false;
+    gridRowsWest = rowsWest;
+    const float kOriginX = kGridOriginX, kOriginZ = kGridOriginZ - kGridCell * (float)rowsWest, kCell = kGridCell;
+    const int kColumns = kGridColumns, kRowsZ = kGridRows + rowsWest;
     size_t filler = 0;
     while (filler < 16 && filler < raw.size && raw.data[filler] == 0x11) ++filler;
     const ByteSpan data = raw.sub(filler, raw.size);
@@ -961,13 +1299,14 @@ bool AddToCollisionGrid(ByteSpan raw, const std::vector<GridEntry>& entries, std
         const size_t length = 0x14 + 4 * ((size_t)data.read<u8>(at + 8) + data.read<u8>(at + 9) +
                                           data.read<u8>(at + 10) + data.read<u8>(at + 11));
         if (at + length > cellsAt + cellsSize) return false;
-        const u16 index = data.read<u16>(at + 4);
+        const u16 index = (u16)(data.read<u16>(at + 4) + rowsWest * kColumns);
         if (index < byIndex.size()) byIndex[index] = (int)cells.size();
         cells.push_back({ std::vector<u8>(data.data + at, data.data + at + length) });
+        std::memcpy(cells.back().bytes.data() + 4, &index, 2);
         at += length;
     }
     const u16 section = (u16)data.read<u32>(4);
-    bool changed = false;
+    bool changed = rowsWest > 0;
     // Cells hold a point by round() (0x6cff40), shipped lists look like floor:
     // take both, the game tests the instance's radius after. A point outside
     // the grid is looked up in the nearest edge cell (0x6cff40 / 0x6df170

@@ -1,4 +1,5 @@
 #include "core/Log.h"
+#include "io/WorldMesh.h"
 #include "ui/DarkTheme.h"
 #include "ui/MainWindow.h"
 #include "ui/SetupWizard.h"
@@ -60,6 +61,20 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCommand) {
             ::CoUninitialize();
             return result;
         }
+    }
+
+    // A check of a car made into a world model (io/WorldMesh.h CarModelSelfTest), with no window.
+    {
+        int count = 0;
+        LPWSTR* args = ::CommandLineToArgvW(::GetCommandLineW(), &count);
+        if (args && count >= 5 && ::lstrcmpiW(args[1], L"--cars-selftest") == 0) {
+            const std::wstring car = args[3];
+            const int result = io::CarModelSelfTest(args[2], std::string(car.begin(), car.end()), args[4]);
+            ::LocalFree(args);
+            ::CoUninitialize();
+            return result;
+        }
+        if (args) ::LocalFree(args);
     }
 
     MainWindow window;

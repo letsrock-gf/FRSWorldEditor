@@ -105,6 +105,17 @@ bool InsideTriangle(const Vec2& p, const Vec2& a, const Vec2& b, const Vec2& c) 
 
 } // namespace
 
+void SetGizmoFrame(GizmoView& view, const Mat4& transform) {
+    for (int row = 0; row < 3; ++row) {
+        const Vec3 axis{ transform.m[row][0], transform.m[row][1], transform.m[row][2] };
+        view.axes[row] = Length(axis) > 1e-6f ? Normalize(axis) : GizmoAxis(row);
+    }
+}
+
+Vec3 GizmoHandleAxis(GizmoMode mode, const GizmoView& view, int handle) {
+    return mode == GizmoMode::Scale && handle >= 0 && handle < 3 ? view.axes[handle] : GizmoAxis(handle);
+}
+
 Vec3 GizmoAxis(int handle) {
     switch (handle) {
         case 0:  return { 1.0f, 0.0f, 0.0f };
@@ -155,6 +166,8 @@ int GizmoHit(GizmoMode mode, const Vec3& origin, const GizmoView& view, float mx
     }
 
     if (mode == GizmoMode::Move) {
+        const float dx = mx - centre.x, dy = my - centre.y;
+        if (std::sqrt(dx * dx + dy * dy) < kGrabPixels * 1.2f) return kGizmoFree;
         Vec3 corners[4];
         SquareCorners(origin, size, corners);
         Vec2 p[4];
@@ -168,7 +181,7 @@ int GizmoHit(GizmoMode mode, const Vec3& origin, const GizmoView& view, float mx
     }
     for (int axis = 0; axis < 3; ++axis) {
         Vec2 end;
-        if (!GizmoProject(view, origin + GizmoAxis(axis) * size, end)) continue;
+        if (!GizmoProject(view, origin + GizmoHandleAxis(mode, view, axis) * size, end)) continue;
         consider(axis, DistanceToSegment(mouse, centre, end));
     }
     return best;
@@ -193,7 +206,7 @@ void BuildGizmo(GizmoMode mode, const Vec3& origin, const GizmoView& view, int h
 
     const float width = size * 0.035f;
     for (int axis = 0; axis < 3; ++axis) {
-        const Vec3 a = GizmoAxis(axis);
+        const Vec3 a = GizmoHandleAxis(mode, view, axis);
         const u32 c = colour(axis);
         if (mode == GizmoMode::Move) {
             Shaft(triangles, origin, origin + a * (size * 0.8f), view.eye, width, c);
@@ -210,6 +223,16 @@ void BuildGizmo(GizmoMode mode, const Vec3& origin, const GizmoView& view, int h
         Triangle(triangles, corners[0], corners[1], corners[2], fill);
         Triangle(triangles, corners[0], corners[2], corners[3], fill);
         for (int k = 0; k < 4; ++k) Line(lines, corners[k], corners[(k + 1) % 4], kHotColour);
+        // The middle dot: a disc turned to face the eye.
+        Vec3 u, v;
+        Basis(Normalize(view.eye - origin), u, v);
+        const float radius = size * 0.06f;
+        const u32 dot = hot == kGizmoFree ? kHotColour : kCentreColour;
+        for (int k = 0; k < 16; ++k) {
+            const float a0 = 2.0f * kPi * k / 16, a1 = 2.0f * kPi * (k + 1) / 16;
+            Triangle(triangles, origin, origin + u * (std::cos(a0) * radius) + v * (std::sin(a0) * radius),
+                     origin + u * (std::cos(a1) * radius) + v * (std::sin(a1) * radius), dot);
+        }
     } else {
         Box(triangles, origin, size * 0.09f, hot == kGizmoCentre ? kHotColour : kCentreColour);
     }

@@ -174,12 +174,21 @@ bool RemoveFromWorldCollision(u8* payload, size_t size, const std::vector<u32>& 
 // written, 1 = pieces, 2 = whole into one box.
 // `grown`, when given, gets the instances that got polygons, for the grid.
 // `pack` is the pack as loaded, for the height the editor shows its barriers at.
+// `nextArticleId`, when given, lets added polygons far from every shipped box
+// (more than 96 m of growth) or with no box with room get instances and articles
+// of their own instead of a stretched box: clustered by grid cells, an identity
+// instance with a tight box each, the article numbered from *nextArticleId on
+// (advanced); `placed` says 3 for those, `grown` lists the new instances too.
+// Without it the nearest box grows as before.
 struct GridEntry { u32 key; float x0, x1, z0, z1; };   // pack << 16 | instance; box in collision x and z
 bool RewriteWorldCollision(ByteSpan payload, const CollisionPack& pack, const std::vector<u32>& removed,
                            const std::vector<CollisionPolygon>& added, size_t& skipped,
                            std::vector<u8>& out, std::wstring& error,
                            const std::vector<CollisionPolygon>& spill = {}, std::vector<u8>* placed = nullptr,
-                           std::vector<GridEntry>* grown = nullptr);
+                           std::vector<GridEntry>* grown = nullptr, u32* nextArticleId = nullptr);
+// One past the highest article number (+0x0C, unique across the shipped map) in
+// a pack's payload (filler included); 0 when it has none.
+u32 WorldCollisionArticleIdEnd(ByteSpan payload);
 
 // Ground that lies a little under added ground (a speed bump, cobbles, a ramp
 // laid on the road) loses the part under it. A wheel keeps the face it found
@@ -197,6 +206,11 @@ bool CutUnderRaised(const CollisionPolygon& ground, const std::vector<const Coll
 // that are missing. False when nothing changed or the layout is not the shipped
 // one; `out` is then left alone.
 bool AddToCollisionGrid(ByteSpan raw, const std::vector<GridEntry>& entries, std::vector<u8>& out);
+// Rows of 96 m the last AddToCollisionGrid added west of the shipped grid (0:
+// none), and the same told to the region file's grid header. False when the
+// header is not the shipped one.
+extern int gridRowsWest;
+bool GrowCollisionGridWest(std::vector<u8>& region, int rows);
 
 // A check of that writer on a copy of one shipped pack: every `every`-th
 // polygon, then a block of neighbours, taken out and read back. The totals

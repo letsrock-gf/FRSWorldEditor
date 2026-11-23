@@ -22,6 +22,7 @@
 #include "nfs/ModelCategory.h"
 #include "nfs/SceneryEdit.h"
 #include "io/SelectionExport.h"
+#include "io/RegionDump.h"
 #include "io/SelectionImport.h"
 #include "io/WorldProfiles.h"
 #include "io/WorldFile.h"
@@ -31,6 +32,7 @@
 #include "ui/Resource.h"
 #include "ui/MarkersExtension.h"
 #include "ui/RoadsExtension.h"
+#include "ui/CarsExtension.h"
 #include "ui/U1Library.h"
 #include "ui/SetupWizard.h"
 #include "io/WorldMesh.h"
@@ -270,6 +272,10 @@ void MainWindow::QueueThumbnailWarmUp() {
     for (const nfs::SolidObject* model : world_->AllModels()) {
         if (!model || model->IsBackdrop()) continue;
         if (nfs::CategorizeModel(model->name).group == L"Terrain and roads") continue;
+        // Pieces of a converted city (FRS_BV_ tiles, FRS_BVI_ models: 2 000 of them for Bayview) are not warmed up:
+        // their pictures were drawn in the background for minutes after every open, which made the view stutter.
+        // The Library still draws the ones it shows.
+        if (model->name.rfind("FRS_BV", 0) == 0) continue;
         if (!thumbnails_.Cached(*model)) thumbsToWarm_.push_back(model);
     }
     // Drawn from the back of the list, so reverse it to go in catalogue order.
@@ -728,6 +734,7 @@ void MainWindow::OnCreate() {
     // After the private ones: a click tries what stands in front of a beacon first.
     extensions_.push_back(CreateMarkersExtension(*this));
     extensions_.push_back(CreateRoadsExtension(*this));
+    extensions_.push_back(CreateCarsExtension(*this));   // NFS World's cars as a Library shelf
     // Need for Speed Underground's models in the library (ui/U1Library.h).
     extensions_.push_back(CreateU1Library(*this));
     // The mesh editor (ui/MeshTools.h), asked before the collision tools so
@@ -3398,6 +3405,14 @@ void MainWindow::LoadAllSections() {
 
     LOG_INFO("region loaded: parse %lu ms, upload %lu ms", parseMs, uploadMs);
 
+    // FRS_DUMP_REGION=<folder>: writes the whole region there, once a process (io/RegionDump.h).
+    static bool regionDumped = false;
+    wchar_t dumpFolder[600] = {};
+    if (!regionDumped && ::GetEnvironmentVariableW(L"FRS_DUMP_REGION", dumpFolder, 600) && dumpFolder[0]) {
+        regionDumped = true;
+        io::DumpRegion(*world_, dumpFolder);
+    }
+
     // FRS_TEST_TEXTURE=<hash in hex>;<image>: replaces that texture and saves,
     // for scripted checks (with FRS_WRITE_TRACKS, into a folder that is not the game's).
     wchar_t test[600] = {};
@@ -3968,8 +3983,17 @@ void MainWindow::Tick(float deltaSeconds) {
     // Under the game the map is not seen: no point drawing it.
     // Under the game the map is not seen -- but the panels round it are,
     // and they are drawn by the viewport.
+    // FRS_FRAME_LOG=1: where a frame's time goes outside the world's own drawing (logged every tenth frame).
+    static const bool tickLog = std::getenv("FRS_FRAME_LOG") != nullptr;
+    static double spent[6] = {};
+    static int ticks = 0;
+    const auto clock = [] { LARGE_INTEGER count, rate; ::QueryPerformanceCounter(&count); ::QueryPerformanceFrequency(&rate); return (double)count.QuadPart / (double)rate.QuadPart; };
+    double mark = clock();
+    const auto lap = [&](int slot) { const double now = clock(); spent[slot] += (now - mark) * 1000.0; mark = now; };
     if (shell_ || !(game_.Embedded() && game_.Shown())) viewport_.Tick(deltaSeconds);
+    lap(0);
     TrackEdits();
+    lap(1);
 
     // The status bar only needs to keep up with the eye, not with the frame rate.
     lastStatusUpdate_ += deltaSeconds;
@@ -3978,6 +4002,7 @@ void MainWindow::Tick(float deltaSeconds) {
         UpdateStatusBar();
         UpdateProperties();
     }
+    lap(2);
 
     // The scene tree follows what is placed; the library draws the pictures
     // it has been asked for, a few milliseconds a frame so the view stays
@@ -3997,6 +4022,7 @@ void MainWindow::Tick(float deltaSeconds) {
             TabCtrl_SetItem(sideTabs_, 2, &item);
         }
     }
+    lap(3);
     // The Library's pictures: always on show in the panels, in the old window only on its tab.
     if ((shell_ || sideTab_ == 1) && catalog_.DrawPending(8)) viewport_.GetRenderer().ReleaseThumbnailTargets();
     else if (!thumbsToWarm_.empty()) WarmThumbnails(6);
@@ -4007,7 +4033,14 @@ void MainWindow::Tick(float deltaSeconds) {
         blenderPoll_ = 0.0;
         PollBlender();
     }
+    lap(4);
     for (auto& extension : extensions_) extension->Tick(deltaSeconds);
+    lap(5);
+    if (tickLog && ++ticks % 10 == 0) {
+        LOG_INFO("tick x10: viewport and panels %.0f ms, TrackEdits %.0f ms, status and properties %.0f ms, scene tree %.0f ms, "
+                 "pictures and Blender %.0f ms, extensions %.0f ms", spent[0], spent[1], spent[2], spent[3], spent[4], spent[5]);
+        for (double& value : spent) value = 0.0;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4885,6 +4918,7 @@ void MainWindow::UpdateProperties() {
     // placement (Viewport::DetachNatives).
     PropertiesPanel::AddTransformRows(view, view.mode == PropertiesPanel::Mode::Placement ||
                                                 view.mode == PropertiesPanel::Mode::Native);
+    if (view.mode == PropertiesPanel::Mode::Placement && model) AddCarPaintRows(*world_, model->hash, view);
 
     if (view.mode == PropertiesPanel::Mode::Native && section &&
         (size_t)picked.native < section->scenery.instances.size()) {

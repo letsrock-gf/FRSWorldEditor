@@ -12,6 +12,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -64,12 +65,18 @@ void WorldRenderer::Clear() {
     stats_  = {};
 }
 
+// The collision meshes are built the first time collision is shown, not when a region opens: for NFS World
+// (a million polygons) building them took 56 of the 57 s of the upload, on every open, shown or not (22/11).
+// ponytail: one flag for the editor's one renderer; make it a member if a second world view ever draws collision.
+static bool collisionMeshesBuilt = false;
+
 void WorldRenderer::SyncWithWorld(const nfs::World& world) {
     if (!context_ || !context_->IsValid()) return;
     objectByHash_.clear();
 
     if (world_ != &world) {
         sections_.clear();
+        collisionMeshesBuilt = false;
         uploadedSections_ = 0;
         bounds_ = {};
         world_ = &world;
@@ -82,6 +89,12 @@ void WorldRenderer::SyncWithWorld(const nfs::World& world) {
     const auto& loaded = world.Loaded();
     sections_.resize(loaded.size());
 
+    // Where the time of opening a region goes (logged below): geometry, collision meshes, instances.
+    const auto tick = [] { return std::chrono::steady_clock::now(); };
+    const auto since = [](std::chrono::steady_clock::time_point from) {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - from).count();
+    };
+    double geometryMs = 0.0, collisionMs = 0.0;
     for (size_t i = uploadedSections_; i < loaded.size(); ++i) {
         SectionRender& target = sections_[i];
         target.alternate = loaded[i]->info && world.IsUnusedAlternate(*loaded[i]->info);
@@ -92,15 +105,21 @@ void WorldRenderer::SyncWithWorld(const nfs::World& world) {
             target.positioned = true;
         }
 
+        auto from = tick();
         auto gpu = std::make_unique<GpuSection>();
         if (gpu->Upload(context_->Device(), *loaded[i])) {
             target.libraryBounds = gpu->Bounds();
             target.gpu = std::move(gpu);
         }
+        geometryMs += since(from);
 
-        auto collision = std::make_unique<CollisionMesh>();
-        if (collision->Upload(context_->Device(), *loaded[i], showRaceGroups_))
-            target.collision = std::move(collision);
+        from = tick();
+        if (collisionMeshesBuilt || showCollision_) {
+            auto collision = std::make_unique<CollisionMesh>();
+            if (collision->Upload(context_->Device(), *loaded[i], showRaceGroups_))
+                target.collision = std::move(collision);
+        }
+        collisionMs += since(from);
 
         for (const nfs::SceneryInstance& instance : loaded[i]->scenery.instances)
             target.instanceBounds.Add(instance.worldBounds);
@@ -108,8 +127,12 @@ void WorldRenderer::SyncWithWorld(const nfs::World& world) {
         bounds_.Add(target.instanceBounds);
     }
     uploadedSections_ = loaded.size();
+    if (showCollision_) collisionMeshesBuilt = true;
 
+    const auto instancesFrom = tick();
     BuildInstances(world);
+    LOG_INFO("upload timing: geometry %.0f ms, collision meshes %.0f ms, instances %.0f ms", geometryMs, collisionMs,
+             since(instancesFrom));
 
     u32 vertices = 0, triangles = 0;
     size_t instances = 0;
@@ -673,6 +696,15 @@ void WorldRenderer::Render(const Camera& camera) {
 
     std::vector<size_t> collisionVisible;
 
+    // Collision shown for the first time since the region opened: its meshes are built now.
+    if (showCollision_ && !collisionMeshesBuilt && world_) {
+        for (size_t i = 0; i < sections_.size() && i < world_->Loaded().size(); ++i) {
+            auto collision = std::make_unique<CollisionMesh>();
+            if (collision->Upload(device, *world_->Loaded()[i], showRaceGroups_)) sections_[i].collision = std::move(collision);
+        }
+        collisionMeshesBuilt = true;
+    }
+
     for (size_t i = 0; i < sections_.size(); ++i) {
         const SectionRender& section = sections_[i];
 
@@ -814,6 +846,21 @@ void WorldRenderer::Render(const Camera& camera) {
 
     stats.frameMilliseconds = (float)((SecondsNow() - start) * 1000.0);
     stats_ = stats;
+    // FRS_FRAME_LOG=1: the frame's numbers into the log about once a second, to measure a view without a screen.
+    static const bool frameLog = std::getenv("FRS_FRAME_LOG") != nullptr;
+    static int frameCount = 0;
+    // `period`: from the end of the last world draw to the end of this one, so everything else the editor does in
+    // a frame (panels, lists, present) shows up as period minus the world's own time.
+    static double lastEnd = 0.0, slowest = 0.0;
+    const double endNow = SecondsNow();
+    if (lastEnd > 0.0) slowest = std::max(slowest, (endNow - lastEnd) * 1000.0);
+    const double period = lastEnd > 0.0 ? (endNow - lastEnd) * 1000.0 : 0.0;
+    lastEnd = endNow;
+    if (frameLog && frameCount % 10 == 9) { LOG_INFO("frame period %.1f ms (slowest of the last ten %.1f ms)", period, slowest); slowest = 0.0; }
+    if (frameLog && ++frameCount % 10 == 0)
+        LOG_INFO("frame: %.1f ms, %u draws, %u triangles, %u of %u sections, %u of %u instances, eye (%.0f, %.0f, %.0f)",
+                 stats.frameMilliseconds, stats.drawCalls, stats.triangles, stats.sectionsVisible, stats.sectionsTotal,
+                 stats.instancesVisible, stats.instancesTotal, eye.x, eye.y, eye.z);
 }
 
 void WorldRenderer::RenderWorldOnly(const Camera& camera) {
@@ -888,6 +935,9 @@ void WorldRenderer::PickOne(const Ray& ray, const GpuObject& object, const Mat4&
         best.worldBounds  = worldBounds;
         best.distance     = distance;
         best.fromInstance = fromInstance;
+        best.triangle[0]  = transform.TransformPoint(source.vertices[i0].position);
+        best.triangle[1]  = transform.TransformPoint(source.vertices[i1].position);
+        best.triangle[2]  = transform.TransformPoint(source.vertices[i2].position);
         best.gpuSection   = ownerSection;
         best.gpuObject    = ownerObject;
         best.loadedSection = (u32)sectionIndex;
@@ -1430,6 +1480,7 @@ void WorldRenderer::RefreshCollision(size_t loadedSection) {
     if (!world_ || !context_ || loadedSection >= sections_.size() ||
         loadedSection >= world_->Loaded().size())
         return;
+    if (!collisionMeshesBuilt) return;   // none built yet: all of them are, from the world as it is, when first shown
     auto collision = std::make_unique<CollisionMesh>();
     if (collision->Upload(context_->Device(), *world_->Loaded()[loadedSection], showRaceGroups_))
         sections_[loadedSection].collision = std::move(collision);
@@ -2037,6 +2088,7 @@ void WorldRenderer::DrawGizmo(IDirect3DDevice9* device, const Camera& camera) {
     view.width = (float)context_->Width();
     view.height = (float)context_->Height();
     view.eye = camera.Position();
+    SetGizmoFrame(view, gizmoFrame_);
 
     std::vector<GizmoVertex> lines, triangles;
     BuildGizmo(gizmoMode_, gizmoOrigin_, view, gizmoHot_, lines, triangles);

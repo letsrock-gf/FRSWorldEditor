@@ -217,6 +217,8 @@ constexpr int ID_ROAD_LANE_DROP     = ID_ROADS_FIRST + 39;
 constexpr int ID_ROAD_LANE_SPLIT    = ID_ROADS_FIRST + 40;
 constexpr int ID_ROAD_LANE_MERGE    = ID_ROADS_FIRST + 90;   // an entrance: a lane joining before the node
 constexpr int ID_ROAD_JOIN_NODES    = ID_ROADS_FIRST + 91;   // join the two nodes picked with Ctrl+click
+constexpr int ID_ROAD_COPY_PROPS    = ID_ROADS_FIRST + 92;   // the selected road's properties, length aside
+constexpr int ID_ROAD_PASTE_PROPS   = ID_ROADS_FIRST + 93;   // onto every selected road
 constexpr int ID_ROAD_DRAW          = ID_ROADS_FIRST + 41;
 constexpr int ID_ROAD_INSERT_MIDDLE = ID_ROADS_FIRST + 42;
 constexpr int ID_ROAD_DRAW_FROM     = ID_ROADS_FIRST + 43;
@@ -972,6 +974,32 @@ public:
             case ID_ROAD_FJ_EDIT:
                 if (const roads::Node* node = SelectedNode()) EditFaceJunction(node->id);
                 return true;
+            case ID_ROAD_COPY_PROPS:
+                if (const roads::Segment* s = SelectedSegment()) {
+                    copiedRoad_ = s->profile;
+                    haveCopiedRoad_ = true;
+                    copiedFrom_ = s->id;
+                    app_.Status(Fmt(L"Properties of road %u copied (its length aside): right click Properties > "
+                                    L"Paste on another road", s->id));
+                    Select(Selected());   // the menu now offers Paste
+                }
+                return true;
+            case ID_ROAD_PASTE_PROPS: {
+                if (!haveCopiedRoad_) return true;
+                const std::vector<u32> roads = SelectedRoadIds();
+                size_t pasted = 0;
+                for (u32 id : roads)
+                    if (roads::Segment* s = network_.FindSegment(id)) {
+                        s->profile = copiedRoad_;
+                        ++pasted;
+                    }
+                if (!pasted) return true;
+                lastProfile_ = copiedRoad_;
+                Changed(true);
+                app_.Status(Fmt(L"Properties of road %u pasted on %zu road(s); their curves and lengths kept",
+                                copiedFrom_, pasted));
+                return true;
+            }
             case ID_ROAD_INSERT_MIDDLE:
                 if (const roads::Segment* s = SelectedSegment()) {
                     const u32 id = s->id;
@@ -6914,7 +6942,8 @@ private:
     size_t WidenZones() {
         nfs::World* world = app_.World();
         if (!world) return 0;
-        world->zoneOutlines.clear();
+        // Outlines widened by hand stay, and the road's corridors start from them.
+        world->zoneOutlines = world->manualZoneOutlines;
         const std::vector<io::WorldZone> zones = io::ReadWorldZones(app_.TracksFolder(), world->Region());
         if (zones.empty() || network_.Segments().empty()) return 0;
         const auto zoneAt = [&](Vec2 p) -> int {
@@ -6970,7 +6999,11 @@ private:
             for (size_t s = 0; s < stretches.size(); ++s) {
                 const io::WorldZone& zone = zones[(size_t)stretches[s].first];
                 auto outline = made.find(zone.section);
-                if (outline == made.end()) outline = made.emplace(zone.section, zone.points).first;
+                if (outline == made.end()) {
+                    const auto manual = world->manualZoneOutlines.find(zone.section);
+                    outline = made.emplace(zone.section, manual != world->manualZoneOutlines.end() ? manual->second
+                                                                                                  : zone.points).first;
+                }
                 const std::vector<Vec2>& path = stretches[s].second;
                 std::vector<Vec2> thin{ path.front() };
                 for (size_t k = 1; k + 1 < path.size(); ++k)
@@ -6981,7 +7014,7 @@ private:
             bool fits = true;
             for (const auto& [section, outline] : made) fits = fits && outline.size() <= 124;
             if (!fits) continue;
-            world->zoneOutlines = std::move(made);
+            for (auto& [section, outline] : made) world->zoneOutlines[section] = std::move(outline);
             for (const auto& [section, outline] : world->zoneOutlines)
                 LOG_INFO("roads: streaming zone %u widened along the road: %zu points", section, outline.size());
             return world->zoneOutlines.size();
@@ -7643,6 +7676,11 @@ private:
     RoadsAccess app_;
     roads::Network network_;
     roads::RoadProfile lastProfile_;
+    // Road > Copy properties: one road's profile, pasted onto others. The
+    // curve, its handles and the nodes stay each road's own (its length).
+    roads::RoadProfile copiedRoad_;
+    bool haveCopiedRoad_ = false;
+    u32 copiedFrom_ = 0;
     std::vector<DrawBatch> batches_;
     bool graphView_ = false;
     u64 graphBuilt_ = 0;
@@ -8006,6 +8044,10 @@ bool RoadsExtension::FillProperties(PropertiesPanel::View& view) {
     if (!s) return false;
     FillRoad(view, *s);
     const std::vector<u32> roads = SelectedRoadIds();
+    view.menu.push_back({ L"Copy road properties", ID_ROAD_COPY_PROPS, roads.size() == 1 });
+    view.menu.push_back({ haveCopiedRoad_ ? Fmt(L"Paste properties of road %u", copiedFrom_)
+                                          : std::wstring(L"Paste road properties"),
+                          ID_ROAD_PASTE_PROPS, haveCopiedRoad_ });
     if (roads.size() > 1) {
         // Several: the first one's rows; where the others differ, "(mixed)"
         // until a value is given, which then goes to all of them.
@@ -9106,7 +9148,7 @@ bool RoadsExtension::RemoveBaked(size_t& removed) {
     nfs::World* world = app_.World();
     if (!world) return false;
     // The streaming zones the last bake widened go back as shipped (only the bake widens them).
-    if (nfs::IsWorld()) world->zoneOutlines.clear();
+    if (nfs::IsWorld()) world->zoneOutlines = world->manualZoneOutlines;   // hand-widened ones stay
     std::vector<u32> hashes;
     for (const nfs::SolidObject* model : world->AllModels())
         if (model && roads::IsBakedRoadModel(model->name) &&

@@ -41,11 +41,13 @@ add_executable(FRSWorldEditor WIN32
     src/nfs/CustomRegions.cpp
     src/nfs/Markers.cpp
     src/ui/MarkersExtension.cpp
+    src/ui/CarsExtension.cpp
     src/io/WorldMesh.cpp
     src/io/WorldPlace.cpp
     src/io/WorldTexture.cpp
     src/io/WorldWrite.cpp
     src/io/SelectionExport.cpp
+    src/io/RegionDump.cpp
     src/io/SelectionImport.cpp
     src/nfs/ChunkReader.cpp
     src/nfs/Jdlz.cpp
@@ -54,6 +56,7 @@ add_executable(FRSWorldEditor WIN32
     src/nfs/Preculler.cpp
     src/nfs/Scenery.cpp
     src/nfs/CityZones.cpp
+    src/nfs/CarGeometry.cpp
     src/nfs/FreeRoam.cpp
     src/nfs/ModelCategory.cpp
     src/nfs/SceneryEdit.cpp

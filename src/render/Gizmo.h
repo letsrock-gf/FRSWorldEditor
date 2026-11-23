@@ -15,9 +15,11 @@
 enum class GizmoMode { Move, Rotate, Scale };
 
 // Handle ids: an axis 0..2 (X, Y, Z), 3 the ground square (Move) or the
-// middle box (Scale), -1 for none.
+// middle box (Scale), 4 the middle dot (Move: drags the object over whatever
+// is under the pointer, held softly by vertices, edges and faces), -1 for none.
 constexpr int kGizmoNone   = -1;
 constexpr int kGizmoCentre = 3;
+constexpr int kGizmoFree   = 4;
 
 // What the handles are measured against: the view and projection together,
 // the viewport's size in pixels, and where the eye is.
@@ -25,7 +27,13 @@ struct GizmoView {
     Mat4  viewProjection;
     float width = 1.0f, height = 1.0f;
     Vec3  eye;
+    // The Scale handles follow the object's own axes (each scales its own
+    // axis); Move and Rotate keep the world's.
+    Vec3  axes[3] = { { 1.0f, 0.0f, 0.0f }, { 0.0f, 1.0f, 0.0f }, { 0.0f, 0.0f, 1.0f } };
 };
+
+// The object's own axes from its transform's rows (scale taken out).
+void SetGizmoFrame(GizmoView& view, const Mat4& transform);
 
 struct GizmoVertex {
     float x, y, z;
@@ -47,6 +55,8 @@ void BuildGizmo(GizmoMode mode, const Vec3& origin, const GizmoView& view, int h
 
 // The world axis a handle stands for.
 Vec3 GizmoAxis(int handle);
+// The axis a handle drags in `mode`: the object's own for Scale.
+Vec3 GizmoHandleAxis(GizmoMode mode, const GizmoView& view, int handle);
 
 // A turn of `angle` radians about the unit `axis`, as a row-vector matrix
 // (the convention every transform in the editor uses).
