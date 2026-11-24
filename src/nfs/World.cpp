@@ -875,30 +875,39 @@ static bool HasModelToBuildFrom(const LoadedSection& section) {
 }
 
 size_t World::SectionForPlacement(const Vec3& point) const {
-    size_t best = SIZE_MAX, nearest = SIZE_MAX;
-    float bestDistance = 1e30f, nearestDistance = 1e30f;
+    // The game draws a section only where a zone lists it: when a zone claims the point, only the sections it
+    // loads there count. Without that, a placement moved into Bayview (sections 1900.. all share the centre
+    // -3418,-552) went to B472, the nearest centre, which zone 1102 never loads: not drawn in game (23/11).
+    const std::vector<size_t> shown = SectionsLoadedThroughout({ point });
+    for (const bool onlyShown : { true, false }) {
+        if (onlyShown && shown.empty()) continue;
+        size_t best = SIZE_MAX, nearest = SIZE_MAX;
+        float bestDistance = 1e30f, nearestDistance = 1e30f;
 
-    for (size_t i = 0; i < loaded_.size(); ++i) {
-        const LoadedSection& candidate = *loaded_[i];
-        if (!candidate.info || IsLibrary(candidate) || IsUnusedAlternate(*candidate.info)) continue;
-        if (!HasModelToBuildFrom(candidate)) continue;
-        if (std::find(candidate.sceneryNumbers.begin(), candidate.sceneryNumbers.end(),
-                      candidate.info->number) == candidate.sceneryNumbers.end())
-            continue;
+        for (size_t i = 0; i < loaded_.size(); ++i) {
+            const LoadedSection& candidate = *loaded_[i];
+            if (onlyShown && !std::binary_search(shown.begin(), shown.end(), i)) continue;
+            if (!candidate.info || IsLibrary(candidate) || IsUnusedAlternate(*candidate.info)) continue;
+            if (!HasModelToBuildFrom(candidate)) continue;
+            if (std::find(candidate.sceneryNumbers.begin(), candidate.sceneryNumbers.end(),
+                          candidate.info->number) == candidate.sceneryNumbers.end())
+                continue;
 
-        const float dx = candidate.info->position.x - point.x;
-        const float dy = candidate.info->position.y - point.y;
-        const float distance = dx * dx + dy * dy;
-        if (distance < nearestDistance) { nearestDistance = distance; nearest = i; }
+            const float dx = candidate.info->position.x - point.x;
+            const float dy = candidate.info->position.y - point.y;
+            const float distance = dx * dx + dy * dy;
+            if (distance < nearestDistance) { nearestDistance = distance; nearest = i; }
 
-        const Aabb& ground = candidate.terrainBounds;
-        if (ground.Valid() && point.x >= ground.min.x && point.x <= ground.max.x &&
-            point.y >= ground.min.y && point.y <= ground.max.y && distance < bestDistance) {
-            bestDistance = distance;
-            best = i;
+            const Aabb& ground = candidate.terrainBounds;
+            if (ground.Valid() && point.x >= ground.min.x && point.x <= ground.max.x &&
+                point.y >= ground.min.y && point.y <= ground.max.y && distance < bestDistance) {
+                bestDistance = distance;
+                best = i;
+            }
         }
+        if (best != SIZE_MAX || nearest != SIZE_MAX) return best != SIZE_MAX ? best : nearest;
     }
-    return best != SIZE_MAX ? best : nearest;
+    return SIZE_MAX;
 }
 
 size_t World::SectionForPlacementAlong(const std::vector<Vec3>& points) const {

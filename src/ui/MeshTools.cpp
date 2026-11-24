@@ -1350,6 +1350,17 @@ void MeshTools::OnRegionLoaded() {
         LOG_INFO("collision edit selftest: %s", ok ? "PASSED" : "FAILED");
     }
 
+    // FRS_PLACE_AT=x,y[;x,y...]: the section a placement moved there goes to (SectionForPlacement).
+    if (const char* at = std::getenv("FRS_PLACE_AT"); at && world) {
+        for (const char* p = at; p && *p; p = std::strchr(p, ';') ? std::strchr(p, ';') + 1 : nullptr) {
+            float x = 0.0f, y = 0.0f;
+            if (std::sscanf(p, "%f,%f", &x, &y) != 2) break;
+            const size_t s = world->SectionForPlacement({ x, y, 0.0f });
+            const bool known = s < world->Loaded().size() && world->Loaded()[s]->info;
+            LOG_INFO("place at %.1f %.1f: section %s", x, y, known ? world->Loaded()[s]->info->name.c_str() : "none");
+        }
+    }
+
     // FRS_FIND_MODEL=<part of a model name>: where such models are stored, what
     // places them, and whether the renderer has them -- for a missing object.
     if (const char* wanted = std::getenv("FRS_FIND_MODEL"); wanted && world) {

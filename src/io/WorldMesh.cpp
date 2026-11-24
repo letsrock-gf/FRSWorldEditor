@@ -1429,7 +1429,19 @@ std::vector<u32> SectionTextures(const nfs::World& world, const std::vector<u32>
 // Whether a staged texture (copied or made by the editor) goes into a
 // pack this section has loaded: one of the textures it is put beside is the
 // section's.
+// A texture no file of the game holds: not in any texture pack the region
+// loads (nor in GlobalB.lzc), yet shipped models draw with it -- 23/11:
+// C1853972, in a slot of 12 materials of the untouched section 1828, which the
+// game draws. Made by the game or left empty there; nothing to copy, and no
+// reason to keep a model from where it is placed.
+// ponytail: "no pack the editor loaded holds it" -- assumes the region's texture sections are all loaded, as
+// opening L5RA loads every section; check the packs on disk if a partial load ever comes.
+bool HeldNowhere(const nfs::World& world, u32 texture) {
+    return !NewTextureOf(world, texture) && !world.FindTexture(texture) && TextureHosts(world, texture).empty();
+}
+
 bool CopyCovers(const nfs::World& world, u32 texture, const std::vector<u32>& sectionTextures) {
+    if (HeldNowhere(world, texture)) return true;
     const nfs::World::NewTexture* copy = NewTextureOf(world, texture);
     if (!copy) return false;
     if (std::binary_search(sectionTextures.begin(), sectionTextures.end(), copy->like)) return true;
@@ -1441,8 +1453,8 @@ bool CopyCovers(const nfs::World& world, u32 texture, const std::vector<u32>& se
 // The placement a manifest object was exported from, taken out of the map: a
 // shipped record is removed (written with its matrix zeroed), a placement the
 // editor made is deleted. Looked for in the section the export named first,
-// then anywhere. False when none matches. `justLook`: only whether one does.
-bool RemoveExportedPlacement(nfs::World& world, const ManifestObject& object, bool justLook = false) {
+// then anywhere. False when none matches.
+bool RemoveExportedPlacement(nfs::World& world, const ManifestObject& object) {
     const auto same = [&](const Mat4& m) {
         for (int r = 0; r < 4; ++r)
             for (int c = 0; c < 3; ++c)
@@ -1457,7 +1469,6 @@ bool RemoveExportedPlacement(nfs::World& world, const ManifestObject& object, bo
             for (size_t p = 0; p < section->placements.size(); ++p) {
                 const nfs::PlacedInstance& placed = section->placements[p].instance;
                 if (placed.modelHash != object.hash || !same(placed.transform)) continue;
-                if (justLook) return true;
                 section->placements.erase(section->placements.begin() + (std::ptrdiff_t)p);
                 section->placementsChanged = true;
                 return true;
@@ -1467,13 +1478,138 @@ bool RemoveExportedPlacement(nfs::World& world, const ManifestObject& object, bo
                 const auto key = std::make_pair(instance.sceneryNumber, instance.record);
                 auto& removed = section->removedNatives;
                 if (std::find(removed.begin(), removed.end(), key) != removed.end()) continue;
-                if (justLook) return true;
                 removed.push_back(key);
                 section->placementsChanged = true;
                 return true;
             }
         }
     return false;
+}
+
+} // namespace
+
+namespace {
+
+// Zone lists naming section `section`: whether one of them also names `pack` (`all`: every one of them does). True
+// when no list names the section (nothing known).
+bool ListedWith(const nfs::World& world, u32 section, u32 pack, bool all) {
+    bool named = false;
+    for (const auto& [zone, list] : world.Visibility().Lists()) {
+        if (std::find(list.begin(), list.end(), section) == list.end()) continue;
+        named = true;
+        const bool both = std::find(list.begin(), list.end(), pack) != list.end();
+        if (all && !both) return false;
+        if (!all && both) return true;
+    }
+    return !named || all;
+}
+
+// The lowest-numbered texture section the game loads wherever it loads any of `sections`; 0 when none is.
+u32 PackAlongside(const nfs::World& world, const std::vector<u32>& sections) {
+    u32 best = 0;
+    for (const auto& [zone, list] : world.Visibility().Lists()) {
+        if (std::find(list.begin(), list.end(), sections.front()) == list.end()) continue;
+        for (const u32 pack : list) {
+            if (best && pack >= best) continue;
+            const nfs::LoadedSection* loaded = SectionNumbered(world, pack);
+            if (!loaded || !loaded->info || loaded->info->name.empty() || loaded->info->name[0] < 'U' ||
+                loaded->info->name[0] > 'Y' || loaded->texturePacks.empty())
+                continue;
+            if (std::all_of(sections.begin(), sections.end(), [&](u32 s) { return ListedWith(world, s, pack, true); }))
+                best = pack;
+        }
+    }
+    return best;
+}
+
+// Wherever the game loads `section`, one of the texture sections `hosts` is loaded too (every zone list naming the
+// section names one of them); true when no list names it.
+bool Served(const nfs::World& world, u32 section, const std::vector<u32>& hosts) {
+    for (const auto& [zone, list] : world.Visibility().Lists()) {
+        if (std::find(list.begin(), list.end(), section) == list.end()) continue;
+        if (std::none_of(hosts.begin(), hosts.end(),
+                         [&](u32 h) { return std::find(list.begin(), list.end(), h) != list.end(); }))
+            return false;
+    }
+    return true;
+}
+
+// The texture sections whose packs take or hold texture `t`: its copies, and for a copied game texture the packs
+// that ship it.
+std::vector<u32> HostNumbers(const nfs::World& world, const nfs::World::NewTexture& texture) {
+    std::vector<u32> out;
+    for (const nfs::LoadedSection* h : NewTextureHosts(world, texture))
+        if (h->info) out.push_back(h->info->number);
+    if (!texture.header.empty())
+        for (const nfs::LoadedSection* h : TextureHosts(world, texture.hash))
+            if (h->info) out.push_back(h->info->number);
+    return out;
+}
+
+// A texture only the pack of texture section `pack` holds: a copy put beside it goes into that pack alone.
+u32 SoleTexture(const nfs::World& world, u32 pack) {
+    static std::map<u32, u32> known;   // ponytail: per process; packs do not change texture sets between saves
+    if (const auto at = known.find(pack); at != known.end()) return at->second;
+    u32 sole = 0;
+    if (const nfs::LoadedSection* loaded = SectionNumbered(world, pack))
+        for (const auto& textures : loaded->texturePacks) {
+            for (const nfs::Texture& texture : textures->Textures())
+                if (TextureHosts(world, texture.hash).size() == 1) { sole = texture.hash; break; }
+            if (sole) break;
+        }
+    return known[pack] = sole;
+}
+
+// A texture the editor made or copied goes beside the texture it copies (`like`), into that texture's packs. For a
+// model in Bayview those can be packs of Palmont no zone loads with it (like 10BD9B5D lives only in W121, never
+// loaded with B907/B910: the Golf drew without its texture, 23/11; ~75 copies for Bayview models the same). Each
+// zone of Bayview loads the Y packs of its own band and the two beside it, so a section's own band is the safe home:
+// a texture goes, besides where it is, beside a texture only that pack holds (moreLikes), one pack per section left
+// without it -- in practice one per band. Done on every save; nothing of it goes into the list.
+void HostTexturesAlongside(nfs::World& world) {
+    std::map<u32, std::vector<u32>> unserved;   // texture -> the sections drawing it that load none of its packs
+    for (const auto& section : world.Loaded()) {
+        if (!section->info) continue;
+        const u32 number = section->info->number;
+        std::vector<u32> models = LoadedWith(*section);
+        for (const auto& placement : section->placements) models.push_back(placement.instance.modelHash);
+        for (const u32 hash : models) {
+            const nfs::SolidObject* model = world.FindModel(hash);
+            if (!model) continue;
+            for (const u32 t : model->textureHashes) {
+                const nfs::World::NewTexture* texture = NewTextureOf(world, t);
+                if (!texture || Served(world, number, HostNumbers(world, *texture))) continue;
+                auto& at = unserved[t];
+                if (std::find(at.begin(), at.end(), number) == at.end()) at.push_back(number);
+            }
+        }
+    }
+    for (auto& [t, sections] : unserved) {
+        auto* texture = const_cast<nfs::World::NewTexture*>(NewTextureOf(world, t));
+        std::sort(sections.begin(), sections.end());
+        // A host the list gives it is exclusive: it stays one of its packs (beside a texture only that pack holds),
+        // the others are added beside it, and the X line no longer names one.
+        if (const u32 given = NewTextureHost(t)) {
+            SetNewTextureHost(t, 0);
+            if (const u32 anchor = SoleTexture(world, given)) texture->moreLikes.push_back(anchor);
+            LOG_INFO("texture %s %08X: texture section %u the list gives it is not loaded with section %u; it stays "
+                     "there and goes where those sections are loaded too", texture->name.c_str(), t, given,
+                     sections.front());
+        }
+        for (const u32 s : sections) {
+            if (Served(world, s, HostNumbers(world, *texture))) continue;   // a pack picked for another section
+            const u32 pack = PackAlongside(world, { s });
+            const u32 anchor = pack ? SoleTexture(world, pack) : 0u;
+            if (!anchor) {
+                LOG_WARN("copied texture %s %08X: no texture section to put it in for section %u",
+                         texture->name.c_str(), t, s);
+                continue;
+            }
+            texture->moreLikes.push_back(anchor);
+            LOG_INFO("copied texture %s %08X also goes to texture section %u (beside %08X): no zone loads its packs "
+                     "with section %u", texture->name.c_str(), t, pack, anchor, s);
+        }
+    }
 }
 
 } // namespace
@@ -1509,6 +1645,7 @@ std::vector<u32> StageCopiedTextures(nfs::World& world) {
                 if (std::binary_search(textures.begin(), textures.end(), t)) continue;
                 if (made && NewTextureOf(world, t)) continue;   // made or already copied: written as such
                 std::wstring why;
+                if (HeldNowhere(world, t)) continue;   // nothing to copy (CopyCovers)
                 if (!host || !StageCopiedWorldTexture(world, t, host, why)) {
                     LOG_WARN("texture %08X of %s placed in %s not copied: %S", t, model->name.c_str(),
                              loaded.info->name.c_str(), host ? why.c_str() : L"the section draws with no texture of a texture section");
@@ -1520,6 +1657,7 @@ std::vector<u32> StageCopiedTextures(nfs::World& world) {
     }
     std::sort(needed.begin(), needed.end());
     needed.erase(std::unique(needed.begin(), needed.end()), needed.end());
+    HostTexturesAlongside(world);
     return needed;
 }
 
@@ -1665,9 +1803,18 @@ bool ImportWorldMeshes(nfs::World& world, const std::wstring& tracksFolder, cons
         if (whole) std::fprintf(f, "# frs-topology whole\n");   // WholeReplacement
         std::fprintf(f, "# model space, game axes (Z up); vt as the game stores it (v down); usemtl tex_<hash> = game texture\n");
         std::fprintf(f, "o %s\n", name.c_str());
+        // The game draws texture x vertex colour at double strength (its baked
+        // light). A model from elsewhere brings no light: Blender writes its
+        // colour attribute, or zeros (23/11: a glb car came out all FF000000,
+        // black in the editor and the game). One flat black or white over the
+        // whole mesh is that, not light: mid grey, as with no colour at all.
+        const u32 first = mesh.colors.empty() ? 0u : mesh.colors.front() & 0xFFFFFFu;
+        const bool flat = !mesh.colors.empty() && (first == 0 || first == 0xFFFFFFu) &&
+                          std::all_of(mesh.colors.begin(), mesh.colors.end(), [&](u32 c) { return (c & 0xFFFFFFu) == first; });
+        if (flat) LOG_INFO("import: %s has one flat %s vertex colour: written mid grey", name.c_str(), first ? "white" : "black");
         for (size_t k = 0; k < mesh.positions.size(); ++k) {
             const Vec3 p = toModel.TransformPoint(FromBlender(mesh.positions[k]) + origin);
-            const u32 c = mesh.colors[k];
+            const u32 c = flat ? 0xFF808080u : mesh.colors[k];
             std::fprintf(f, "v %.9g %.9g %.9g %.6f %.6f %.6f\n", p.x, p.y, p.z, ((c >> 16) & 0xFF) / 255.0f,
                          ((c >> 8) & 0xFF) / 255.0f, (c & 0xFF) / 255.0f);
         }
@@ -1809,10 +1956,21 @@ bool ImportWorldMeshes(nfs::World& world, const std::wstring& tracksFolder, cons
             found = manifest.find(name.substr(0, name.find_last_of('.')));
         return found;
     };
+    // Objects an earlier save of this Blender session took out of the map, one
+    // name a line beside the OBJ: gone for good, never "swapped" later.
+    // (Not their placements: the placement may have been moved in the editor
+    // since the export, 23/11, so where it stood does not say whether it was.)
+    const std::wstring removedList = objPath.substr(0, objPath.find_last_of(L'.')) + L".removed.txt";
+    std::unordered_set<std::string> removedBefore;
+    {
+        std::ifstream in(removedList);
+        for (std::string line; std::getline(in, line);)
+            if (!line.empty()) removedBefore.insert(line);
+    }
     // Another model imported in the place of the exported one, which was
     // deleted: when exactly one object of the manifest is gone from the save
-    // (and still placed: not deleted in an earlier save) and the save holds
-    // objects the manifest does not name, those together are that object.
+    // (not taken out by an earlier save) and the save holds objects the
+    // manifest does not name, those together are that object.
     if (wholeScene && manifested) {
         std::unordered_set<std::string> present;
         std::vector<size_t> strangers;
@@ -1823,7 +1981,7 @@ bool ImportWorldMeshes(nfs::World& world, const std::wstring& tracksFolder, cons
         }
         std::vector<std::string> gone;
         for (const auto& [object, entry] : manifest)
-            if (!present.count(object) && RemoveExportedPlacement(world, entry, true)) gone.push_back(object);
+            if (!present.count(object) && !removedBefore.count(object)) gone.push_back(object);
         if (gone.size() == 1 && !strangers.empty()) {
             ObjMesh merged;
             merged.name = gone.front();
@@ -1974,14 +2132,22 @@ bool ImportWorldMeshes(nfs::World& world, const std::wstring& tracksFolder, cons
     // manifest keeps it, so a later save finds nothing left to take out.
     if (wholeScene && manifested)
         for (const auto& [object, entry] : manifest) {
-            if (seen.count(object)) continue;
+            if (seen.count(object) || removedBefore.count(object)) continue;
             if (entry.header) {
                 out.refused += L"  " + Widen(object) + L": not in the save, but placed by its own header: left\n";
                 continue;
             }
-            if (!RemoveExportedPlacement(world, entry)) continue;   // gone already
+            if (!RemoveExportedPlacement(world, entry)) {
+                out.refused += L"  " + Widen(object) + L": not in the save, but its placement is no longer where it "
+                               L"was exported (moved in the editor?): left, delete it there\n";
+                continue;
+            }
             ++out.removed;
             out.done += L"  " + Widen(object) + L": not in the save any more, taken out of the map\n";
+            if (FILE* file = nullptr; ::_wfopen_s(&file, removedList.c_str(), L"a") == 0 && file) {
+                std::fprintf(file, "%s\n", object.c_str());
+                std::fclose(file);
+            }
         }
 
     // The new objects join the manifest (the one beside the OBJ, as a Blender

@@ -51,6 +51,9 @@ public:
     // Whether any zone's list names the section: what the game ever loads.
     bool Listed(u32 sectionNumber) const;
 
+    // Every zone's list: zone id -> the section numbers the game loads in it.
+    const std::unordered_map<u32, std::vector<u32>>& Lists() const { return visible_; }
+
     // --- collision (read out of SPEED2.EXE) ---------------------------------
     // The car reads ONE collision pack at a time: the pack of the section
     // whose number is its collision zone's id plus the base (the first word

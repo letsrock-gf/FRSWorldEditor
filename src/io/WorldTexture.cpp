@@ -698,7 +698,10 @@ bool WriteNewTextures(const nfs::World& world, const nfs::LoadedSection& loaded,
         // In a section the list names for it: what it copies is taken from that texture's own pack.
         const Entry* from = like == entries.end() ? nullptr : &*like;
         Entry borrowed;
-        if (!from && NewTextureHost(texture->hash) &&
+        // A texture made by the editor in a pack without its `like` (a host the list gives it, or beside another
+        // texture there: HostTexturesAlongside) takes its like's header, as it was made from that texture.
+        const bool ownLike = like != entries.end() && like->hash == texture->like;
+        if ((!from || (!ownLike && texture->header.empty())) &&
             ShippedTextureRows(world, texture->like, borrowed.header, borrowed.format))
             from = &borrowed;
         if (!from) return fail(L"does not hold the texture a new one copies");

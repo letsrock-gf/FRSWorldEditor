@@ -41,6 +41,8 @@ if mode == "swap":
     sphere = bpy.context.active_object
     sphere.name = "Bola"
     sphere.data.materials.append(packed_material("Bola_Azul", (0.1, 0.3, 0.9)))
+    # A colour attribute left at zero, as a glb car brought (23/11: black in the editor and the game).
+    sphere.data.color_attributes.new("Col", 'BYTE_COLOR', 'CORNER')
 
     if first:
         first.data.materials.append(packed_material("Faixa_Verde", (0.1, 0.8, 0.2)))
