@@ -272,10 +272,10 @@ u32 NameHash(const std::string& text) {
     return hash;
 }
 
-// The power of two nearest a side of the image, 4..512.
-u32 SideFor(u32 size) {
+// The power of two nearest a side of the image, 4..512 (or the cap the edit list names for the texture).
+u32 SideFor(u32 size, u32 cap = kMaxNewSide) {
     u32 side = 4;
-    while (side < kMaxNewSide && side * 2 <= size + size / 2) side *= 2;
+    while (side < cap && side * 2 <= size + size / 2) side *= 2;
     return side;
 }
 
@@ -351,6 +351,22 @@ void SetNewTextureHost(u32 hash, u32 section) {
 u32 NewTextureHost(u32 hash) {
     const auto given = GivenHosts().find(hash);
     return given == GivenHosts().end() ? 0u : given->second;
+}
+
+// ponytail: beside GivenHosts for the same reason (nfs/World.h untouched).
+static std::unordered_map<u32, u32>& GivenSides() {
+    static std::unordered_map<u32, u32> sides;
+    return sides;
+}
+
+void SetNewTextureSide(u32 hash, u32 side) {
+    if (side == 1024 || side == 2048) GivenSides()[hash] = side;
+    else GivenSides().erase(hash);
+}
+
+u32 NewTextureSide(u32 hash) {
+    const auto given = GivenSides().find(hash);
+    return given == GivenSides().end() ? 0u : given->second;
 }
 
 std::vector<const nfs::LoadedSection*> TextureHosts(const nfs::World& world, u32 like) {
@@ -545,7 +561,8 @@ bool StageNewWorldTexture(nfs::World& world, const std::string& name, u32 like, 
         error = L"could not read the image " + keptFile;
         return false;
     }
-    const u32 width = SideFor(imageWidth), height = SideFor(imageHeight);
+    const u32 cap = std::max(kMaxNewSide, NewTextureSide(NameHash(name)));
+    const u32 width = SideFor(imageWidth, cap), height = SideFor(imageHeight, cap);
     u32 mips = 1;
     while ((std::min(width, height) >> mips) >= 4) ++mips;
     // The alpha is opacity only where the texture copied says so.

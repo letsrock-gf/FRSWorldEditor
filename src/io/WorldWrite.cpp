@@ -1186,10 +1186,11 @@ size_t LoadWorldEdits(nfs::World& world, const std::wstring& realTracksFolder) {
         }
         if (line[0] == 'X') {
             // A new texture: its hash, the game texture it copies, its name, its kept image.
-            unsigned hash = 0, like = 0, host = 0;
+            unsigned hash = 0, like = 0, host = 0, side = 0;
             char name[64] = {}, kept[260] = {};
-            if (std::sscanf(line, "X %x %x %63s %259s %u", &hash, &like, name, kept, &host) < 4) continue;
+            if (std::sscanf(line, "X %x %x %63s %259s %u %u", &hash, &like, name, kept, &host, &side) < 4) continue;
             SetNewTextureHost(hash, host);   // the texture section that takes it, when the line names one
+            SetNewTextureSide(hash, side);   // its largest side, when the line names one (after the section)
             std::wstring why;
             if (StageNewWorldTexture(world, name, like,
                                      tracksFolder + kBackupFolder + L"\\textures\\" + std::wstring(kept, kept + std::strlen(kept)),
@@ -1434,8 +1435,11 @@ bool WriteWorldEdits(nfs::World& world, const std::wstring& tracksFolder, WorldW
         for (const nfs::LoadedSection* host : NewTextureHosts(world, *texture)) textureHosts.insert(host);
         if (!texture->header.empty()) continue;
         char line[400];
-        const u32 host = NewTextureHost(texture->hash);
-        if (host)
+        const u32 host = NewTextureHost(texture->hash), side = NewTextureSide(texture->hash);
+        if (side)   /* written after the section field, which is 0 when the line names no section */
+            std::snprintf(line, sizeof(line), "X %08X %08X %s %ls %u %u\n", texture->hash, texture->like,
+                          texture->name.c_str(), texture->file.c_str(), host, side);
+        else if (host)
             std::snprintf(line, sizeof(line), "X %08X %08X %s %ls %u\n", texture->hash, texture->like,
                           texture->name.c_str(), texture->file.c_str(), host);
         else

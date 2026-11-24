@@ -52,6 +52,10 @@ std::vector<const nfs::LoadedSection*> TextureHosts(const nfs::World& world, u32
 // The texture section (by number) that alone takes a new texture, when the edit list names one; 0 = none named.
 void SetNewTextureHost(u32 hash, u32 section);
 u32 NewTextureHost(u32 hash);
+// The largest side a new texture may be encoded at, when the edit list names one (X line, sixth field: 512,
+// 1024 or 2048; the game ships textures of each); 0 = none named, the usual 512.
+void SetNewTextureSide(u32 hash, u32 side);
+u32 NewTextureSide(u32 hash);
 
 bool StageNewWorldTexture(nfs::World& world, const std::string& name, u32 like, const std::wstring& keptFile,
                           std::wstring& error);
