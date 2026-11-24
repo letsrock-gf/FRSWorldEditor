@@ -15,6 +15,16 @@
 
 namespace {
 
+// The tabs of the list. A texture's city comes from its name: the editor names the ones it adds FRS_<...>,
+// and the ones of a converted city FRS_<game>_<...>. A new city = one name here and one prefix in CityOf.
+const wchar_t* const kCities[] = { L"All", L"Palmont", L"Bayview", L"Added" };
+
+int CityOf(const std::string& name) {
+    if (name.compare(0, 7, "FRS_U2_") == 0) return 2;   // Bayview, from Underground 2
+    if (name.compare(0, 4, "FRS_") == 0) return 3;      // added in the editor, of no city
+    return 1;                                           // shipped with the game
+}
+
 std::wstring Widen(const std::string& text) {
     if (text.empty()) return {};
     const int needed = ::MultiByteToWideChar(CP_ACP, 0, text.c_str(), (int)text.size(),
@@ -78,6 +88,7 @@ void TextureBrowser::Show(HINSTANCE instance, HWND parent, const nfs::World* wor
             LOG_ERROR("could not create the texture browser");
             return;
         }
+        Layout();   // the tabs are made in OnInit, not in the dialog template: they get their place here
     }
 
     Populate();
@@ -103,6 +114,7 @@ void TextureBrowser::Close() {
         ::DestroyWindow(dialog_);
         dialog_ = nullptr;
         list_   = nullptr;
+        tabs_   = nullptr;
     }
 }
 
@@ -123,6 +135,7 @@ INT_PTR CALLBACK TextureBrowser::DialogProc(HWND dialog, UINT message,
                 auto* change = (NMLISTVIEW*)lParam;
                 if (change->uNewState & LVIS_SELECTED) self->OnSelectionChanged();
             }
+            if (header->hwndFrom == self->tabs_ && header->code == TCN_SELCHANGE) self->Populate();
             return TRUE;
         }
 
@@ -183,6 +196,16 @@ void TextureBrowser::OnInit(HWND dialog) {
     ListView_SetExtendedListViewStyle(list_, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
     ::SendDlgItemMessageW(dialog, IDC_TEX_SEARCH, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search by name");
 
+    tabs_ = ::CreateWindowExW(0, WC_TABCONTROLW, L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TCS_FOCUSNEVER,
+                              0, 0, 0, 0, dialog, nullptr, nullptr, nullptr);
+    ::SendMessageW(tabs_, WM_SETFONT, ::SendMessageW(dialog, WM_GETFONT, 0, 0), TRUE);
+    for (int i = 0; i < (int)std::size(kCities); ++i) {
+        TCITEMW tab{};
+        tab.mask    = TCIF_TEXT;
+        tab.pszText = (LPWSTR)kCities[i];
+        TabCtrl_InsertItem(tabs_, i, &tab);
+    }
+
     struct { const wchar_t* title; int width; } columns[] = {
         { L"Name",   150 },
         { L"Size",    62 },
@@ -222,6 +245,12 @@ void TextureBrowser::Populate() {
                                            return !std::binary_search(filter_.begin(), filter_.end(),
                                                                       texture->hash);
                                        }),
+                        textures_.end());
+
+    // The chosen tab keeps one city's textures (tab 0: all of them).
+    if (const int city = tabs_ ? TabCtrl_GetCurSel(tabs_) : 0; city > 0)
+        textures_.erase(std::remove_if(textures_.begin(), textures_.end(),
+                                       [city](const nfs::Texture* texture) { return CityOf(texture->name) != city; }),
                         textures_.end());
 
     // The search field keeps the textures whose name holds what was typed,
@@ -493,8 +522,11 @@ void TextureBrowser::Layout() {
     const int footer    = dpi(4) + infoH + pad + button + dpi(6) + button;
 
     const int searchH = line + dpi(6);
-    ::MoveWindow(::GetDlgItem(dialog_, IDC_TEX_SEARCH), pad, pad, listWidth, searchH, TRUE);
-    ::MoveWindow(list_, pad, pad + searchH + dpi(4), listWidth, client.bottom - 2 * pad - searchH - dpi(4), TRUE);
+    const int tabsH   = tabs_ ? line + dpi(10) : 0;   // the strip of tabs only: the list is not inside it
+    if (tabs_) ::MoveWindow(tabs_, pad, pad, listWidth, tabsH, TRUE);
+    const int top = pad + tabsH + (tabs_ ? dpi(4) : 0);
+    ::MoveWindow(::GetDlgItem(dialog_, IDC_TEX_SEARCH), pad, top, listWidth, searchH, TRUE);
+    ::MoveWindow(list_, pad, top + searchH + dpi(4), listWidth, client.bottom - top - pad - searchH - dpi(4), TRUE);
 
     const int previewX = pad * 2 + listWidth;
     const int previewW = std::max(dpi(60), (int)client.right - previewX - pad);

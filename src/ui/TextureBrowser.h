@@ -44,6 +44,7 @@ private:
 
     HWND dialog_ = nullptr;
     HWND list_   = nullptr;
+    HWND tabs_   = nullptr;     // one tab a city, so their textures are not listed mixed
     const nfs::World* world_ = nullptr;
 
     std::vector<const nfs::Texture*> textures_;
