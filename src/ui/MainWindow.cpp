@@ -277,10 +277,6 @@ void MainWindow::QueueThumbnailWarmUp() {
     for (const nfs::SolidObject* model : world_->AllModels()) {
         if (!model || model->IsBackdrop()) continue;
         if (nfs::CategorizeModel(model->name).group == L"Terrain and roads") continue;
-        // Pieces of a converted city (FRS_BV_ tiles, FRS_BVI_ models: 2 000 of them for Bayview) are not warmed up:
-        // their pictures were drawn in the background for minutes after every open, which made the view stutter.
-        // The Library still draws the ones it shows.
-        if (model->name.rfind("FRS_BV", 0) == 0) continue;
         if (!thumbnails_.Cached(*model)) thumbsToWarm_.push_back(model);
     }
     // Drawn from the back of the list, so reverse it to go in catalogue order.
