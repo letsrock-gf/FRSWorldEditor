@@ -28,6 +28,8 @@ struct PlacedInstance {
     Mat4        transform;       // rotation and scale rows, translation in row 3
     Aabb        modelBounds;     // the model's own box, for the record's world box
     u16         flags = 0;
+    // NFS World: the game physics it gets (io::kPhysicsPresets index, 0 none).
+    u8          physics = 0;
     // The model's triangle count and bounding radius, for a model the pack
     // does not list yet. `infoTemplate` is the 68-byte entry another section
     // already uses for the same model; copying it is preferred when there is

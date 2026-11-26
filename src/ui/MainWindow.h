@@ -268,6 +268,7 @@ private:
 
     void LoadAllSections();
     void PopulateSectionTree();
+    void FillTreeBranch(HTREEITEM branch, intptr_t what);
     void OnSectionSelected();
     // For a row of the tree (its lParam): the extension's TreeItemMark, -1
     // for the editor's own rows.

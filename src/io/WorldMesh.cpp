@@ -912,20 +912,114 @@ u32 PickLikeTexture(const nfs::World& world, const nfs::LoadedSection& target, b
 // writing): opening the list read each twice and every save three times more.
 // ponytail: the parsed meshes stay in memory (about twice the OBJ text; 170 MB of OBJ on 22/11); drop the
 // entries of models no longer in world.newModels if that ever weighs.
+//
+// meshes.cache, beside the meshes folder: those parsed meshes in one file, so the next start does not open
+// every OBJ (24/11: 10 726 files, 95 s of a 180 s start, nearly all of it waiting on the opens, not parsing).
+// Each entry carries its OBJ's size and time of writing and is used only while both still match, so a file
+// changed in Blender is parsed again. SaveKeptObjPack writes it when something was parsed.
+struct KeptObj { u64 size = 0, time = 0; std::vector<ObjMesh> meshes; };
+struct KeptObjPack {
+    std::unordered_map<std::wstring, KeptObj> known;    // by the path asked for: what this run has used
+    std::unordered_map<std::wstring, KeptObj> stored;   // by file name: read from meshes.cache, not asked for yet
+    std::wstring folder;                                // the meshes folder the file serves: the first one asked for
+    bool loaded = false, dirty = false;
+};
+KeptObjPack& ObjPack() { static KeptObjPack pack; return pack; }
+constexpr u32 kObjPackMagic = 0x314B4F46;   // "FOK1": change it when ObjMesh changes
+
+template <typename T> void PutPod(std::vector<u8>& out, const T& value) {
+    const u8* bytes = (const u8*)&value;
+    out.insert(out.end(), bytes, bytes + sizeof(T));
+}
+template <typename T> void PutMany(std::vector<u8>& out, const T* values, size_t count) {
+    PutPod(out, (u64)count);
+    const u8* bytes = (const u8*)values;
+    out.insert(out.end(), bytes, bytes + count * sizeof(T));
+}
+struct PackCursor {
+    const u8* at; const u8* end; bool ok = true;
+    template <typename T> T Pod() {
+        T value{};
+        if ((size_t)(end - at) < sizeof(T)) { ok = false; return value; }
+        std::memcpy(&value, at, sizeof(T));
+        at += sizeof(T);
+        return value;
+    }
+    template <typename Container> void Many(Container& out) {
+        using T = typename Container::value_type;
+        const u64 count = Pod<u64>();
+        if (!ok || count > (u64)(end - at) / sizeof(T)) { ok = false; return; }
+        out.resize((size_t)count);
+        if (count) std::memcpy(&out[0], at, (size_t)count * sizeof(T));
+        at += (size_t)count * sizeof(T);
+    }
+};
+
+void LoadObjPack(const std::filesystem::path& meshesFolder) {
+    KeptObjPack& pack = ObjPack();
+    pack.loaded = true;
+    pack.folder = meshesFolder.wstring();
+    std::ifstream in(meshesFolder.parent_path() / L"meshes.cache", std::ios::binary | std::ios::ate);
+    if (!in) return;
+    std::vector<u8> bytes((size_t)in.tellg());
+    in.seekg(0);
+    in.read((char*)bytes.data(), (std::streamsize)bytes.size());
+    if (!in) return;
+    PackCursor cursor{ bytes.data(), bytes.data() + bytes.size() };
+    if (cursor.Pod<u32>() != kObjPackMagic) return;
+    std::unordered_map<std::wstring, KeptObj> read;
+    for (u64 left = cursor.Pod<u64>(); left > 0 && cursor.ok; --left) {
+        std::wstring name;
+        KeptObj kept;
+        cursor.Many(name);
+        kept.size = cursor.Pod<u64>();
+        kept.time = cursor.Pod<u64>();
+        for (u64 meshes = cursor.Pod<u64>(); meshes > 0 && cursor.ok; --meshes) {
+            ObjMesh& mesh = kept.meshes.emplace_back();
+            cursor.Many(mesh.name);
+            cursor.Many(mesh.positions);
+            cursor.Many(mesh.colors);
+            cursor.Many(mesh.normals);
+            cursor.Many(mesh.uvs);
+            cursor.Many(mesh.indices);
+            cursor.Many(mesh.sourcePositions);
+            for (u64 groups = cursor.Pod<u64>(); groups > 0 && cursor.ok; --groups) {
+                ObjFaceGroup& group = mesh.groups.emplace_back();
+                cursor.Many(group.material);
+                group.firstIndex = cursor.Pod<u32>();
+                group.indexCount = cursor.Pod<u32>();
+            }
+        }
+        if (cursor.ok) read.emplace(std::move(name), std::move(kept));
+    }
+    if (!cursor.ok) { LOG_WARN("meshes.cache is cut short: every OBJ is parsed again"); return; }
+    LOG_INFO("meshes.cache: %zu parsed OBJ files read (%zu MiB)", read.size(), bytes.size() >> 20);
+    pack.stored = std::move(read);
+}
+
 bool ReadKeptObj(const std::wstring& path, std::vector<ObjMesh>& out, std::wstring& why) {
-    struct Kept { u64 size = 0, time = 0; std::vector<ObjMesh> meshes; };
-    static std::unordered_map<std::wstring, Kept> known;
+    KeptObjPack& pack = ObjPack();
     std::error_code failed;
     const std::filesystem::path file(path);
     const u64 size = (u64)std::filesystem::file_size(file, failed);
     const u64 time = (u64)std::filesystem::last_write_time(file, failed).time_since_epoch().count();
     if (failed) return ReadObjMeshes(path, out, why);
-    Kept& kept = known[path];
+    if (!pack.loaded) LoadObjPack(file.parent_path());
+    const bool served = file.parent_path().wstring() == pack.folder;
+    KeptObj& kept = pack.known[path];
     if (kept.size != size || kept.time != time || kept.meshes.empty()) {
-        kept = Kept{};
-        if (!ReadObjMeshes(path, kept.meshes, why)) { known.erase(path); return false; }
-        kept.size = size;
-        kept.time = time;
+        kept = KeptObj{};
+        const auto had = served ? pack.stored.find(file.filename().wstring()) : pack.stored.end();
+        if (had != pack.stored.end() && had->second.size == size && had->second.time == time &&
+            !had->second.meshes.empty()) {
+            kept = std::move(had->second);
+            pack.stored.erase(had);
+        } else {
+            if (!ReadObjMeshes(path, kept.meshes, why)) { pack.known.erase(path); return false; }
+            kept.size = size;
+            kept.time = time;
+            if (served) pack.dirty = true;
+        }
     }
     out = kept.meshes;
     return true;
@@ -1186,6 +1280,57 @@ std::unordered_map<u32, CarBuilt>& CarsBuilt() {
 }
 
 } // namespace
+
+void SaveKeptObjPack() {
+    KeptObjPack& pack = ObjPack();
+    if (!pack.dirty || pack.folder.empty()) return;
+    // Only what this run asked for: the entry of an OBJ no model uses any more is left behind.
+    std::vector<u8> out;
+    PutPod(out, kObjPackMagic);
+    const size_t countAt = out.size();
+    PutPod(out, (u64)0);
+    u64 count = 0;
+    for (const auto& [path, kept] : pack.known) {
+        const std::filesystem::path file(path);
+        if (kept.meshes.empty() || file.parent_path().wstring() != pack.folder) continue;
+        const std::wstring name = file.filename().wstring();
+        PutMany(out, name.data(), name.size());
+        PutPod(out, kept.size);
+        PutPod(out, kept.time);
+        PutPod(out, (u64)kept.meshes.size());
+        for (const ObjMesh& mesh : kept.meshes) {
+            PutMany(out, mesh.name.data(), mesh.name.size());
+            PutMany(out, mesh.positions.data(), mesh.positions.size());
+            PutMany(out, mesh.colors.data(), mesh.colors.size());
+            PutMany(out, mesh.normals.data(), mesh.normals.size());
+            PutMany(out, mesh.uvs.data(), mesh.uvs.size());
+            PutMany(out, mesh.indices.data(), mesh.indices.size());
+            PutMany(out, mesh.sourcePositions.data(), mesh.sourcePositions.size());
+            PutPod(out, (u64)mesh.groups.size());
+            for (const ObjFaceGroup& group : mesh.groups) {
+                PutMany(out, group.material.data(), group.material.size());
+                PutPod(out, group.firstIndex);
+                PutPod(out, group.indexCount);
+            }
+        }
+        ++count;
+    }
+    std::memcpy(out.data() + countAt, &count, sizeof(count));
+
+    const std::filesystem::path target = std::filesystem::path(pack.folder).parent_path() / L"meshes.cache";
+    const std::filesystem::path fresh = target.wstring() + L".new";
+    {
+        std::ofstream file(fresh, std::ios::binary | std::ios::trunc);
+        file.write((const char*)out.data(), (std::streamsize)out.size());
+        if (!file) { LOG_WARN("meshes.cache could not be written"); return; }
+    }
+    if (!::MoveFileExW(fresh.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        LOG_WARN("meshes.cache could not be replaced (error %lu)", ::GetLastError());
+        return;
+    }
+    pack.dirty = false;
+    LOG_INFO("meshes.cache: %llu parsed OBJ files written (%zu MiB)", (unsigned long long)count, out.size() >> 20);
+}
 
 bool WholeReplacement(const std::wstring& keptPath) {
     std::ifstream in(keptPath);
@@ -1568,22 +1713,35 @@ u32 SoleTexture(const nfs::World& world, u32 pack) {
 // without it -- in practice one per band. Done on every save; nothing of it goes into the list.
 void HostTexturesAlongside(nfs::World& world) {
     std::map<u32, std::vector<u32>> unserved;   // texture -> the sections drawing it that load none of its packs
+    // Each texture is judged once per section and its hosts read once: the same model and texture come up
+    // thousands of times (this loop alone was 45 s of a save with Bayview, 24/11). Nothing here changes a host.
+    const ULONGLONG from = ::GetTickCount64();
+    std::unordered_map<u32, std::vector<u32>> hostsOf;
+    std::unordered_set<u32> judged, seenModels;
     for (const auto& section : world.Loaded()) {
         if (!section->info) continue;
         const u32 number = section->info->number;
         std::vector<u32> models = LoadedWith(*section);
         for (const auto& placement : section->placements) models.push_back(placement.instance.modelHash);
+        judged.clear();
+        seenModels.clear();
         for (const u32 hash : models) {
+            if (!seenModels.insert(hash).second) continue;
             const nfs::SolidObject* model = world.FindModel(hash);
             if (!model) continue;
             for (const u32 t : model->textureHashes) {
+                if (!judged.insert(t).second) continue;
                 const nfs::World::NewTexture* texture = NewTextureOf(world, t);
-                if (!texture || Served(world, number, HostNumbers(world, *texture))) continue;
+                if (!texture) continue;
+                auto hosts = hostsOf.find(t);
+                if (hosts == hostsOf.end()) hosts = hostsOf.emplace(t, HostNumbers(world, *texture)).first;
+                if (Served(world, number, hosts->second)) continue;
                 auto& at = unserved[t];
                 if (std::find(at.begin(), at.end(), number) == at.end()) at.push_back(number);
             }
         }
     }
+    LOG_INFO("save timing: textures against the zones' sections %llu ms", ::GetTickCount64() - from);
     for (auto& [t, sections] : unserved) {
         auto* texture = const_cast<nfs::World::NewTexture*>(NewTextureOf(world, t));
         std::sort(sections.begin(), sections.end());
@@ -1661,6 +1819,80 @@ std::vector<u32> StageCopiedTextures(nfs::World& world) {
     return needed;
 }
 
+Vec3 BakedScale(const nfs::PlacedInstance& placement) {
+    const Vec3 one{ 1.0f, 1.0f, 1.0f };
+    if (placement.physics == 0) return one;
+    float s[3];
+    bool unit = true;
+    for (int row = 0; row < 3; ++row) {
+        const Mat4& m = placement.transform;
+        s[row] = std::round(Length(Vec3{ m.m[row][0], m.m[row][1], m.m[row][2] }) * 1000.0f) / 1000.0f;
+        if (s[row] <= 0.0f) return one;
+        unit = unit && std::fabs(s[row] - 1.0f) < 0.0005f;
+    }
+    return unit ? one : Vec3{ s[0], s[1], s[2] };
+}
+
+namespace {
+
+bool SameScale(const Vec3& a, const Vec3& b) { return a.x == b.x && a.y == b.y && a.z == b.z; }
+
+// The copy's vertices, boxes and area multiplied by `s` (model axes). Positions
+// are the first three floats of every float layout; effects 8 and 9 keep i16
+// (x / 32767 * 8 m, nfs/SolidList.cpp), which a copy past 8 m cannot hold.
+// ponytail: normals stay as shipped; a stretched (non-uniform) copy shades a
+// little off. Scale them by 1/s and renormalise if that shows.
+bool ScaleObject(Node& object, const Vec3& s, std::wstring& why) {
+    Node* header = ChildOf(object, nfs::kChunkSolidObjectHeader);
+    Node* mesh   = ChildOf(object, nfs::kChunkMeshContainer);
+    Node* mats   = mesh ? ChildOf(*mesh, nfs::kChunkMeshMaterials) : nullptr;
+    if (!header || !mats || header->payload.size() < kHdrSize || mats->payload.size() % kMatSize) {
+        why = L"the model's chunks are not the layout the editor writes";
+        return false;
+    }
+    const auto scale = [&](u8* at) { const Vec3 v = ReadVec3(at); WriteVec3(at, { v.x * s.x, v.y * s.y, v.z * s.z }); };
+    scale(header->payload.data() + kHdrMin);
+    scale(header->payload.data() + kHdrMax);
+    const float areaScale = std::pow(s.x * s.y * s.z, 2.0f / 3.0f);
+    u8* h = header->payload.data();
+    Write<float>(h + kHdrArea, Read<float>(h + kHdrArea) * areaScale);
+    Write<float>(h + kHdrDensity, Read<float>(h + kHdrDensity) / areaScale);
+
+    std::vector<Node*> buffers;
+    for (Node& child : mesh->children)
+        if (child.id == nfs::kChunkMeshVertices) buffers.push_back(&child);
+    struct Run { u32 effect, vertices; };
+    std::vector<Run> runs;
+    for (size_t m = 0; m < mats->payload.size() / kMatSize; ++m) {
+        u8* entry = mats->payload.data() + m * kMatSize;
+        scale(entry + kMatMin);
+        scale(entry + kMatMax);
+        const u32 effect = Read<u32>(entry + kMatEffect);
+        if (runs.empty() || runs.back().effect != effect) runs.push_back({ effect, 0 });
+        runs.back().vertices += Read<u32>(entry + kMatVertices);
+    }
+    if (runs.size() != buffers.size()) { why = L"its vertex buffers do not match its runs of materials"; return false; }
+    for (size_t r = 0; r < runs.size(); ++r) {
+        std::vector<u8>& bytes = buffers[r]->payload;
+        if (!runs[r].vertices || bytes.size() % runs[r].vertices) { why = L"a vertex buffer is not the size its materials say"; return false; }
+        const size_t stride = bytes.size() / runs[r].vertices;
+        const bool packed = runs[r].effect == 0x8 || runs[r].effect == 0x9;
+        if (stride < (packed ? 6u : 12u)) { why = L"a vertex is too short to hold a position"; return false; }
+        for (size_t at = 0; at + stride <= bytes.size(); at += stride) {
+            if (!packed) { scale(bytes.data() + at); continue; }
+            const float f[3] = { s.x, s.y, s.z };
+            for (int c = 0; c < 3; ++c) {
+                const long v = std::lround(Read<i16>(bytes.data() + at + (size_t)c * 2) * f[c]);
+                if (v < -32767 || v > 32767) { why = L"scaled, it is wider than the 8 m a car vertex holds"; return false; }
+                Write<i16>(bytes.data() + at + (size_t)c * 2, (i16)v);
+            }
+        }
+    }
+    return true;
+}
+
+} // namespace
+
 bool SectionModelCopies(const nfs::World& world, const nfs::LoadedSection& loaded,
                         std::vector<WorldModelCopy>& out, std::wstring& error) {
     if (!loaded.info || loaded.placements.empty()) return true;
@@ -1669,18 +1901,23 @@ bool SectionModelCopies(const nfs::World& world, const nfs::LoadedSection& loade
     bool texturesRead = false;
     for (const auto& placement : loaded.placements) {
         const u32 hash = placement.instance.modelHash;
-        if (std::binary_search(here.begin(), here.end(), hash)) continue;
-        if (std::any_of(out.begin(), out.end(), [&](const WorldModelCopy& c) { return c.source == hash; })) continue;
+        const Vec3 scale = BakedScale(placement.instance);
+        const bool scaled = !SameScale(scale, { 1.0f, 1.0f, 1.0f });
+        const bool loadedHere = std::binary_search(here.begin(), here.end(), hash);
+        if (loadedHere && !scaled) continue;
+        if (std::any_of(out.begin(), out.end(), [&](const WorldModelCopy& c) {
+                return c.source == hash && SameScale(c.scale, scale); })) continue;
         const nfs::SolidObject* model = world.FindModel(hash);
         if (!model) { error = L"The model " + Hex(hash) + L" placed in " + Widen(loaded.info->name) + L" is not loaded."; return false; }
-        if (!texturesRead) {
+        if (!loadedHere && !texturesRead) {
             textures = SectionTextures(world, here);
             texturesRead = true;
         }
-        // Textures the section does not load come with it (StageCopiedTextures).
+        // Textures the section does not load come with it (StageCopiedTextures);
+        // a model it loads draws with its textures already.
         std::wstring missing;
         for (u32 t : model->textureHashes)
-            if (!std::binary_search(textures.begin(), textures.end(), t) && !CopyCovers(world, t, textures))
+            if (!loadedHere && !std::binary_search(textures.begin(), textures.end(), t) && !CopyCovers(world, t, textures))
                 missing += L" " + Hex(t);
         if (!missing.empty()) {
             // ponytail: written as before -- the record names the model where it is
@@ -1693,6 +1930,12 @@ bool SectionModelCopies(const nfs::World& world, const nfs::LoadedSection& loade
         WorldModelCopy copy;
         copy.source = hash;
         copy.name = model->name + "_FRS" + std::to_string(loaded.info->number);
+        if (scaled) {
+            copy.scaled = true;
+            copy.scale = scale;
+            copy.name += "_S" + std::to_string(std::lround(scale.x * 1000.0f)) + "_" +
+                         std::to_string(std::lround(scale.y * 1000.0f)) + "_" + std::to_string(std::lround(scale.z * 1000.0f));
+        }
         copy.copy = StringHash(copy.name);
         if (world.FindModel(copy.copy)) {
             error = L"The copy of " + Widen(model->name) + L" for section " + Widen(loaded.info->name) +
@@ -2208,9 +2451,11 @@ bool WriteWorldMeshes(const nfs::World& world, const nfs::LoadedSection& loaded,
     std::vector<Node> added;
     // The paint of the cars among them (0x135200 chunks), loaded before their objects.
     std::vector<u8> paints;
+    std::vector<u32> painted;   // once each: a car and its scaled copy share the paint
     const auto addPaint = [&](u32 hash) {
         const nfs::World::NewModel* car = NewModelOf(world, hash);
-        if (!car || car->car.empty()) return;
+        if (!car || car->car.empty() || std::count(painted.begin(), painted.end(), hash)) return;
+        painted.push_back(hash);
         float rgb[3];
         nfs::HlsToRgb(car->hue, car->lightness, car->saturation, rgb);
         const std::vector<u8> material = nfs::CarPaintMaterial(CarPaintName(hash), rgb, car->metallic, car->gloss);
@@ -2243,6 +2488,10 @@ bool WriteWorldMeshes(const nfs::World& world, const nfs::LoadedSection& loaded,
             }
             Node* header = ChildOf(node, nfs::kChunkSolidObjectHeader);
             header->payload = HeaderWithName(header->payload, copy.name);
+            if (copy.scaled && !ScaleObject(node, copy.scale, why)) {
+                error = L"The model " + Hex(copy.source) + L" could not be scaled for " + Widen(loaded.info->name) + L": " + why;
+                return false;
+            }
             added.push_back(std::move(node));
             addPaint(copy.source);
         }

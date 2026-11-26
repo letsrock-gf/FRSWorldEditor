@@ -10,6 +10,8 @@
 #include <fstream>
 #include <unordered_map>
 
+#include <windows.h>
+
 // What is written here was measured on the shipped files (tools/nfsw/
 // tex_layout_stats.py), on every third section file of the map:
 //
@@ -511,19 +513,176 @@ bool StageCarTexture(nfs::World& world, const nfs::Texture& texture, const std::
     return true;
 }
 
-// EncodeForSlot, with the result kept beside the image in cache\<image>.<w>x<h>.<fourcc>.<levels>.bin: the image's
-// size and time of writing, then the levels. A kept image that was written again is compressed again.
-// ponytail: one small file per texture; one file per folder if thousands of opens/reads show up as slow.
+// textures.cache, beside the textures folder: every encoded new texture and every image's size in one file,
+// read through one handle. Opening a file costs about 8 ms here whatever its size (the antivirus looks at each
+// one: 1 500 opens took 12 s on 24/11), and the edit list used to open two per new texture, 6 000 at a start.
+// Records one after the other, the later of two with the same key the one that counts:
+//   u32 "FTK1", u32 key length, the key (wide), u64 image size, u64 image time, u32 width, u32 height,
+//   u64 byte count, the bytes.
+// The key is the image's file name and what was asked of it; size and time are the image's own, so an image
+// written again is encoded again. A record with no bytes only says the image's width and height.
+// ponytail: only grows (an image encoded again leaves its old record behind): delete the file to make it
+// again from the images. One editor at a time has it: a second one finds it taken and works without.
+namespace {
+
+struct KeptTextureRecord { u64 stamp[2] = {}; u32 width = 0, height = 0; u64 at = 0, size = 0; };
+struct KeptTextureFile {
+    std::unordered_map<std::wstring, KeptTextureRecord> known;
+    std::wstring folder;                    // the textures folder it serves: the first one asked for
+    HANDLE file = INVALID_HANDLE_VALUE;
+    u64 end = 0;                            // where the next record goes
+    bool opened = false;
+};
+constexpr u32 kKeptTextureMagic = 0x314B5446;   // "FTK1"
+
+bool ReadAt(HANDLE file, u64 at, void* out, size_t size) {
+    LARGE_INTEGER where{};
+    where.QuadPart = (LONGLONG)at;
+    if (!::SetFilePointerEx(file, where, nullptr, FILE_BEGIN)) return false;
+    for (size_t done = 0; done < size;) {
+        DWORD got = 0;
+        const DWORD want = (DWORD)std::min<size_t>(size - done, 1u << 24);
+        if (!::ReadFile(file, (u8*)out + done, want, &got, nullptr) || got == 0) return false;
+        done += got;
+    }
+    return true;
+}
+
+KeptTextureFile& KeptTextures(const std::filesystem::path& texturesFolder) {
+    static KeptTextureFile kept;
+    if (kept.opened) return kept;
+    kept.opened = true;
+    kept.folder = texturesFolder.wstring();
+    const std::wstring path = (texturesFolder.parent_path() / L"textures.cache").wstring();
+    kept.file = ::CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (kept.file == INVALID_HANDLE_VALUE) return kept;
+    LARGE_INTEGER length{};
+    ::GetFileSizeEx(kept.file, &length);
+    // Whatever follows the last whole record (a write cut short) is written over.
+    for (u64 at = 0; at + 8 <= (u64)length.QuadPart;) {
+        u32 head[2] = {};
+        if (!ReadAt(kept.file, at, head, sizeof(head)) || head[0] != kKeptTextureMagic || head[1] > 1024) break;
+        std::wstring key(head[1], L'\0');
+        struct { u64 stamp[2]; u32 width, height; u64 size; } body{};
+        const u64 bodyAt = at + 8 + (u64)head[1] * sizeof(wchar_t);
+        if (bodyAt + sizeof(body) > (u64)length.QuadPart) break;
+        if (head[1] && !ReadAt(kept.file, at + 8, key.data(), head[1] * sizeof(wchar_t))) break;
+        if (!ReadAt(kept.file, bodyAt, &body, sizeof(body))) break;
+        const u64 next = bodyAt + sizeof(body) + body.size;
+        if (next > (u64)length.QuadPart) break;
+        KeptTextureRecord& record = kept.known[key];
+        record.stamp[0] = body.stamp[0];
+        record.stamp[1] = body.stamp[1];
+        record.width    = body.width;
+        record.height   = body.height;
+        record.at       = bodyAt + sizeof(body);
+        record.size     = body.size;
+        kept.end = at = next;
+    }
+    LOG_INFO("textures.cache: %zu records, %llu MiB", kept.known.size(), (unsigned long long)(kept.end >> 20));
+    return kept;
+}
+
+// The record of `key` for an image with this size and time, or null.
+const KeptTextureRecord* KeptRecord(KeptTextureFile& kept, const std::wstring& key, const u64 stamp[2]) {
+    if (kept.file == INVALID_HANDLE_VALUE) return nullptr;
+    const auto found = kept.known.find(key);
+    if (found == kept.known.end() || found->second.stamp[0] != stamp[0] || found->second.stamp[1] != stamp[1])
+        return nullptr;
+    return &found->second;
+}
+
+void KeepRecord(KeptTextureFile& kept, const std::wstring& key, const u64 stamp[2], u32 width, u32 height,
+                const u8* bytes, size_t size) {
+    if (kept.file == INVALID_HANDLE_VALUE) return;
+    std::vector<u8> head;
+    const auto put = [&head](const void* data, size_t count) {
+        head.insert(head.end(), (const u8*)data, (const u8*)data + count);
+    };
+    const u32 lead[2] = { kKeptTextureMagic, (u32)key.size() };
+    const u64 byteCount = size;
+    put(lead, sizeof(lead));
+    put(key.data(), key.size() * sizeof(wchar_t));
+    put(stamp, 2 * sizeof(u64));
+    put(&width, sizeof(width));
+    put(&height, sizeof(height));
+    put(&byteCount, sizeof(byteCount));
+
+    LARGE_INTEGER where{};
+    where.QuadPart = (LONGLONG)kept.end;
+    DWORD wrote = 0;
+    if (!::SetFilePointerEx(kept.file, where, nullptr, FILE_BEGIN) ||
+        !::WriteFile(kept.file, head.data(), (DWORD)head.size(), &wrote, nullptr) || wrote != head.size())
+        return;
+    for (size_t done = 0; done < size;) {
+        const DWORD want = (DWORD)std::min<size_t>(size - done, 1u << 24);
+        if (!::WriteFile(kept.file, bytes + done, want, &wrote, nullptr) || wrote != want) return;
+        done += wrote;
+    }
+    KeptTextureRecord& record = kept.known[key];
+    record.stamp[0] = stamp[0];
+    record.stamp[1] = stamp[1];
+    record.width    = width;
+    record.height   = height;
+    record.at       = kept.end + head.size();
+    record.size     = size;
+    kept.end        = record.at + size;
+}
+
+// The image's size and time of writing, without opening it. False when it cannot be asked.
+bool ImageStamp(const std::filesystem::path& image, u64 stamp[2]) {
+    std::error_code failed;
+    stamp[0] = (u64)std::filesystem::file_size(image, failed);
+    stamp[1] = (u64)std::filesystem::last_write_time(image, failed).time_since_epoch().count();
+    return !failed;
+}
+
+// ImageSize, asked of textures.cache first: the image itself is opened only the first time.
+bool KeptImageSize(const std::wstring& image, u32& width, u32& height) {
+    const std::filesystem::path source(image);
+    u64 stamp[2] = {};
+    if (!ImageStamp(source, stamp)) return ImageSize(image, width, height);
+    KeptTextureFile& kept = KeptTextures(source.parent_path());
+    if (source.parent_path().wstring() != kept.folder) return ImageSize(image, width, height);
+    const std::wstring key = source.filename().wstring() + L".size";
+    if (const KeptTextureRecord* record = KeptRecord(kept, key, stamp)) {
+        width  = record->width;
+        height = record->height;
+        return width && height;
+    }
+    if (!ImageSize(image, width, height)) return false;
+    KeepRecord(kept, key, stamp, width, height, nullptr, 0);
+    return true;
+}
+
+} // namespace
+
+// EncodeForSlot, with the result kept: in textures.cache (above), and before 24/11 beside the image in
+// cache\<image>.<w>x<h>.<fourcc>.<levels>.bin (the image's size and time of writing, then the levels). Those
+// files are still read, once each: what they hold goes into textures.cache. A kept image that was written
+// again is compressed again.
 bool EncodeCached(const std::wstring& image, u32 width, u32 height, u32 fourCc, u32 mips, std::vector<u8>& pixels,
                   std::wstring& error) {
     namespace fs = std::filesystem;
-    std::error_code failed;
     const fs::path source(image);
-    const u64 stamp[2] = { (u64)fs::file_size(source, failed),
-                           (u64)fs::last_write_time(source, failed).time_since_epoch().count() };
+    u64 stamp[2] = {};
+    const bool failed = !ImageStamp(source, stamp);
     wchar_t tail[64];
     ::swprintf_s(tail, L".%ux%u.%08X.%u.bin", width, height, fourCc, mips);
-    const fs::path kept = source.parent_path() / L"cache" / (source.filename().wstring() + tail);
+    const std::wstring key = source.filename().wstring() + tail;
+    KeptTextureFile* packed = nullptr;
+    if (!failed) {
+        KeptTextureFile& kept = KeptTextures(source.parent_path());
+        if (kept.file != INVALID_HANDLE_VALUE && source.parent_path().wstring() == kept.folder) packed = &kept;
+    }
+    if (packed)
+        if (const KeptTextureRecord* record = KeptRecord(*packed, key, stamp); record && record->size) {
+            pixels.resize((size_t)record->size);
+            if (ReadAt(packed->file, record->at, pixels.data(), pixels.size())) return true;
+        }
+
+    const fs::path kept = source.parent_path() / L"cache" / key;
     if (!failed) {
         std::ifstream in(kept, std::ios::binary | std::ios::ate);
         const std::streamoff size = in ? (std::streamoff)in.tellg() : 0;
@@ -534,13 +693,19 @@ bool EncodeCached(const std::wstring& image, u32 width, u32 height, u32 fourCc, 
             if (had[0] == stamp[0] && had[1] == stamp[1]) {
                 pixels.resize((size_t)size - sizeof(had));
                 in.read((char*)pixels.data(), (std::streamsize)pixels.size());
-                if (in) return true;
+                if (in) {
+                    if (packed) KeepRecord(*packed, key, stamp, width, height, pixels.data(), pixels.size());
+                    return true;
+                }
             }
         }
     }
     if (!EncodeForSlot(image, width, height, fourCc, mips, pixels, error)) return false;
-    if (!failed) {
-        fs::create_directories(kept.parent_path(), failed);
+    if (packed) {
+        KeepRecord(*packed, key, stamp, width, height, pixels.data(), pixels.size());
+    } else if (!failed) {
+        std::error_code ignored;
+        fs::create_directories(kept.parent_path(), ignored);
         std::ofstream out(kept, std::ios::binary | std::ios::trunc);
         out.write((const char*)stamp, sizeof(stamp));
         out.write((const char*)pixels.data(), (std::streamsize)pixels.size());
@@ -557,7 +722,7 @@ bool StageNewWorldTexture(nfs::World& world, const std::string& name, u32 like, 
         return false;
     }
     u32 imageWidth = 0, imageHeight = 0;
-    if (!ImageSize(keptFile, imageWidth, imageHeight)) {
+    if (!KeptImageSize(keptFile, imageWidth, imageHeight)) {
         error = L"could not read the image " + keptFile;
         return false;
     }

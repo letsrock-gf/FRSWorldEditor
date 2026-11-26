@@ -96,6 +96,11 @@ bool ImportWorldMeshes(nfs::World& world, const std::wstring& tracksFolder, cons
 bool StageNewWorldModel(nfs::World& world, u32 sectionNumber, u32 hash, const std::wstring& keptPath,
                         std::wstring& error);
 
+// Writes meshes.cache (the parsed OBJ of every new model, one file beside the meshes folder) when an OBJ was
+// parsed since it was last written. Called after the edit list is read.
+// ponytail: not after a save; an OBJ imported in this run is parsed once more at the next start, then stored.
+void SaveKeptObjPack();
+
 // Whether a placement anywhere uses this model.
 bool ModelPlaced(const nfs::World& world, u32 hash);
 
@@ -113,7 +118,16 @@ std::vector<u32> StageCopiedTextures(nfs::World& world);
 struct WorldModelCopy {
     u32 source = 0, copy = 0;
     std::string name;
+    // A physics placement's copy with its scale in the vertices (BakedScale): the
+    // game's prop (0x34027) has a rotation and a position only, so a knocked
+    // object would come back at the model's own size.
+    bool scaled = false;
+    Vec3 scale{ 1.0f, 1.0f, 1.0f };
 };
+// The scale a placement's copy takes into its vertices: the length of each matrix
+// row (its local axes), to a thousandth, for a placement with a physics preset;
+// (1, 1, 1) for any other, or when every axis is within a thousandth of 1.
+Vec3 BakedScale(const nfs::PlacedInstance& placement);
 // The models `loaded`'s placements need copied into its file. False, with why,
 // when one cannot be.
 bool SectionModelCopies(const nfs::World& world, const nfs::LoadedSection& loaded,

@@ -246,16 +246,17 @@ void MainWindow::DrawShellTree(HTREEITEM item, int depth) {
         info.cchTextMax = 259;
         info.stateMask = TVIS_EXPANDED;
         ::SendMessageW(sectionTree_, TVM_GETITEMW, 0, (LPARAM)&info);
-        const HTREEITEM child = (HTREEITEM)::SendMessageW(sectionTree_, TVM_GETNEXTITEM, TVGN_CHILD, (LPARAM)item);
+        HTREEITEM child = (HTREEITEM)::SendMessageW(sectionTree_, TVM_GETNEXTITEM, TVGN_CHILD, (LPARAM)item);
+        const bool later = !child && info.cChildren == 1;   // rows made when the branch is first opened
         const HTREEITEM selected = (HTREEITEM)::SendMessageW(sectionTree_, TVM_GETNEXTITEM, TVGN_CARET, 0);
 
         ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_OpenOnDoubleClick |
                                    ImGuiTreeNodeFlags_SpanAvailWidth;
-        if (!child) flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+        if (!child && !later) flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
         // An extension keeping several rows selected says which.
         const int mark = ExtensionTreeMark(info.lParam);
         if (mark > 0 || (mark < 0 && item == selected)) flags |= ImGuiTreeNodeFlags_Selected;
-        const char* icon = depth == 0 ? ICON_PH_FOLDER_SIMPLE : child ? ICON_PH_FOLDER : ICON_PH_CUBE;
+        const char* icon = depth == 0 ? ICON_PH_FOLDER_SIMPLE : child || later ? ICON_PH_FOLDER : ICON_PH_CUBE;
         const std::string label = std::string(icon) + "  " + Utf8(text);
         const bool open = ImGui::TreeNodeEx((void*)item, flags, "%s", label.c_str());
         if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
@@ -264,10 +265,14 @@ void MainWindow::DrawShellTree(HTREEITEM item, int depth) {
             else if (mark >= 0 && (ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeyShift))
                 OnSectionSelected();   // Ctrl/Shift on the caret's row: the extension toggles it
         }
-        if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && !child)
+        if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && !child && !later)
             ::PostMessageW(window_, kShellTreeActivate, 0, 0);
-        if (child && open) {
-            DrawShellTree(child, depth + 1);
+        if (later && open) {
+            FillTreeBranch(item, (intptr_t)info.lParam);
+            child = (HTREEITEM)::SendMessageW(sectionTree_, TVM_GETNEXTITEM, TVGN_CHILD, (LPARAM)item);
+        }
+        if ((child || later) && open) {
+            if (child) DrawShellTree(child, depth + 1);
             ImGui::TreePop();
         }
     }

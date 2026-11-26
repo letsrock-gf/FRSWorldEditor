@@ -6,6 +6,7 @@
 #include <wincodec.h>
 
 #include <algorithm>
+#include <fstream>
 #include <cstring>
 
 namespace {
@@ -496,8 +497,17 @@ bool ImageSize(const std::wstring& path, u32& width, u32& height) {
     for (wchar_t& c : suffix) c = (wchar_t)::towlower(c);
     std::vector<u32> pixels;
     width = height = 0;
-    return (suffix == L".tga" ? LoadTga(path, width, height, pixels) : LoadImage(path, width, height, pixels)) &&
-           width && height;
+    // A TGA says its size in its 18-byte header: the edit list asks this of 3 000 textures on opening, and
+    // decoding each whole for it was most of 48 s (24/11).
+    if (suffix == L".tga") {
+        u8 header[18] = {};
+        std::ifstream file(path, std::ios::binary);
+        if (!file.read((char*)header, sizeof(header))) return false;
+        width  = (u32)header[12] | ((u32)header[13] << 8);
+        height = (u32)header[14] | ((u32)header[15] << 8);
+        return width && height;
+    }
+    return LoadImage(path, width, height, pixels) && width && height;
 }
 
 u32 TextureNameHash(const std::string& name) {

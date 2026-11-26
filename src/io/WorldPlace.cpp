@@ -4,6 +4,7 @@
 
 #include "core/Log.h"
 #include "nfs/ChunkReader.h"
+#include "render/GameLookAttributes.h"
 
 #include <algorithm>
 #include <cmath>
@@ -180,6 +181,114 @@ bool ShippedProp(const nfs::World& world, u32 modelHash, const PropIds& ids, std
     return false;
 }
 
+// The copy of its model a placement is named by in this section (io/WorldMesh.h), if any.
+const WorldModelCopy* CopyFor(const nfs::PlacedInstance& placement, const std::vector<WorldModelCopy>& copies) {
+    const Vec3 s = BakedScale(placement);
+    for (const WorldModelCopy& copy : copies)
+        if (copy.source == placement.modelHash && copy.scale.x == s.x && copy.scale.y == s.y && copy.scale.z == s.z)
+            return &copy;
+    return nullptr;
+}
+
+// The key of a placement's prop in the `physical` maps: the model alone for a
+// copy of a shipped physical model, the model (its scaled copy's, when it has
+// one) and its preset otherwise.
+u64 PropKey(const nfs::PlacedInstance& placement, const std::vector<WorldModelCopy>& copies) {
+    if (placement.physics == 0 || placement.physics >= kPhysicsPresetCount) return placement.modelHash;
+    const WorldModelCopy* copy = CopyFor(placement, copies);
+    return ((u64)placement.physics << 32) | (copy && copy->scaled ? copy->copy : placement.modelHash);
+}
+
+// A prop for a placement of `modelHash` given preset `preset`, made from
+// nothing (FINDINGS in work/smackable-research): +0x1C the model's name hash,
+// +0x20 the Bounds collection made here for it, +0x24 the preset's attribute
+// collection; pose, id, uid and flags are set when it is placed. The Bounds:
+// one root box, the model's own box (times `copy`'s scale when the placement
+// has a scaled copy: the prop itself has no scale) in physics axes (x = -game y,
+// y = up, z = game x), mm, laid out as the shipped single-box XO_VendMachB_1b_00
+// (root flags 0x40, no children, no point cloud).
+bool PresetProp(const nfs::World& world, u32 modelHash, u8 preset, const WorldModelCopy* copy, PropIds& ids,
+                std::vector<u8>& prop) {
+    const nfs::SolidObject* model = world.FindModel(modelHash);
+    if (!model || !model->bounds.Valid() || preset == 0 || preset >= kPhysicsPresetCount) return false;
+    const bool scaled = copy && copy->scaled;
+    const u32 key = gamelook::VltHash((scaled ? copy->name : model->name) + "_FRSPHYS");
+    if (std::find(ids.boundsKeys.begin(), ids.boundsKeys.end(), key) == ids.boundsKeys.end()) {
+        Aabb box = model->bounds;
+        if (scaled) {
+            const Vec3 s = copy->scale;
+            box.min = { box.min.x * s.x, box.min.y * s.y, box.min.z * s.z };
+            box.max = { box.max.x * s.x, box.max.y * s.y, box.max.z * s.z };
+        }
+        const auto mm = [](float metres) { return (i16)std::clamp(std::lround(metres * 1000.0f), -32767L, 32767L); };
+        const Vec3 half = (box.max - box.min) * 0.5f, mid = (box.max + box.min) * 0.5f;
+        u8 child[96] = {};
+        Write<u32>(child + 0, 0x0003B901u);
+        Write<u32>(child + 4, 88);
+        std::memset(child + 8, 0x11, 8);
+        Write<u32>(child + 16, key);
+        Write<u32>(child + 20, 1);
+        u8* root = child + 32;
+        Write<i16>(root + 0x06, 32767);   // quaternion w
+        Write<u16>(root + 0x0E, 0x40);
+        Write<i16>(root + 0x10, std::max<i16>(mm(half.y), 10));
+        Write<i16>(root + 0x12, std::max<i16>(mm(half.z), 10));
+        Write<i16>(root + 0x14, std::max<i16>(mm(half.x), 10));
+        root[0x17] = 0xFF;
+        Write<i16>(root + 0x18, mm(-mid.y));
+        Write<i16>(root + 0x1A, mm(mid.z));
+        Write<i16>(root + 0x1C, mm(mid.x));
+        Write<i16>(root + 0x1E, -1);
+        ids.bounds.insert(ids.bounds.end(), child, child + sizeof(child));
+        ids.boundsKeys.push_back(key);
+    }
+    prop.assign(kPropSize, 0);
+    Write<u32>(prop.data() + 0x1C, gamelook::VltHash(model->name));
+    Write<u32>(prop.data() + 0x20, key);
+    Write<u32>(prop.data() + 0x24, kPhysicsPresets[preset].collection);
+    return true;
+}
+
+// The number of the scenery container AppendToContainer puts placements of
+// chunk `number` in: that one when the file has it, else the first.
+u32 ContainerNumber(const std::vector<u8>& bytes, u64 streamOffset, u32 number) {
+    nfs::ChunkReader reader(ByteSpan{ bytes.data(), bytes.size() }, streamOffset);
+    nfs::Chunk chunk;
+    u32 first = UINT32_MAX;
+    while (reader.Next(chunk)) {
+        if (chunk.id != nfs::kChunkTrackScenery) continue;
+        const u32 here = nfs::FindChunk(chunk, nfs::kChunkSceneryHeader).data.read<u32>(0x0C);
+        if (here == number) return here;
+        if (first == UINT32_MAX) first = here;
+    }
+    return first;
+}
+
+// An empty 0x34027 chunk for container `container` at the end of a section
+// file that has none (Bayview's). Shipped files have it last (584 of 673), its
+// two header words 11 (the game links the pack there), then i16 container,
+// i16 count, 4 zero bytes. The chunk starts 16-aligned, after a padding chunk
+// (id 0) when the file does not end so.
+void AddPropChunk(std::vector<u8>& bytes, u32 container) {
+    size_t need = (16 - bytes.size() % 16) % 16;
+    if (need && need < 8) need += 16;
+    if (need) {
+        const size_t at = bytes.size();
+        bytes.resize(at + need, 0);
+        Write<u32>(bytes.data() + at + 4, (u32)(need - 8));
+    }
+    u8 chunk[32] = {};
+    Write<u32>(chunk + 0, kIdProps);
+    Write<u32>(chunk + 4, 24);
+    std::memset(chunk + 8, 0x11, 8);
+    Write<u32>(chunk + 16, 11);
+    Write<u32>(chunk + 20, 11);
+    Write<i16>(chunk + 24, (i16)container);
+    bytes.insert(bytes.end(), chunk, chunk + sizeof(chunk));
+}
+
+using PhysicalProps = std::map<u64, std::pair<std::vector<u8>, u16>>;
+
 // A prop to add once its container is written.
 struct NewProp {
     u32 id;
@@ -254,7 +363,10 @@ constexpr size_t kTreeStack = 64;
 // Makes every node from `at` up to the root hold `box`.
 void GrowUp(std::vector<u8>& nodes, int at, const Aabb& box) {
     const size_t count = nodes.size() / kNodeSize;
-    for (int guard = 0; guard < 64; ++guard) {
+    // Up to the root, however deep: a guard of 64 left the nodes above the 64th smaller than their children
+    // (7 in Bayview's section 1927), and the game culled a road with the node it did not fit in whenever the
+    // camera looked down (Gui 25/11). `count` steps still stop a loop.
+    for (size_t guard = 0; guard <= count; ++guard) {
         u8* grown = nodes.data() + (size_t)at * kNodeSize;
         WriteVec3(grown + kNodeMin, Min(ReadVec3(grown + kNodeMin), box.min));
         WriteVec3(grown + kNodeMax, Max(ReadVec3(grown + kNodeMax), box.max));
@@ -454,7 +566,7 @@ bool AppendToContainer(const nfs::World& world, const nfs::LoadedSection& loaded
                        std::vector<u8>& bytes, u32 number,
                        const std::vector<const nfs::PlacedInstance*>& placed,
                        const std::vector<WorldModelCopy>& copies, PropIds& ids,
-                       const std::map<u32, std::pair<std::vector<u8>, u16>>& physical,
+                       const PhysicalProps& physical,
                        std::vector<NewProp>& newProps, std::wstring& error) {
     // --- the container, and its children as they stand ---------------------------
     size_t start = 0, size = 0;
@@ -505,10 +617,9 @@ bool AppendToContainer(const nfs::World& world, const nfs::LoadedSection& loaded
     std::vector<int> added;
     for (const nfs::PlacedInstance* placement : placed) {
         // A model copied into this section (io/WorldMesh.h) is named by its copy's hash.
-        u32 hash = placement->modelHash;
-        bool copied = false;
-        for (const WorldModelCopy& copy : copies)
-            if (copy.source == hash) { hash = copy.copy; copied = true; }
+        const WorldModelCopy* copyOf = CopyFor(*placement, copies);
+        const bool copied = copyOf != nullptr;
+        const u32 hash = copied ? copyOf->copy : placement->modelHash;
         const size_t index = records->payload.size() / kRecordSize;
         if (index > 32000) { error = L"That section cannot take more objects."; return false; }
 
@@ -538,7 +649,9 @@ bool AppendToContainer(const nfs::World& world, const nfs::LoadedSection& loaded
                 std::memcpy(info.data(), placement->modelName.c_str(), std::min<size_t>(placement->modelName.size(), 23));
                 for (int level = 0; level < 3; ++level) Write<u32>(info.data() + kInfoHashes + (size_t)level * 4, hash);
                 const nfs::SolidObject* model = world.FindModel(placement->modelHash);
-                Write<float>(info.data() + kInfoRadius, model ? ModelRadius(*model) : placement->radius);
+                float radius = model ? ModelRadius(*model) : placement->radius;
+                if (copied && copyOf->scaled) radius *= std::max({ copyOf->scale.x, copyOf->scale.y, copyOf->scale.z });
+                Write<float>(info.data() + kInfoRadius, radius);
             }
             infos->payload.insert(infos->payload.end(), info.begin(), info.end());
         }
@@ -575,8 +688,12 @@ bool AppendToContainer(const nfs::World& world, const nfs::LoadedSection& loaded
         WriteVec3(record.data() + kRecordBoundsMin, box.min);
         WriteVec3(record.data() + kRecordBoundsMax, box.max);
         WriteVec3(record.data() + kRecordTranslation, { m.m[3][0], m.m[3][1], m.m[3][2] });
+        // A scaled copy holds the scale in its vertices: the record keeps the rotation.
+        const Vec3 unscale = copied && copyOf->scaled ? copyOf->scale : Vec3{ 1.0f, 1.0f, 1.0f };
+        const float by[3] = { unscale.x, unscale.y, unscale.z };
         for (int row = 0; row < 3; ++row)
-            WriteVec3(record.data() + kRecordRotation + (size_t)row * 12, { m.m[row][0], m.m[row][1], m.m[row][2] });
+            WriteVec3(record.data() + kRecordRotation + (size_t)row * 12,
+                      { m.m[row][0] / by[row], m.m[row][1] / by[row], m.m[row][2] / by[row] });
         Write<u32>(record.data() + kRecordNameHash, 0xED170000u + (u32)index);
         Write<i16>(record.data() + kRecordInfoIndex, (i16)infoIndex);
         Write<u32>(record.data() + kRecordExtra, 0);
@@ -584,11 +701,16 @@ bool AppendToContainer(const nfs::World& world, const nfs::LoadedSection& loaded
         // where the game placed it, record matrix identity). A new placement has
         // a matrix of its own, so the flag goes.
         Write<u32>(record.data() + kRecordFlags, Read<u32>(record.data() + kRecordFlags) & ~0x400u);
+        const auto prop = physical.find(PropKey(*placement, copies));
+        const bool preset = prop != physical.end() && PropKey(*placement, copies) != placement->modelHash;
+        // Every shipped prop's record has flag 0x40000000 (signpost 0x40000000,
+        // pop machine 0x40080001, vending 0x40180000); the rest of its flags stay.
+        if (preset) Write<u32>(record.data() + kRecordFlags, Read<u32>(record.data() + kRecordFlags) | 0x40000000u);
 
         records->payload.insert(records->payload.end(), record.begin(), record.end());
         extras->payload.insert(extras->payload.end(), extra.begin(), extra.end());
         added.push_back((int)index);
-        if (const auto prop = physical.find(placement->modelHash); prop != physical.end()) {
+        if (prop != physical.end()) {
             // An id of its own: a 0x34108 entry naming this container and record,
             // a 0x34106 row here, and the prop itself (written after the container).
             if (!Find(children, kIdPropRecords)) {
@@ -604,7 +726,10 @@ bool AppendToContainer(const nfs::World& world, const nfs::LoadedSection& loaded
             }
             Child* rows = Find(children, kIdPropRecords);
             const u32 id = ids.Next();
-            const u16 entry[3] = { (u16)number, (u16)index, prop->second.second };
+            // 0x73D340 copies the entry's flags over the record's low 16 bits:
+            // a preset's are the record's own.
+            const u16 flags = preset ? (u16)Read<u32>(record.data() + kRecordFlags) : prop->second.second;
+            const u16 entry[3] = { (u16)number, (u16)index, flags };
             ids.added.insert(ids.added.end(), (const u8*)entry, (const u8*)entry + sizeof(entry));
             const u16 row[2] = { (u16)id, (u16)index };
             rows->payload.insert(rows->payload.end(), (const u8*)row, (const u8*)row + sizeof(row));
@@ -613,6 +738,8 @@ bool AppendToContainer(const nfs::World& world, const nfs::LoadedSection& loaded
             Write<u32>(made.bytes.data() + 0x28, id);
             Write<u32>(made.bytes.data() + 0x30, Read<u32>(record.data() + kRecordFlags));
             Write<u32>(made.bytes.data() + 0x3C, 0);
+            // A uid of its own (shipped ones are all different; what reads it is not known).
+            if (preset) Write<u32>(made.bytes.data() + 0x2C, gamelook::VltHash("FRS_PROP_" + std::to_string(id)));
             newProps.push_back(std::move(made));
         }
 
@@ -707,7 +834,18 @@ bool AppendPlacements(const nfs::World& world, const nfs::LoadedSection& loaded,
     // The container this file's props belong to: a physical placement goes
     // there (17244 of 17244 shipped props are named by 0x34108 under it).
     nfs::Chunk props;
-    const bool hasProps = FindProps(bytes.data(), bytes.size(), loaded.info->streamOffset, props);
+    bool hasProps = FindProps(bytes.data(), bytes.size(), loaded.info->streamOffset, props);
+    // A placement given a physics preset in a file with no props: the chunk is made.
+    if (!hasProps)
+        for (const auto& placement : loaded.placements) {
+            if (placement.instance.physics == 0 || placement.instance.physics >= kPhysicsPresetCount) continue;
+            const u32 container = ContainerNumber(bytes, loaded.info->streamOffset, placement.sceneryNumber);
+            if (container == UINT32_MAX) break;
+            AddPropChunk(bytes, container);
+            hasProps = FindProps(bytes.data(), bytes.size(), loaded.info->streamOffset, props);
+            LOG_INFO("section %s: a physical props chunk made for container %u", loaded.info->name.c_str(), container);
+            break;
+        }
     const u32 propContainer = hasProps ? (u32)(u16)Read<i16>(bytes.data() + PropBase(bytes.data(), props) + 8) : 0;
     bool containerHere = false;
     {
@@ -720,19 +858,25 @@ bool AppendPlacements(const nfs::World& world, const nfs::LoadedSection& loaded,
     }
     const bool canProp = hasProps && containerHere;
 
-    std::map<u32, std::pair<std::vector<u8>, u16>> physical;   // model -> template prop, 0x34108 flags
-    std::map<u32, bool> checked;
+    PhysicalProps physical;   // PropKey -> template prop, 0x34108 flags
+    std::map<u64, bool> checked;
     std::map<u32, std::vector<const nfs::PlacedInstance*>> byChunk;
     for (const auto& placement : loaded.placements) {
         u32 number = placement.sceneryNumber;
         const u32 hash = placement.instance.modelHash;
-        if (!checked[hash]) {
-            checked[hash] = true;
+        const u64 key = PropKey(placement.instance, copies);
+        if (!checked[key]) {
+            checked[key] = true;
             std::vector<u8> prop;
             u16 flags = 0;
-            if (ShippedProp(world, hash, ids, prop, flags)) physical[hash] = { std::move(prop), flags };
+            if (key == hash ? ShippedProp(world, hash, ids, prop, flags)
+                            : PresetProp(world, hash, placement.instance.physics, CopyFor(placement.instance, copies), ids, prop))
+                physical[key] = { std::move(prop), flags };
+            else if (key != hash)
+                LOG_WARN("%s in section %s: no box to give it physics, placed as scenery only",
+                         placement.instance.modelName.c_str(), loaded.info->name.c_str());
         }
-        if (physical.count(hash)) {
+        if (physical.count(key)) {
             if (canProp) number = propContainer;
             else LOG_WARN("%s in section %s: the file has no physical props, placed as scenery only",
                           placement.instance.modelName.c_str(), loaded.info->name.c_str());
@@ -742,7 +886,7 @@ bool AppendPlacements(const nfs::World& world, const nfs::LoadedSection& loaded,
     if (!canProp) physical.clear();
 
     std::vector<NewProp> newProps;
-    static const std::map<u32, std::pair<std::vector<u8>, u16>> none;
+    static const PhysicalProps none;
     for (const auto& [number, placed] : byChunk) {
         if (!AppendToContainer(world, loaded, bytes, number, placed, copies, ids,
                                number == propContainer ? physical : none, newProps, error))

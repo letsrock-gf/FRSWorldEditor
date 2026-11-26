@@ -37,6 +37,9 @@
 #include "ui/SetupWizard.h"
 #include "io/WorldMesh.h"
 #include "io/WorldWrite.h"
+#include "io/WorldTexture.h"
+#include "io/TextureImport.h"
+#include "io/WorldPlace.h"
 #include "ui/WorldDialogs.h"
 
 #include <commctrl.h>
@@ -72,6 +75,8 @@ constexpr UINT kOpenStoredMessage = WM_APP + 2;
 // FRSFastTest reads its switch when the game starts; this long after the
 // launch it certainly has, and the switch goes back off.
 constexpr DWORD kFastBootRestoreMs = 15000;
+// The "Game physics" row of a placement (transform rows 1..7, car paint 41..44).
+constexpr int kPhysicsField = 48;
 
 constexpr int kComboHeight  = 24;
 // Also the width of the gaps that resize the panels.
@@ -3052,13 +3057,44 @@ void MainWindow::OpenRegion(std::wstring region) {
 
 // --- undo -----------------------------------------------------------------------
 
-MainWindow::EditSnapshot MainWindow::TakeEditSnapshot() const {
-    EditSnapshot snapshot;
+// What the object edits of every section hash to, read in place: TrackEdits asks this every time, and a
+// snapshot (a copy of every placement, 43 000 of them with Bayview) is only taken when it differs.
+static u64 EditHashOf(const nfs::World& world) {
     u64 hash = 1469598103934665603ull;
     auto mix = [&hash](const void* data, size_t size) {
         for (size_t i = 0; i < size; ++i) hash = (hash ^ ((const u8*)data)[i]) * 1099511628211ull;
     };
 
+    const auto& loaded = world.Loaded();
+    for (size_t i = 0; i < loaded.size(); ++i) {
+        const nfs::LoadedSection& section = *loaded[i];
+        if (section.placements.empty() && section.removedNatives.empty() &&
+            section.importedModels.empty() && section.movedNatives.empty())
+            continue;
+
+        for (const auto& moved : section.movedNatives) {
+            mix(&moved.sceneryNumber, sizeof(moved.sceneryNumber));
+            mix(&moved.record, sizeof(moved.record));
+            mix(&moved.moved, sizeof(moved.moved));
+        }
+
+        mix(&i, sizeof(i));
+        for (const auto& placement : section.placements) {
+            mix(&placement.sceneryNumber, sizeof(placement.sceneryNumber));
+            mix(&placement.instance.modelHash, sizeof(placement.instance.modelHash));
+            mix(&placement.instance.transform, sizeof(placement.instance.transform));
+        }
+        for (const auto& removed : section.removedNatives) mix(&removed, sizeof(removed));
+        for (const u32 model : section.importedModels) mix(&model, sizeof(model));
+        const size_t counts[3] = { section.placements.size(), section.removedNatives.size(),
+                                   section.importedModels.size() };
+        mix(counts, sizeof(counts));
+    }
+    return hash;
+}
+
+MainWindow::EditSnapshot MainWindow::TakeEditSnapshot() const {
+    EditSnapshot snapshot;
     const auto& loaded = world_->Loaded();
     for (size_t i = 0; i < loaded.size(); ++i) {
         const nfs::LoadedSection& section = *loaded[i];
@@ -3073,27 +3109,9 @@ MainWindow::EditSnapshot MainWindow::TakeEditSnapshot() const {
         part.importedModels = section.importedModels;
         part.movedNatives   = section.movedNatives;
         part.changed        = section.placementsChanged;
-        for (const auto& moved : part.movedNatives) {
-            mix(&moved.sceneryNumber, sizeof(moved.sceneryNumber));
-            mix(&moved.record, sizeof(moved.record));
-            mix(&moved.moved, sizeof(moved.moved));
-        }
-
-        mix(&i, sizeof(i));
-        for (const auto& placement : part.placements) {
-            mix(&placement.sceneryNumber, sizeof(placement.sceneryNumber));
-            mix(&placement.instance.modelHash, sizeof(placement.instance.modelHash));
-            mix(&placement.instance.transform, sizeof(placement.instance.transform));
-        }
-        for (const auto& removed : part.removedNatives) mix(&removed, sizeof(removed));
-        for (const u32 model : part.importedModels) mix(&model, sizeof(model));
-        const size_t counts[3] = { part.placements.size(), part.removedNatives.size(),
-                                   part.importedModels.size() };
-        mix(counts, sizeof(counts));
-
         snapshot.parts.push_back(std::move(part));
     }
-    snapshot.hash = hash;
+    snapshot.hash = EditHashOf(*world_);
     return snapshot;
 }
 
@@ -3144,6 +3162,8 @@ void MainWindow::TrackEdits() {
     // A drag is one step: wait for it to end.
     if (viewport_.Transforming() || viewport_.GizmoDragging() || ::GetKeyState(VK_LBUTTON) < 0)
         return;
+
+    if (haveCurrent_ && EditHashOf(*world_) == current_.hash) return;
 
     EditSnapshot now = TakeEditSnapshot();
     if (!haveCurrent_) {
@@ -3297,6 +3317,23 @@ void MainWindow::ReplaceTexture(u32 hash, bool restore, const std::wstring& imag
         }
 
         std::wstring error;
+        // A texture the editor made (an X line: Bayview's, an imported model's) is in no shipped file:
+        // it takes the new image as its own, at the image's size up to 2048.
+        if (const nfs::World::NewTexture* made = io::NewTextureOf(*world_, hash);
+            made && made->header.empty() && !made->fromCar) {
+            u32 w = 0, h = 0, side = 1;
+            if (ImageSize(kept, w, h)) while (side < std::max(w, h)) side <<= 1;
+            io::SetNewTextureSide(hash, side);
+            const std::string name = made->name;
+            if (!io::StageNewWorldTexture(*world_, name, made->like, kept, error)) {
+                ::MessageBoxW(window_, error.c_str(), kWindowTitle, MB_ICONWARNING | MB_OK);
+                return;
+            }
+            SetStatusText(2, L"Texture replaced (not written yet: Ctrl+Shift+S)");
+            viewport_.GetRenderer().ReloadTextures();
+            textures_.SetWorld(world_.get());
+            return;
+        }
         const size_t staged = io::StageTextureReplacement(*world_, hash, kept, error);
         list.erase(std::remove_if(list.begin(), list.end(), same), list.end());
         if (!staged) {
@@ -3452,8 +3489,16 @@ void MainWindow::LoadAllSections() {
 }
 
 void MainWindow::PopulateSectionTree() {
+    const ULONGLONG treeStart = ::GetTickCount64();
+    ULONGLONG treeLap[5] = {};
     rebuildingTree_ = true;
     ::SendMessageW(sectionTree_, WM_SETREDRAW, FALSE, 0);
+    // Emptying 57 000 rows took 3.6 s and filling them 2 s after every paste (24/11, the times logged below).
+    // Clearing the selection first, closing the branches first, and putting each row after the one before
+    // or first of its siblings were each measured and changed nothing. So with no search typed the rows
+    // under "Placed objects", a model, "My objects" and "Sections" are made when that row is first opened
+    // (FillTreeBranch, called by DrawShellTree).
+    treeLap[0] = ::GetTickCount64();
     ::SendMessageW(sectionTree_, TVM_DELETEITEM, 0, (LPARAM)TVI_ROOT);
     mineHashes_.clear();
     if (!world_) {
@@ -3462,6 +3507,7 @@ void MainWindow::PopulateSectionTree() {
         return;
     }
     sceneSignature_ = SceneSignature();
+    const ULONGLONG treeEmptied = ::GetTickCount64();
 
     // The scene's own filter in the panels; the shared box in the old window.
     std::wstring needle = sceneFilter_;
@@ -3477,6 +3523,7 @@ void MainWindow::PopulateSectionTree() {
         for (wchar_t& c : lower) c = (wchar_t)::towlower(c);
         return lower.find(needle) != std::wstring::npos;
     };
+    const bool later = shell_ && needle.empty();   // rows made when their branch is opened
     const auto insert = [&](HTREEITEM parent, const std::wstring& text, intptr_t param) {
         TVINSERTSTRUCTW item{};
         item.hParent      = parent;
@@ -3484,6 +3531,10 @@ void MainWindow::PopulateSectionTree() {
         item.item.mask    = TVIF_TEXT | TVIF_PARAM;
         item.item.pszText = (LPWSTR)text.c_str();
         item.item.lParam  = (LPARAM)param;
+        if (later && parent == TVI_ROOT && (param == kPlacedBranchItem || param == kMineBranchItem || param == -1)) {
+            item.item.mask |= TVIF_CHILDREN;
+            item.item.cChildren = 1;
+        }
         return (HTREEITEM)::SendMessageW(sectionTree_, TVM_INSERTITEMW, 0, (LPARAM)&item);
     };
     const auto rename = [&](HTREEITEM node, const std::wstring& text) {
@@ -3524,6 +3575,7 @@ void MainWindow::PopulateSectionTree() {
         finish(branch, shown, true);
     }
 
+    treeLap[1] = ::GetTickCount64();
     // What has been put in the world, by model: the rows people come back to.
     {
         std::map<std::string, std::vector<std::pair<size_t, size_t>>> byModel;
@@ -3535,7 +3587,7 @@ void MainWindow::PopulateSectionTree() {
             }
         HTREEITEM branch = insert(TVI_ROOT, Format(L"Placed objects (%zu)", total), kPlacedBranchItem);
         size_t shown = 0;
-        for (const auto& [model, where] : byModel) {
+        if (!later) for (const auto& [model, where] : byModel) {
             const std::wstring name = Widen(model);
             const bool modelMatches = matches(name);
             HTREEITEM group = nullptr;
@@ -3559,21 +3611,24 @@ void MainWindow::PopulateSectionTree() {
         finish(branch, shown, true);
     }
 
+    treeLap[2] = ::GetTickCount64();
     // The objects made in this editor: click to go to one, double-click to
     // place another at the view centre.
     {
         HTREEITEM branch = insert(TVI_ROOT, L"My objects", kMineBranchItem);
         size_t shown = 0;
+        // Counted once for all: with Bayview there are 7 600 models and 43 000 placements.
+        std::unordered_map<u32, size_t> placedOf;
+        for (const auto& section : loaded)
+            for (const auto& placement : section->placements) ++placedOf[placement.instance.modelHash];
         for (const nfs::SolidObject* model : world_->AllModels()) {
             if (!model || model->name.rfind("FRS_", 0) != 0) continue;
             const std::wstring name = Widen(model->name);
             if (!matches(name)) continue;
-            size_t placed = 0;
-            for (const auto& section : loaded)
-                for (const auto& placement : section->placements)
-                    if (placement.instance.modelHash == model->hash) ++placed;
-            insert(branch, Format(L"%s  (%zu placed)", name.c_str(), placed),
-                   -(kMineItemBase + (intptr_t)mineHashes_.size()));
+            const auto counted = placedOf.find(model->hash);
+            const size_t placed = counted == placedOf.end() ? 0 : counted->second;
+            if (!later) insert(branch, Format(L"%s  (%zu placed)", name.c_str(), placed),
+                               -(kMineItemBase + (intptr_t)mineHashes_.size()));
             mineHashes_.push_back(model->hash);
             ++shown;
         }
@@ -3581,6 +3636,7 @@ void MainWindow::PopulateSectionTree() {
         finish(branch, shown, true);
     }
 
+    treeLap[3] = ::GetTickCount64();
     // The extensions' branches.
     for (size_t e = 0; e < extensions_.size(); ++e) {
         SceneTreeBuilder tree;
@@ -3593,11 +3649,12 @@ void MainWindow::PopulateSectionTree() {
         extensions_[e]->PopulateTree(tree);
     }
 
+    treeLap[4] = ::GetTickCount64();
     // The sections last and closed: a place to jump to, not to read.
     {
         HTREEITEM branch = insert(TVI_ROOT, Format(L"Sections (%zu)", loaded.size()), (intptr_t)-1);
         size_t shown = 0;
-        for (size_t i = 0; i < loaded.size(); ++i) {
+        for (size_t i = 0; i < loaded.size() && !later; ++i) {
             const nfs::LoadedSection& section = *loaded[i];
             const std::wstring text = Format(L"%s  -  %zu obj, %zu tris", Widen(section.info->name).c_str(),
                                              section.ObjectCount(), section.TriangleCount());
@@ -3610,6 +3667,75 @@ void MainWindow::PopulateSectionTree() {
 
     ::SendMessageW(sectionTree_, WM_SETREDRAW, TRUE, 0);
     ::InvalidateRect(sectionTree_, nullptr, TRUE);
+    rebuildingTree_ = false;
+    if (::GetTickCount64() - treeStart >= 50)
+        LOG_INFO("scene tree rebuilt in %llu ms: closing %llu, emptying %llu, zones %llu, placed objects %llu, my objects %llu, "
+                 "extensions %llu, sections %llu", ::GetTickCount64() - treeStart, treeLap[0] - treeStart,
+                 treeEmptied - treeLap[0], treeLap[1] - treeEmptied, treeLap[2] - treeLap[1], treeLap[3] - treeLap[2], treeLap[4] - treeLap[3],
+                 ::GetTickCount64() - treeLap[4]);
+}
+
+// The rows of a branch PopulateSectionTree left for later, same texts and codes as it gives them.
+void MainWindow::FillTreeBranch(HTREEITEM branch, intptr_t what) {
+    if (!world_) return;
+    const auto& loaded = world_->Loaded();
+    size_t made = 0;
+    const auto insert = [&](const std::wstring& text, intptr_t param, bool parent = false) {
+        TVINSERTSTRUCTW item{};
+        item.hParent      = branch;
+        item.hInsertAfter = TVI_LAST;
+        item.item.mask    = TVIF_TEXT | TVIF_PARAM | (parent ? TVIF_CHILDREN : 0);
+        item.item.pszText = (LPWSTR)text.c_str();
+        item.item.lParam  = (LPARAM)param;
+        item.item.cChildren = 1;
+        ::SendMessageW(sectionTree_, TVM_INSERTITEMW, 0, (LPARAM)&item);
+        ++made;
+    };
+    const auto placedCode = [](size_t s, size_t p) { return -(kPlacedItemBase + (intptr_t)s * 65536 + (intptr_t)p); };
+    rebuildingTree_ = true;
+    if (what == kPlacedBranchItem) {
+        std::map<std::string, std::pair<intptr_t, size_t>> byModel;   // first placement's code, count
+        for (size_t s = 0; s < loaded.size(); ++s)
+            for (size_t p = 0; p < loaded[s]->placements.size(); ++p) {
+                auto& entry = byModel[loaded[s]->placements[p].instance.modelName];
+                if (entry.second++ == 0) entry.first = placedCode(s, p);
+            }
+        for (const auto& [model, entry] : byModel)
+            insert(Format(L"%s (%zu)%s", Widen(model).c_str(), entry.second, model.rfind("FRS_", 0) == 0 ? L"  - yours" : L""),
+                   entry.first, true);
+    } else if (what == kMineBranchItem) {
+        std::unordered_map<u32, size_t> placedOf;
+        for (const auto& section : loaded)
+            for (const auto& placement : section->placements) ++placedOf[placement.instance.modelHash];
+        for (size_t i = 0; i < mineHashes_.size(); ++i) {
+            const nfs::SolidObject* model = world_->FindModel(mineHashes_[i]);
+            const auto counted = placedOf.find(mineHashes_[i]);
+            insert(Format(L"%s  (%zu placed)", model ? Widen(model->name).c_str() : L"?", counted == placedOf.end() ? 0 : counted->second),
+                   -(kMineItemBase + (intptr_t)i));
+        }
+    } else if (what == -1) {
+        for (size_t i = 0; i < loaded.size(); ++i)
+            insert(Format(L"%s  -  %zu obj, %zu tris", Widen(loaded[i]->info->name).c_str(), loaded[i]->ObjectCount(),
+                          loaded[i]->TriangleCount()), (intptr_t)i);
+    } else if (what <= -kPlacedItemBase && what > -kMineItemBase) {   // a model's row: where it is placed
+        const intptr_t code = -what - kPlacedItemBase;
+        const size_t s0 = (size_t)(code / 65536), p0 = (size_t)(code % 65536);
+        if (s0 < loaded.size() && p0 < loaded[s0]->placements.size()) {
+            const std::string model = loaded[s0]->placements[p0].instance.modelName;
+            for (size_t s = 0; s < loaded.size(); ++s)
+                for (size_t p = 0; p < loaded[s]->placements.size(); ++p) {
+                    if (loaded[s]->placements[p].instance.modelName != model) continue;
+                    const Mat4& m = loaded[s]->placements[p].instance.transform;
+                    insert(Format(L"%s  (%.0f, %.0f)", Widen(loaded[s]->info->name).c_str(), m.m[3][0], m.m[3][1]), placedCode(s, p));
+                }
+        }
+    }
+    if (made == 0) {   // nothing under it: no arrow, and not asked again every frame
+        TVITEMW item{};
+        item.mask = TVIF_CHILDREN;
+        item.hItem = branch;
+        ::SendMessageW(sectionTree_, TVM_SETITEMW, 0, (LPARAM)&item);
+    }
     rebuildingTree_ = false;
 }
 
@@ -3997,7 +4123,11 @@ void MainWindow::Tick(float deltaSeconds) {
     const auto lap = [&](int slot) { const double now = clock(); spent[slot] += (now - mark) * 1000.0; mark = now; };
     if (shell_ || !(game_.Embedded() && game_.Shown())) viewport_.Tick(deltaSeconds);
     lap(0);
-    TrackEdits();
+    // Ten times a second: the check hashes every placement, and an undo step need not be finer than that.
+    // Undo itself asks again before it steps (UndoLatest, LatestUndoStamp).
+    static float editPoll = 0.0f;
+    editPoll += deltaSeconds;
+    if (editPoll >= 0.1f) { editPoll = 0.0f; TrackEdits(); }
     lap(1);
 
     // The status bar only needs to keep up with the eye, not with the frame rate.
@@ -4566,6 +4696,7 @@ void MainWindow::PasteClipboard() {
 
     std::vector<std::pair<u32, int>> pasted;
     size_t copiedModels = 0, skipped = 0;
+    const ULONGLONG pasteStart = ::GetTickCount64();
     for (nfs::PlacedInstance placed : clipboard_) {
         placed.transform.m[3][0] += shift.x;
         placed.transform.m[3][1] += shift.y;
@@ -4587,13 +4718,16 @@ void MainWindow::PasteClipboard() {
         pasted.push_back({ (u32)target, (int)section->placements.size() - 1 });
     }
 
+    const ULONGLONG pasteSorted = ::GetTickCount64();
     viewport_.GetRenderer().RebuildInstances(*world_);
     viewport_.GetRenderer().SelectPlacements(pasted);
     SetStatusText(2, Format(L"Pasted %zu objects%s%s (not written yet)", pasted.size(),
                             copiedModels ? L", models copied into their sections" : L"",
                             skipped ? L", some had no section to go into" : L""));
-    LOG_INFO("pasted %zu objects around (%.1f, %.1f, %.1f), %zu models to copy in, %zu skipped",
-             pasted.size(), point.x, point.y, point.z, copiedModels, skipped);
+    LOG_INFO("pasted %zu objects around (%.1f, %.1f, %.1f), %zu models to copy in, %zu skipped; "
+             "%llu ms finding their sections, %llu ms rebuilding what is drawn",
+             pasted.size(), point.x, point.y, point.z, copiedModels, skipped,
+             pasteSorted - pasteStart, ::GetTickCount64() - pasteSorted);
 }
 
 bool MainWindow::SavePlacements() {
@@ -4924,6 +5058,19 @@ void MainWindow::UpdateProperties() {
     PropertiesPanel::AddTransformRows(view, view.mode == PropertiesPanel::Mode::Placement ||
                                                 view.mode == PropertiesPanel::Mode::Native);
     if (view.mode == PropertiesPanel::Mode::Placement && model) AddCarPaintRows(*world_, model->hash, view);
+    if (view.mode == PropertiesPanel::Mode::Placement && section && nfs::IsWorld()) {
+        const u8 physics = section->placements[(size_t)picked.placement].instance.physics;
+        Row row;
+        row.group = L"Physics";
+        row.name = L"Game physics";
+        row.value = io::kPhysicsPresets[physics < io::kPhysicsPresetCount ? physics : 0].label;
+        row.description = L"Knocked about by cars as the game's own props are: the model's box is its collision, "
+                          L"the preset its mass. The game drops the placement's scale when the prop is hit.";
+        row.editable = true;
+        row.field = kPhysicsField;
+        for (const io::PhysicsPreset& preset : io::kPhysicsPresets) row.choices.push_back(preset.label);
+        view.rows.push_back(std::move(row));
+    }
 
     if (view.mode == PropertiesPanel::Mode::Native && section &&
         (size_t)picked.native < section->scenery.instances.size()) {
@@ -4944,6 +5091,19 @@ void MainWindow::ApplyPropertyFields(bool rehome) {
     int placement = -1;
     if (!world_) return;
     Mat4 transform;
+    if (properties_.LastField() == kPhysicsField) {
+        std::wstring text;
+        if (!viewport_.SelectedPlacement(section, placement) || section >= world_->Loaded().size() ||
+            !properties_.ReadText(kPhysicsField, text))
+            return;
+        nfs::LoadedSection* loaded = world_->MutableLoaded(section);
+        if ((size_t)placement >= loaded->placements.size()) return;
+        for (size_t i = 0; i < io::kPhysicsPresetCount; ++i)
+            if (text == io::kPhysicsPresets[i].label) loaded->placements[(size_t)placement].instance.physics = (u8)i;
+        loaded->placementsChanged = true;
+        UpdateProperties();
+        return;
+    }
     if (!properties_.Read(transform)) return;
     // NFS World: one of the map's own objects moves where it stands, as it
     // does with the gizmo -- nothing is detached there (Viewport::DetachNatives

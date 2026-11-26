@@ -91,6 +91,27 @@ std::wstring TargetFolder(const std::wstring& tracks, bool& redirected) {
     return redirected ? std::wstring(other) : tracks;
 }
 
+// Whether the file at `path` already holds exactly these bytes. A save builds every edited section again
+// (620 files, 1.4 GB on 24/11) and nearly all come out as they already are on disk: reading one back to
+// compare costs far less than writing it and moving it over the old one.
+bool HoldsAlready(const std::wstring& path, const u8* data, size_t size) {
+    HANDLE file = ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER length{};
+    bool same = ::GetFileSizeEx(file, &length) && (u64)length.QuadPart == (u64)size;
+    std::vector<u8> block(same ? std::min<size_t>(size, 1u << 22) : 0);
+    for (size_t done = 0; same && done < size;) {
+        DWORD got = 0;
+        const DWORD want = (DWORD)std::min(size - done, block.size());
+        same = ::ReadFile(file, block.data(), want, &got, nullptr) && got == want &&
+               std::memcmp(block.data(), data + done, want) == 0;
+        done += got;
+    }
+    ::CloseHandle(file);
+    return same;
+}
+
 bool WriteWhole(const std::wstring& path, const u8* data, size_t size) {
     // Written beside the target and moved over it, so a failed write never
     // leaves half a section where the game will look for a whole one.
@@ -158,6 +179,30 @@ bool GrowPropIds(std::vector<u8>& region, std::vector<u8>& hot, const std::vecto
     return true;
 }
 
+// New Bounds collections (0x3B901 children, io::PropIds::bounds) at the end of
+// L5RA.BUN's 0x8003B900 pack. The loader (0x706A60) indexes a pack's children
+// into a sorted array of its own, so their order does not matter; each child
+// is 96 bytes and starts where the pack ends, which must be 16-aligned so its
+// data lands at +16. L5RA.HOT's rows follow as in GrowPropIds.
+bool GrowBounds(std::vector<u8>& region, std::vector<u8>& hot, const std::vector<u8>& children) {
+    size_t at = 0, size = 0;
+    if (!RegionChunk(region, 0x8003B900, at, size) || (at + size) % 16 || children.size() % 96) return false;
+    region.insert(region.begin() + (std::ptrdiff_t)(at + size), children.begin(), children.end());
+    const u32 grown = (u32)(size + children.size());
+    std::memcpy(region.data() + at - 4, &grown, 4);
+    if (hot.size() >= 16 && hot.size() % 16 == 0) {
+        for (size_t row = 16; row + 16 <= hot.size(); row += 16) {
+            const u32 offset = Read<u32>(hot.data() + row + 8);
+            if (offset == at - 8) {
+                std::memcpy(hot.data() + row + 4, &grown, 4);
+            } else if (offset > at - 8) {
+                const u32 moved = offset + (u32)children.size();
+                std::memcpy(hot.data() + row + 8, &moved, 4);
+            }
+        }
+    }
+    return true;
+}
 
 // Chunk 0x34152 inside the top-level 0x80034150: where its payload starts and
 // how long it is, and where the parent's header is.
@@ -1253,6 +1298,9 @@ size_t LoadWorldEdits(nfs::World& world, const std::wstring& realTracksFolder) {
                 at = end;
             }
             if (!whole) continue;
+            // An 18th field: the physics preset (io::kPhysicsPresets), when it has one.
+            if (const unsigned long physics = std::strtoul(at, nullptr, 10); physics < kPhysicsPresetCount)
+                placed.physics = (u8)physics;
             placed.modelHash   = hash;
             placed.modelName   = model->name;
             placed.modelBounds = model->bounds;
@@ -1302,6 +1350,7 @@ size_t LoadWorldEdits(nfs::World& world, const std::wstring& realTracksFolder) {
         world.zoneOutlines.emplace(section, outline);
     LOG_INFO("NFS World edits: %zu applied from the list, %zu collision polygons deleted by it", applied,
              cutPolygons);
+    SaveKeptObjPack();
     return applied;
 }
 
@@ -1477,21 +1526,71 @@ bool WriteWorldEdits(nfs::World& world, const std::wstring& tracksFolder, WorldW
     // none is written: a section that cannot be built stops the save while the
     // game's files are still as they were, instead of leaving some written
     // beside a section table and an edit list that do not know of them.
+    // The second time writes what the first built (kept in memory, 1.4 GB with
+    // Bayview): building it all again was half of a save's time (24/11).
     const size_t sectionCount = world.Loaded().size();
-    const size_t listHead = list.size();
-    WorldWriteReport rehearsal;
+    enum : char { kLeft, kPutBack, kBuilt };
+    std::vector<char> fate(sectionCount, kLeft);
+    std::vector<std::vector<u8>> built(sectionCount);
+    std::vector<std::vector<u32>> builtParts(sectionCount);
+    ResetCollisionPass();
     for (size_t step = 0; step < sectionCount * 2; ++step) {
         const bool write = step >= sectionCount;
         const size_t i = step % sectionCount;
-        if (step == sectionCount) { list.resize(listHead); propIds.added.clear(); }   // numbered again
-        if (step % sectionCount == 0) ResetCollisionPass();
-        WorldWriteReport& counts = write ? report : rehearsal;
+        WorldWriteReport& counts = report;
 
         nfs::LoadedSection* loaded = world.MutableLoaded(i);
         if (!loaded || !loaded->info || loaded->info->fileName.empty()) continue;
 
         const std::wstring live   = target + L"\\" + loaded->info->fileName;
         const std::wstring backup = backups + L"\\" + loaded->info->fileName;
+        if (write) {
+            if (fate[i] == kLeft) continue;
+            const ByteSpan shipped = world.SectionBytes(*loaded->info);
+            const bool hasBackup = Exists(backup);
+            if (fate[i] == kPutBack) {
+                loaded->collisionChanged = false;
+                loaded->changedCollisionPacks.clear();
+                if (hasBackup) {
+                    if (!WriteWhole(live, shipped.data, shipped.size)) {
+                        report.error = L"Could not put back " + live;
+                        return false;
+                    }
+                    ::DeleteFileW(backup.c_str());
+                    ++report.restored;
+                }
+                loaded->placementsChanged = false;
+                continue;
+            }
+            const std::vector<u8> bytes = std::move(built[i]);
+            std::vector<u32> parts = std::move(builtParts[i]);
+            if (bytes.size() != shipped.size || !parts.empty()) {
+                // By how much what stays in memory grew: placed objects, an
+                // edited model, collision. Made up to 128 like the word it is
+                // added to; a part that shrank keeps the room it had.
+                const size_t now = ResidentBytes(bytes.data(), bytes.size());
+                const size_t was = ResidentBytes(shipped.data, shipped.size);
+                const u32 resident = parts.empty() || now <= was ? 0u : (u32)((now - was + 127) & ~(size_t)127);
+                grownSections.push_back({ loaded->info->id, (u32)(bytes.size() - shipped.size),
+                                          std::move(parts), resident });
+            }
+
+            if (!hasBackup && !WriteWhole(backup, shipped.data, shipped.size)) {
+                report.error = L"Could not keep a copy of the shipped file as " + backup;
+                return false;
+            }
+            // Counted and logged as written either way: the file says what this save says.
+            if (!HoldsAlready(live, bytes.data(), bytes.size()) && !WriteWhole(live, bytes.data(), bytes.size())) {
+                report.error = L"Could not write " + live;
+                return false;
+            }
+            loaded->placementsChanged = false;
+            loaded->collisionChanged = false;
+            loaded->changedCollisionPacks.clear();
+            ++report.written;
+            LOG_INFO("NFS World: section %s written to %S", loaded->info->name.c_str(), live.c_str());
+            continue;
+        }
         const bool meshes    = SectionHasMeshEdits(world, *loaded);
         // A texture section that takes new textures; written when one in use is its.
         const bool hosts     = HostsNewTextures(world, *loaded);
@@ -1523,7 +1622,6 @@ bool WriteWorldEdits(nfs::World& world, const std::wstring& tracksFolder, WorldW
         const bool edited    = !loaded->removedNatives.empty() || !loaded->movedNatives.empty() ||
                                !loaded->texturePatches.empty() || !loaded->placements.empty() || meshes || cut ||
                                newTextures;
-        const bool hasBackup = Exists(backup);
 
         char line[512];
         for (const auto& removed : loaded->removedNatives) {
@@ -1545,6 +1643,8 @@ bool WriteWorldEdits(nfs::World& world, const std::wstring& tracksFolder, WorldW
             for (int k = 0; k < 16; ++k)
                 at += std::snprintf(line + at, sizeof(line) - (size_t)at, " %.9g",
                                     placement.instance.transform.m[k / 4][k % 4]);
+            if (placement.instance.physics)
+                std::snprintf(line + at, sizeof(line) - (size_t)at, " %u", (unsigned)placement.instance.physics);
             list += line;
             list += "\n";
         }
@@ -1569,18 +1669,7 @@ bool WriteWorldEdits(nfs::World& world, const std::wstring& tracksFolder, WorldW
         if (shipped.empty()) continue;
 
         if (!edited) {
-            if (!write) continue;
-            loaded->collisionChanged = false;
-            loaded->changedCollisionPacks.clear();
-            if (hasBackup) {
-                if (!WriteWhole(live, shipped.data, shipped.size)) {
-                    report.error = L"Could not put back " + live;
-                    return false;
-                }
-                ::DeleteFileW(backup.c_str());
-                ++report.restored;
-            }
-            loaded->placementsChanged = false;
+            fate[i] = kPutBack;
             continue;
         }
 
@@ -1599,7 +1688,7 @@ bool WriteWorldEdits(nfs::World& world, const std::wstring& tracksFolder, WorldW
         // After everything that goes by offset: a pack that gains polygons grows.
         size_t underCut = 0, underPieces = 0;
         const std::vector<CollisionEdit> written = CutUnderRaised(*loaded, collisionEdits, underCut, underPieces);
-        if (write && underCut)
+        if (underCut)
             LOG_INFO("collision: %zu ground polygons under raised added ground cut into %zu pieces", underCut, underPieces);
         if (!PatchCollision(*loaded, written, bytes, counts, report.error)) return false;
         // A texture section is streamed in parts, and the table says where
@@ -1614,31 +1703,9 @@ bool WriteWorldEdits(nfs::World& world, const std::wstring& tracksFolder, WorldW
                 return false;
             }
         }
-        if (!write) continue;
-        if (bytes.size() != shipped.size || !parts.empty()) {
-            // By how much what stays in memory grew: placed objects, an
-            // edited model, collision. Made up to 128 like the word it is
-            // added to; a part that shrank keeps the room it had.
-            const size_t now = ResidentBytes(bytes.data(), bytes.size());
-            const size_t was = ResidentBytes(shipped.data, shipped.size);
-            const u32 resident = parts.empty() || now <= was ? 0u : (u32)((now - was + 127) & ~(size_t)127);
-            grownSections.push_back({ loaded->info->id, (u32)(bytes.size() - shipped.size),
-                                      std::move(parts), resident });
-        }
-
-        if (!hasBackup && !WriteWhole(backup, shipped.data, shipped.size)) {
-            report.error = L"Could not keep a copy of the shipped file as " + backup;
-            return false;
-        }
-        if (!WriteWhole(live, bytes.data(), bytes.size())) {
-            report.error = L"Could not write " + live;
-            return false;
-        }
-        loaded->placementsChanged = false;
-        loaded->collisionChanged = false;
-        loaded->changedCollisionPacks.clear();
-        ++report.written;
-        LOG_INFO("NFS World: section %s written to %S", loaded->info->name.c_str(), live.c_str());
+        fate[i] = kBuilt;
+        built[i] = std::move(bytes);
+        builtParts[i] = std::move(parts);
     }
 
     // --- the section table -------------------------------------------------------
@@ -1760,6 +1827,13 @@ bool WriteWorldEdits(nfs::World& world, const std::wstring& tracksFolder, WorldW
                         report.error = L"The prop table of " + live + L" is laid out in a way the editor does not write yet.";
                         return false;
                     }
+                    if (!propIds.bounds.empty() && !GrowBounds(layout, hot, propIds.bounds)) {
+                        report.error = L"The collision bounds of " + live + L" are laid out in a way the editor does not write yet.";
+                        return false;
+                    }
+                    if (!propIds.bounds.empty())
+                        LOG_INFO("NFS World: %zu collision bounds added to %S (0x8003B900)", propIds.bounds.size() / 96,
+                                 live.c_str());
                     // Last: it moves what follows the visibility container.
                     if (zones && !GrowZones(layout, hot, world.zoneOutlines)) {
                         report.error = L"The streaming zones of " + live + L" could not be widened (an outline of more "

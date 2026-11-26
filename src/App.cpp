@@ -132,6 +132,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCommand) {
         previous = now;
 
         window.Tick(delta);
+
+        // Frame limit: the loop used to spin a whole core with nothing changing. Any input ends the wait
+        // at once, so nothing is felt in the hand. In front: up to 144 frames a second (the system timer
+        // makes that about 64). Behind another program (the game, Blender): ten.
+        DWORD front = 0;
+        ::GetWindowThreadProcessId(::GetForegroundWindow(), &front);
+        const double budget = front == ::GetCurrentProcessId() ? 1.0 / 144.0 : 0.1;
+        const double left = budget - (SecondsNow() - now);
+        if (left > 0.001) ::MsgWaitForMultipleObjects(0, nullptr, FALSE, (DWORD)(left * 1000.0), QS_ALLINPUT);
     }
 
     window.Destroy();

@@ -698,11 +698,20 @@ void WorldRenderer::Render(const Camera& camera) {
 
     // Collision shown for the first time since the region opened: its meshes are built now.
     if (showCollision_ && !collisionMeshesBuilt && world_) {
+        const ULONGLONG from = ::GetTickCount64();
+        size_t packs = 0, polygons = 0, largest = 0;
         for (size_t i = 0; i < sections_.size() && i < world_->Loaded().size(); ++i) {
+            for (const nfs::CollisionPack& pack : world_->Loaded()[i]->collision) {
+                ++packs;
+                polygons += pack.polygons.size();
+                largest = std::max(largest, pack.polygons.size());
+            }
             auto collision = std::make_unique<CollisionMesh>();
             if (collision->Upload(device, *world_->Loaded()[i], showRaceGroups_)) sections_[i].collision = std::move(collision);
         }
         collisionMeshesBuilt = true;
+        LOG_INFO("collision meshes built in %llu ms: %zu packs, %zu polygons, largest pack %zu (barrier heights %.0f ms, %zu packs differ in the check)",
+                 ::GetTickCount64() - from, packs, polygons, largest, CollisionMesh::resolveMs, nfs::CollisionPack::barrierMismatches);
     }
 
     for (size_t i = 0; i < sections_.size(); ++i) {

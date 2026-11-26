@@ -1,6 +1,7 @@
 #include "nfs/Collision.h"
 
 #include <cstdio>
+#include <cstdlib>
 
 #include <algorithm>
 #include <functional>
@@ -130,19 +131,33 @@ bool TriangleHeight(const Vec3& a, const Vec3& b, const Vec3& c, const Vec3& p, 
 
 } // namespace
 
+// The ground index ResolveBarriers keeps while it runs: 16 m cells in plan, each with the ground polygons
+// whose box, grown by kCellMargin, touches it, in the pack's order.
+static const float kCellSize = 16.0f, kCellMargin = 1.0f;
+static long long CellKey(long long x, long long y) { return (x << 32) ^ (y & 0xFFFFFFFF); }
+
 void CollisionPack::GroundHeightsAt(const Vec3& point, float reach, std::vector<float>& out) const {
     out.clear();
-    for (const CollisionPolygon& polygon : polygons) {
-        if (polygon.barrier || polygon.Vertical()) continue;
+    const auto consider = [&](const CollisionPolygon& polygon) {
+        if (polygon.barrier || polygon.Vertical()) return;
         float z = 0.0f;
         const Vec3* c = polygon.corners;
         bool found = TriangleHeight(c[0], c[1], c[2], point, reach, z);
         if (!found && polygon.quad) found = TriangleHeight(c[0], c[2], c[3], point, reach, z);
-        if (!found) continue;
+        if (!found) return;
         bool known = false;
         for (float h : out) known |= std::fabs(h - z) < 0.5f;
         if (!known) out.push_back(z);
+    };
+    // Every barrier end scanning every polygon took 107 s for NFS World with Bayview (831 000 polygons,
+    // 24/11): while ResolveBarriers runs, only the polygons of the point's cell are looked at. Same result.
+    if (!groundCells_.empty() && reach <= kCellMargin) {
+        const auto cell = groundCells_.find(CellKey((long long)std::floor(point.x / kCellSize), (long long)std::floor(point.y / kCellSize)));
+        if (cell != groundCells_.end())
+            for (u32 index : cell->second) consider(polygons[index]);
+        return;
     }
+    for (const CollisionPolygon& polygon : polygons) consider(polygon);
 }
 
 void CollisionPack::BarrierQuad(const CollisionPolygon& barrier, Vec3 out[4]) const {
@@ -180,6 +195,31 @@ void CollisionPack::ResolveBarriers() const {
     barrierZ_.assign(count, { unknown, unknown });
     barrierFor_ = polygons.data();
     barrierSize_ = count;
+    if (BarrierCount() == 0) return;
+
+    // FRS_CHECK_BARRIERS=1: every pack is also done without the index and the heights compared
+    // (barrierMismatches, logged with the collision meshes' build time).
+    static bool withoutIndex = false;
+    groundCells_.clear();
+    for (size_t i = 0; i < count && !withoutIndex; ++i) {
+        const CollisionPolygon& p = polygons[i];
+        if (p.barrier || p.Vertical()) continue;
+        float low[2] = { p.corners[0].x, p.corners[0].y }, high[2] = { p.corners[0].x, p.corners[0].y };
+        for (int c = 1; c < (p.quad ? 4 : 3); ++c) {
+            low[0] = std::min(low[0], p.corners[c].x);  high[0] = std::max(high[0], p.corners[c].x);
+            low[1] = std::min(low[1], p.corners[c].y);  high[1] = std::max(high[1], p.corners[c].y);
+        }
+        // ponytail: a polygon with a corner that is not a number, or wider than 4 km, makes the index
+        // useless; none is known. Then the pack is done the slow way.
+        if (!(high[0] - low[0] < 4096.0f) || !(high[1] - low[1] < 4096.0f)) { groundCells_.clear(); break; }
+        for (long long x = (long long)std::floor((low[0] - kCellMargin) / kCellSize); x <= (long long)std::floor((high[0] + kCellMargin) / kCellSize); ++x)
+            for (long long y = (long long)std::floor((low[1] - kCellMargin) / kCellSize); y <= (long long)std::floor((high[1] + kCellMargin) / kCellSize); ++y)
+                groundCells_[CellKey(x, y)].push_back((u32)i);
+    }
+    struct DropCells {   // the index is only right for the polygons as they are now
+        std::unordered_map<long long, std::vector<u32>>& cells;
+        ~DropCells() { cells.clear(); }
+    } dropCells{ groundCells_ };
 
     // The layers under each end; a barrier with one choice is settled.
     std::vector<std::vector<float>> under(count * 2);
@@ -197,8 +237,9 @@ void CollisionPack::ResolveBarriers() const {
         GroundHeightsAt(p.corners[2], 0.75f, under[i * 2 + 1]);
         ends[key(p.corners[0])].push_back(i * 2);
         ends[key(p.corners[2])].push_back(i * 2 + 1);
-        if (under[i * 2].size() <= 1 && under[i * 2 + 1].size() <= 1 &&
-            (!under[i * 2].empty() || !under[i * 2 + 1].empty())) {
+        const bool hinted = p.corners[0].z != 0.0f && p.corners[2].z != 0.0f;   // see BarrierEnds
+        if (hinted || (under[i * 2].size() <= 1 && under[i * 2 + 1].size() <= 1 &&
+            (!under[i * 2].empty() || !under[i * 2 + 1].empty()))) {
             float za = 0.0f, zb = 0.0f;
             BarrierEnds(p, za, zb);
             barrierZ_[i] = { za, zb };
@@ -253,6 +294,13 @@ void CollisionPack::ResolveBarriers() const {
         BarrierEnds(polygons[i], za, zb);
         barrierZ_[i] = { za, zb };
     }
+    if (!withoutIndex && std::getenv("FRS_CHECK_BARRIERS")) {
+        const auto indexed = barrierZ_;
+        withoutIndex = true;
+        ResolveBarriers();
+        withoutIndex = false;
+        if (std::memcmp(indexed.data(), barrierZ_.data(), indexed.size() * sizeof(indexed[0])) != 0) ++barrierMismatches;
+    }
 }
 
 void CollisionPack::BarrierEnds(const CollisionPolygon& barrier, float& za, float& zb) const {
@@ -267,7 +315,17 @@ void CollisionPack::BarrierEnds(const CollisionPolygon& barrier, float& za, floa
     GroundHeightsAt(b, 0.75f, under[1]);
     za = 0.0f;
     zb = 0.0f;
-    if (!under[0].empty() && !under[1].empty()) {
+    // A barrier given a height (its corners' z, not 0: the level of the road it
+    // edges, chosen when Underground 2 barriers were pasted, Gui 26/11) stands on
+    // the layer under each end nearest that height: by levelness alone a deck's
+    // edge over a crossing road fell to the road below.
+    const float hintA = a.z, hintB = b.z;
+    if (hintA != 0.0f && hintB != 0.0f && !under[0].empty() && !under[1].empty()) {
+        za = under[0].front();
+        zb = under[1].front();
+        for (float h : under[0]) if (std::fabs(h - hintA) < std::fabs(za - hintA)) za = h;
+        for (float h : under[1]) if (std::fabs(h - hintB) < std::fabs(zb - hintB)) zb = h;
+    } else if (!under[0].empty() && !under[1].empty()) {
         float best = 1e30f;
         for (float ha : under[0])
             for (float hb : under[1])

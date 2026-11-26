@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <set>
 #include <unordered_map>
@@ -159,7 +160,9 @@ bool DumpRegion(const nfs::World& world, const std::wstring& folder) {
         const u32 number = section.info ? section.info->number : 0;
         auto add = [&](const nfs::SolidObject* model, const Mat4& transform) {
             if (hidden) { ++alternate; return; }
-            if (model->IsBackdrop()) { ++backdrop; return; }   // BackdropHidden in the default view
+            // BackdropHidden in the default view. FRS_DUMP_KEEP=<name>: that backdrop is kept (UG2's sea is PAN_OCEAN).
+            static const char* keep = std::getenv("FRS_DUMP_KEEP");
+            if (model->IsBackdrop() && !(keep && *keep && model->name == keep)) { ++backdrop; return; }
             std::string upper = model->name;
             for (char& c : upper) c = (char)std::toupper((unsigned char)c);
             if (upper.rfind("LOD_", 0) == 0 || upper.find("_1Z_") != std::string::npos) ++distantLod;

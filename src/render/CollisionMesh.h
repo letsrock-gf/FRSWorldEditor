@@ -49,6 +49,7 @@ public:
     u32 BarrierCount() const   { return barrierCount_; }
 
     static constexpr DWORD kFvf = D3DFVF_XYZ | D3DFVF_DIFFUSE;
+    static inline double resolveMs = 0.0;   // time spent in ResolveBarriers, for the log
 
 private:
     u32  sectionNumber_    = 0;

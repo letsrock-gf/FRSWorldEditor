@@ -6,6 +6,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <map>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -263,8 +264,22 @@ size_t PolygonCount(ByteSpan article) {
 // vertices, 40 bytes each), `newBarriers` barrier records (32 bytes each).
 // `newSurfaces` are surface hashes appended to the article's table.
 bool RebuildArticle(ByteSpan article, const std::vector<bool>& drop, std::vector<u8>& out,
-                    const std::vector<u8>& newStrips = {}, const std::vector<u8>& newBarriers = {},
+                    const std::vector<u8>& unsortedStrips = {}, const std::vector<u8>& newBarriers = {},
                     const std::vector<u32>& newSurfaces = {}) {
+    // Added strips go highest first (strip centre y, collision axes). A wheel takes the FIRST face of its list
+    // that lies under it or at most 1 m above (nfsw.exe 0x6dcbc0, flag +0x2d bit 2 clear), however far under:
+    // with a road and the street 30 m below in one article, Bayview's wheels took the street (Frida 24/11:
+    // wheels at y 186.4 on face y 156.97) and the car sank, floated, stuck or flipped on ramps and hills.
+    // Highest first, a deck more than 1 m over the wheel is passed and the next face is the one under it.
+    std::vector<u8> newStrips(unsortedStrips);
+    {
+        const size_t n = newStrips.size() / 40;
+        std::vector<size_t> order(n);
+        for (size_t i = 0; i < n; ++i) order[i] = i;
+        auto y = [&](size_t i) { float v; std::memcpy(&v, unsortedStrips.data() + i * 40 + 4, 4); return v; };
+        std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return y(a) > y(b); });
+        for (size_t i = 0; i < n; ++i) std::memcpy(newStrips.data() + i * 40, unsortedStrips.data() + order[i] * 40, 40);
+    }
     const size_t addedStrips = newStrips.size() / 40, addedBarriers = newBarriers.size() / 32;
     const size_t stripCount   = article.read<u16>(0);
     const size_t stripBytes   = article.read<u16>(2);
@@ -507,12 +522,15 @@ bool RewriteWorldCollision(ByteSpan whole, const CollisionPack& pack, const std:
                            std::vector<GridEntry>* grown, u32* nextArticleId) {
     if (placed) placed->assign(added.size() + spill.size(), 0);
     if (grown) grown->clear();
+    size_t degenerate = 0;   // added triangles with no area, left out (see writeInto)
+    struct Report { const size_t& n; u32 pack; ~Report() { if (n) LOG_INFO("collision section %u: %zu added triangles with no area left out", pack, n); } };
     const u8* payload = whole.data;
     const size_t size = whole.size;
     size_t filler = 0;
     while (filler < 16 && filler < size && payload[filler] == 0x11) ++filler;
     const ByteSpan data{ payload + filler, size - filler };
     const std::wstring name = L"Collision section " + std::to_wstring(data.read<u32>(4));
+    const Report report{ degenerate, data.read<u32>(4) };
     auto fail = [&](const wchar_t* why) {
         error = name + L" " + why;
         return false;
@@ -621,6 +639,10 @@ bool RewriteWorldCollision(ByteSpan whole, const CollisionPack& pack, const std:
             std::vector<Vec3> local((size_t)pieceCount);
             for (int k = 0; k < pieceCount; ++k) {
                 local[k] = { shift.x - primitives[k].y, primitives[k].z + shift.y, primitives[k].x + shift.z };
+                // On the 1/128 grid the game reads vertices in: neighbours then share their corners exactly. Each
+                // one-triangle strip rounded its corners about its own centre, which left cracks between
+                // triangles that a wheel fell through onto the ground under a ramp (Bayview 24/11).
+                for (float* v : { &local[k].x, &local[k].y, &local[k].z }) *v = std::round(*v * 128.0f) / 128.0f;
                 tall = std::max(tall, std::fabs(local[k].y) + 0.01f);
                 around = std::max(around, std::hypot(local[k].x, local[k].z) + 0.01f);
             }
@@ -695,9 +717,19 @@ bool RewriteWorldCollision(ByteSpan whole, const CollisionPack& pack, const std:
             }
             for (int k = 0; k + 2 < pieceCount; k += 3) {
                 Vec3 a = local[k], b = local[k + 1], c = local[k + 2];
+                // No area on the 1/128 grid (one point, or three in a line): never written. nfsw.exe's point-in-face
+                // test (0x6dcbc0) takes a one-point face as holding every point, and a wheel that cached one rode its
+                // height as an endless flat plane: the car floated down a slope and sank into the sidewalk (Bayview
+                // -3373 728 -> -3425 673, Gui 25/11; 238 such faces, 8 267 with no area).
+                {
+                    const Vec3 u = b - a, w = c - a;
+                    const float cx = u.y * w.z - u.z * w.y, cy = u.z * w.x - u.x * w.z, cz = u.x * w.y - u.y * w.x;
+                    if (cx * cx + cy * cy + cz * cz < 1e-8f) { ++degenerate; continue; }
+                }
                 // Winding 0 is a strip whose first triangle looks up as stored.
                 if ((b.z - a.z) * (c.x - a.x) - (b.x - a.x) * (c.z - a.z) < 0.0f) std::swap(a, b);
-                const Vec3 centre = (a + b + c) * (1.0f / 3.0f);
+                Vec3 centre = (a + b + c) * (1.0f / 3.0f);
+                for (float* v : { &centre.x, &centre.y, &centre.z }) *v = std::round(*v * 128.0f) / 128.0f;   // corners stay on the grid
                 float reach = 0.0f;
                 bool fits = true;
                 u8 strip[40] = {};
@@ -1045,6 +1077,18 @@ bool RewriteWorldCollision(ByteSpan whole, const CollisionPack& pack, const std:
             };
             size_t packBytes = data.size;
             const u32 section = data.read<u32>(4);
+            // Highest clusters first: a wheel takes the first face under it in the order the game gathers
+            // instances (index order within a grid cell), so a road deck whose instance came after the ground
+            // 9 m below lost the wheel to that ground at every change of triangle (Bayview 25/11, -3063 940).
+            {
+                auto top = [&](const std::vector<size_t>& cl) {
+                    float t = -1e30f;
+                    for (size_t i : cl) for (const Vec3& p : homeless[i].points) t = std::max(t, p.z);
+                    return t;
+                };
+                std::stable_sort(clusters.begin(), clusters.end(),
+                                 [&](const std::vector<size_t>& a, const std::vector<size_t>& b) { return top(a) > top(b); });
+            }
             for (const std::vector<size_t>& cluster : clusters) {
                 size_t strips = 0, barriers = 0;
                 for (size_t i : cluster) (homeless[i].barrier ? barriers : strips) += homeless[i].cost;
@@ -1067,7 +1111,8 @@ bool RewriteWorldCollision(ByteSpan whole, const CollisionPack& pack, const std:
                     }
                 // 5 cm round the content keeps every local point inside and the
                 // radius at hypot(width, length) after writeInto's +0.01.
-                const Vec3 middle = (lo + hi) * 0.5f;
+                Vec3 middle = (lo + hi) * 0.5f;
+                for (float* v : { &middle.x, &middle.y, &middle.z }) *v = std::round(*v * 128.0f) / 128.0f;   // shift on the 1/128 grid too
                 const float width = (hi.x - lo.x) * 0.5f + 0.05f, height = (hi.y - lo.y) * 0.5f + 0.05f;
                 const float length = (hi.z - lo.z) * 0.5f + 0.05f, radius = std::hypot(width, length);
                 u8 instance[kInstanceSize];
@@ -1101,7 +1146,7 @@ bool RewriteWorldCollision(ByteSpan whole, const CollisionPack& pack, const std:
                     writeInto(added[homeless[i].n], homeless[i].barrier, false, homeless[i].points, at,
                               ByteSpan{ target.base.data(), target.base.size() }, target.strips, target.barriers,
                               target.surfaces);
-                if (grown) grown->push_back({ (section << 16) | (u32)index, lo.x, hi.x, lo.z, hi.z });
+                if (grown) grown->push_back({ (section << 16) | (u32)index, lo.x, hi.x, lo.z, hi.z, lo.y, hi.y });
             }
             LOG_INFO("collision section %u: %zu polygons (or parts outside the boxes they were cut into) far from "
                      "its shipped boxes or without room there, %zu written in %zu new "
@@ -1118,7 +1163,9 @@ bool RewriteWorldCollision(ByteSpan whole, const CollisionPack& pack, const std:
                 const size_t at = i * kInstanceSize;
                 const float width = field(at + 0x0C), length = field(at + 0x2C);
                 const float sx = field(at + 0x30), sz = field(at + 0x38);
-                grown->push_back({ (section << 16) | (u32)i, -sx - width, -sx + width, -sz - length, -sz + length });
+                const float sy = field(at + 0x34), half = field(at + 0x14);
+                grown->push_back({ (section << 16) | (u32)i, -sx - width, -sx + width, -sz - length, -sz + length,
+                                   -sy - half, -sy + half });
             }
     }
 

@@ -1,6 +1,7 @@
 #include "render/CollisionMesh.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -103,7 +104,9 @@ void CollisionMesh::Build(IDirect3DDevice9* device, const nfs::CollisionPack& pa
     part = {};
 
     std::vector<CollisionVertex> surfaces, sided, lines;
+    const auto resolveFrom = std::chrono::steady_clock::now();
     pack.ResolveBarriers();   // barrier heights, chain by chain
+    resolveMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - resolveFrom).count();
 
     for (const nfs::CollisionPolygon& polygon : pack.polygons) {
         ++part.polygons;

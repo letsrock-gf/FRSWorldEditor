@@ -5,6 +5,7 @@
 #include "nfs/ChunkReader.h"
 
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace nfs {
@@ -107,6 +108,7 @@ struct CollisionPack {
     // the result until the polygons are replaced; the collision view calls
     // this whenever it rebuilds.
     void ResolveBarriers() const;
+    static inline size_t barrierMismatches = 0;   // packs whose heights differ with and without the ground index (FRS_CHECK_BARRIERS)
     // The heights a barrier gets on its own, without its neighbours.
     void BarrierEndsAlone(const CollisionPolygon& barrier, float& za, float& zb) const { BarrierEnds(barrier, za, zb); }
 
@@ -115,6 +117,7 @@ private:
     mutable std::vector<std::pair<float, float>> barrierZ_;   // per polygon, for barriers
     mutable const CollisionPolygon* barrierFor_ = nullptr;
     mutable size_t barrierSize_ = 0;
+    mutable std::unordered_map<long long, std::vector<u32>> groundCells_;   // filled only while ResolveBarriers runs
     static constexpr float kWallShown    = 4.0f;   // drawn height of an NFS World wall
 };
 
@@ -180,7 +183,7 @@ bool RemoveFromWorldCollision(u8* payload, size_t size, const std::vector<u32>& 
 // instance with a tight box each, the article numbered from *nextArticleId on
 // (advanced); `placed` says 3 for those, `grown` lists the new instances too.
 // Without it the nearest box grows as before.
-struct GridEntry { u32 key; float x0, x1, z0, z1; };   // pack << 16 | instance; box in collision x and z
+struct GridEntry { u32 key; float x0, x1, z0, z1; float y0 = 0.0f, y1 = 0.0f; };   // pack << 16 | instance; box in collision x and z, height span (up)
 bool RewriteWorldCollision(ByteSpan payload, const CollisionPack& pack, const std::vector<u32>& removed,
                            const std::vector<CollisionPolygon>& added, size_t& skipped,
                            std::vector<u8>& out, std::wstring& error,

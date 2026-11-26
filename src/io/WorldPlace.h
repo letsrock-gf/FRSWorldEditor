@@ -27,11 +27,32 @@ constexpr size_t kPropSize = 64;
 // The prop's pose from a placement's matrix (rows = axes, scale taken out).
 void SetPropPose(u8* prop, const Mat4& m);
 
+// Game physics an editor placement can be given whatever its model
+// (PlacedInstance::physics). The attribute collection of class `smackable`
+// (attributes.bin) sets mass and how it reacts; the collision box is the
+// model's own box (a Bounds collection made for it). A plain rigid body: it is
+// knocked about, not dented or broken.
+struct PhysicsPreset {
+    const wchar_t* label;
+    u32 collection;   // 0x34027 +0x24
+};
+inline constexpr PhysicsPreset kPhysicsPresets[] = {
+    { L"None", 0 },
+    { L"Sign (signpost, 100 kg)", 0x8C582F44u },
+    { L"Pop machine (150 kg)", 0x13750F5Fu },
+    { L"Vending machine (vend_mach, 25 kg)", 0x0543862Eu },
+};
+inline constexpr size_t kPhysicsPresetCount = sizeof(kPhysicsPresets) / sizeof(kPhysicsPresets[0]);
+
 // New entries of L5RA.BUN's 0x34108, numbered on from the shipped ones. Each
 // save makes them again from the shipped files, in the same order.
 struct PropIds {
     ByteSpan shipped;                       // the shipped chunk's data
     std::vector<u8> added;                  // 6 bytes an entry
+    // New 0x3B901 children for the 0x8003B900 pack of L5RA.BUN (96 bytes
+    // each): the collision box of a model given a preset, once per model.
+    std::vector<u8> bounds;
+    std::vector<u32> boundsKeys;
     u32 Next() const { return (u32)(shipped.size / 6 + added.size() / 6); }
 };
 
