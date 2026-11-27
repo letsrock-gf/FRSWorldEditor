@@ -1056,6 +1056,10 @@ bool BuildNewNode(const nfs::World& world, const nfs::World::NewModel& entry, co
         if (found == donors.end()) {
             // A new texture's material is the one of the game texture it copies.
             const nfs::World::NewTexture* made = NewTextureOf(world, texture);
+            // A game texture copied beside another (StageCopiedTextures) is still the game's: its material
+            // is its own, not that of `like`, which only names the pack the copy goes into and may be no
+            // model's first texture (ARC_A_CROSSBEAM_GR beside 003D2B24 in F115, 27/11).
+            if (made && !made->header.empty() && !made->fromCar) made = nullptr;
             Donor donor;
             bool have = FindDonor(world, *target, made ? made->like : texture, donor);
             // A new texture whose `like` no model of this section draws with (a
