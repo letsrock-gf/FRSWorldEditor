@@ -43,6 +43,7 @@
 #include "imgui.h"
 
 #include <shlobj.h>
+#include <commdlg.h>
 
 #include <algorithm>
 #include <cmath>
@@ -364,6 +365,9 @@ constexpr int ID_ROAD_LANE_MERGE    = ID_ROADS_FIRST + 90;   // an entrance: a l
 constexpr int ID_ROAD_JOIN_NODES    = ID_ROADS_FIRST + 91;   // join the two nodes picked with Ctrl+click
 constexpr int ID_ROAD_COPY_PROPS    = ID_ROADS_FIRST + 92;   // the selected road's properties, length aside
 constexpr int ID_ROAD_PASTE_PROPS   = ID_ROADS_FIRST + 93;   // onto every selected road
+constexpr int ID_ROAD_SELECT_JOINED = ID_ROADS_FIRST + 94;   // every road joined to the selected one
+constexpr int ID_ROAD_EXPORT        = ID_ROADS_FIRST + 95;   // the selected roads to a file, for another map
+constexpr int ID_ROAD_IMPORT        = ID_ROADS_FIRST + 96;   // roads from such a file, at the view centre
 constexpr int ID_ROAD_DRAW          = ID_ROADS_FIRST + 41;
 constexpr int ID_ROAD_INSERT_MIDDLE = ID_ROADS_FIRST + 42;
 constexpr int ID_ROAD_DRAW_FROM     = ID_ROADS_FIRST + 43;
@@ -1067,6 +1071,9 @@ public:
             case ID_ROAD_SPLIT:        Split(); return true;
             case ID_ROAD_DELETE:       DeleteSelection(); return true;
             case ID_ROAD_AUTO_HEADING: AutoHeading(); return true;
+            case ID_ROAD_SELECT_JOINED: SelectJoined(); return true;
+            case ID_ROAD_EXPORT:       ExportRoads(); return true;
+            case ID_ROAD_IMPORT:       ImportRoads(); return true;
             case ID_ROAD_BAKE:         Bake(); return true;
             case ID_ROAD_UNBAKE:       Unbake(); return true;
             case ID_TERRAIN_NEW:       NewTerrain(); return true;
@@ -1969,7 +1976,7 @@ public:
             return true;
         }
         if (const size_t count = SelectedRoadIds().size(); count > 1) {
-            text = Fmt(L"%zu roads selected   [a value changed in Properties goes to all of them   Ctrl+click in the "
+            text = Fmt(L"%zu roads selected   [gizmo moves and turns them all   a value changed in Properties goes to all of them   Ctrl+click in the "
                        L"Explorer adds or takes out one, Shift+click a run]", count);
             return true;
         }
@@ -2076,6 +2083,11 @@ public:
         if (const roads::Segment* s = SelectedHandle()) {
             position = HandlePoint(*s, (Selected() & kHandleAtStart) != 0);
             heading = 0.0f;
+            return true;
+        }
+        if (GroupSelected()) {
+            position = GroupCentre();
+            heading = groupHeading_;
             return true;
         }
         const roads::Node* node = SelectedNode();
@@ -2187,6 +2199,30 @@ public:
                         (otherStart ? other->liftA : other->liftB) = -slope * otherReach;
                     }
             }
+            network_.SetDirty();
+            if (commit) Changed(true);
+            return true;
+        }
+        if (GroupSelected()) {
+            // The whole group: moved with the gizmo, turned round its middle.
+            const Vec3 centre = GroupCentre();
+            const float turn = heading - groupHeading_;
+            groupHeading_ = heading;
+            const float c = std::cos(Radians(turn)), sn = std::sin(Radians(turn));
+            for (u32 id : GroupNodes()) {
+                roads::Node* n = network_.FindNode(id);
+                const Vec3 r = n->position - centre;
+                n->position = Vec3{ position.x + r.x * c - r.y * sn, position.y + r.x * sn + r.y * c,
+                                    n->position.z + position.z - centre.z };
+                if (n->hasHeading) n->heading += turn;
+            }
+            if (turn != 0.0f)
+                for (u32 id : SelectedRoadIds())
+                    if (roads::Segment* s = network_.FindSegment(id)) {
+                        s->dirA += turn;
+                        s->dirB += turn;
+                    }
+            network_.UpdateFollowers();
             network_.SetDirty();
             if (commit) Changed(true);
             return true;
@@ -2354,6 +2390,183 @@ private:
         Select((int)ids.front());
         app_.UpdateProperties();
     }
+    // ---- roads to another map
+    //
+    // A group of roads goes out as a road network file of its own -- the same
+    // FRSROADS text a region's roads are kept in (roads-<region>.txt), at the
+    // coordinates they had, every profile value with them (lanes, textures,
+    // bridge, walls, poles, terrain bands), so a bake on the other map makes
+    // the same mesh and collision. It comes in at the view centre, all of it
+    // selected, and the gizmo moves and turns it whole. The original editor's
+    // own roads-<region>.txt reads the same way. Junctions into the game's own
+    // roads and cuts belong to the map they were made on and stay behind.
+
+    u32 groupFor_ = 0;          // the road a group selection was made from
+    float groupHeading_ = 0.0f; // the gizmo's heading while the group is selected
+
+    // Copies the roads `only` (every road when empty) of `from`, with their
+    // nodes, into `into`, moved by `delta`; the new roads' ids in `added`.
+    static void CopyRoads(const roads::Network& from, const std::vector<u32>& only, const Vec3& delta,
+                          roads::Network& into, std::vector<u32>& added) {
+        const auto taken = [&](u32 id) { return only.empty() || std::find(only.begin(), only.end(), id) != only.end(); };
+        std::map<u32, u32> nodes;
+        for (const roads::Segment& s : from.Segments())
+            if (taken(s.id))
+                for (u32 end : { s.a, s.b })
+                    if (!nodes.count(end))
+                        if (const roads::Node* n = from.FindNode(end)) nodes[end] = into.AddNode(n->position + delta);
+        for (const auto& [old, now] : nodes) {
+            roads::Node& n = *into.FindNode(now);
+            n = *from.FindNode(old);
+            n.id = now;
+            n.position = n.position + delta;
+            const auto followed = nodes.find(n.follow);
+            n.follow = followed != nodes.end() ? followed->second : 0;
+        }
+        for (const roads::Segment& s : from.Segments()) {
+            if (!taken(s.id) || !nodes.count(s.a) || !nodes.count(s.b)) continue;
+            roads::Segment* copy = into.AddSegment(nodes[s.a], nodes[s.b], s.profile);
+            if (!copy) continue;
+            const u32 id = copy->id;
+            *copy = s;
+            copy->id = id;
+            copy->a = nodes[s.a];
+            copy->b = nodes[s.b];
+            added.push_back(id);
+        }
+        into.SetDirty();
+    }
+
+    void SelectGroup(const std::vector<u32>& ids) {
+        if (ids.empty()) return;
+        groupFor_ = ids.front();
+        groupHeading_ = 0.0f;
+        SelectRoads(ids);
+    }
+
+    bool GroupSelected() const {
+        const roads::Segment* s = SelectedSegment();
+        return s && (groupFor_ == s->id || SelectedRoadIds().size() > 1);
+    }
+
+    std::set<u32> GroupNodes() const {
+        std::set<u32> nodes;
+        for (u32 id : SelectedRoadIds())
+            if (const roads::Segment* s = network_.FindSegment(id)) nodes.insert({ s->a, s->b });
+        return nodes;
+    }
+
+    Vec3 GroupCentre() const {
+        Aabb box;
+        for (u32 id : GroupNodes()) box.Add(network_.FindNode(id)->position);
+        return box.Center();
+    }
+
+    // Every road reachable from the selected road or node, through nodes and
+    // through the halves of a split road (a node that follows another).
+    void SelectJoined() {
+        u32 start = 0;
+        if (const roads::Segment* s = SelectedSegment()) start = s->id;
+        else if (const roads::Node* n = SelectedNode()) {
+            const std::vector<u32> around = network_.SegmentsAt(n->id);
+            if (!around.empty()) start = around.front();
+        }
+        // ponytail: a scripted test (FRS_ROADS_FILE) cannot click; it starts at the first road.
+        if (!start && std::getenv("FRS_ROADS_FILE") && !network_.Segments().empty()) start = network_.Segments().front().id;
+        if (!start) {
+            app_.Message(L"Select a road or a node first (click it): every road joined to it is selected.");
+            return;
+        }
+        std::vector<u32> ids{ start };
+        std::set<u32> seen{ start };
+        // ponytail: every node scanned for followers, O(nodes x roads); fine for a few thousand nodes.
+        for (size_t k = 0; k < ids.size(); ++k) {
+            const roads::Segment* s = network_.FindSegment(ids[k]);
+            for (u32 end : { s->a, s->b }) {
+                std::vector<u32> at{ end };
+                if (const roads::Node* n = network_.FindNode(end); n && n->follow) at.push_back(n->follow);
+                for (const roads::Node& o : network_.Nodes())
+                    if (o.follow == end) at.push_back(o.id);
+                for (u32 node : at)
+                    for (u32 next : network_.SegmentsAt(node))
+                        if (seen.insert(next).second) ids.push_back(next);
+            }
+        }
+        SelectGroup(ids);
+        app_.Status(Fmt(L"%zu roads selected -- the gizmo moves and turns them all; Roads > Export the Selected "
+                        L"Roads writes them to a file", ids.size()));
+    }
+
+    std::wstring AskRoadsFile(bool save) const {
+        if (const wchar_t* test = _wgetenv(L"FRS_ROADS_FILE")) return test;   // scripted test: no dialog
+        wchar_t file[MAX_PATH] = {};
+        if (save) wcscpy_s(file, L"roads-export.txt");
+        OPENFILENAMEW dialog{};
+        dialog.lStructSize = sizeof(dialog);
+        dialog.hwndOwner = app_.Window();
+        dialog.lpstrFilter = L"Road networks (*.txt)\0*.txt\0All files\0*.*\0";
+        dialog.lpstrFile = file;
+        dialog.nMaxFile = MAX_PATH;
+        dialog.lpstrDefExt = L"txt";
+        dialog.lpstrTitle = save ? L"Export the selected roads" : L"Import roads (an export, or a roads-<region>.txt)";
+        dialog.Flags = OFN_NOCHANGEDIR | (save ? OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST : OFN_FILEMUSTEXIST);
+        return (save ? ::GetSaveFileNameW(&dialog) : ::GetOpenFileNameW(&dialog)) ? std::wstring(file) : std::wstring();
+    }
+
+    void ExportRoads() {
+        const std::vector<u32> ids = SelectedRoadIds();
+        if (ids.empty()) {
+            app_.Message(L"Select the roads first: click one, then Roads > Select All Roads Joined to the Selected One "
+                         L"(Ctrl+click in the Explorer adds or takes out a road).");
+            return;
+        }
+        const std::wstring path = AskRoadsFile(true);
+        if (path.empty()) return;
+        roads::Network out;
+        std::vector<u32> added;
+        CopyRoads(network_, ids, Vec3{}, out, added);
+        if (!out.Save(path)) {
+            app_.Message(L"Could not write " + path, MB_ICONWARNING);
+            return;
+        }
+        LOG_INFO("roads: %zu roads, %zu nodes exported to %S", added.size(), out.Nodes().size(), path.c_str());
+        app_.Status(Fmt(L"%zu roads exported to %s -- Roads > Import Roads on the other map", added.size(), path.c_str()));
+    }
+
+    void ImportRoads() {
+        if (!app_.World()) return;
+        const std::wstring path = AskRoadsFile(false);
+        if (path.empty()) return;
+        roads::Network in;
+        if (!in.Load(path) || in.Segments().empty()) {
+            app_.Message(L"No roads in " + path, MB_ICONWARNING);
+            return;
+        }
+        Vec3 at;
+        if (!app_.ViewCentre(at)) {
+            app_.Message(L"Look at the ground where the roads should go, then import again.");
+            return;
+        }
+        // The group's middle on the view centre, its lowest node on the ground there.
+        Aabb box;
+        for (const roads::Node& n : in.Nodes()) box.Add(n.position);
+        const Vec3 middle = box.Center();
+        const Vec3 delta{ at.x - middle.x, at.y - middle.y, at.z - box.min.z };
+        std::vector<u32> added;
+        CopyRoads(in, {}, delta, network_, added);
+        if (added.empty()) {
+            app_.Message(L"No road of " + path + L" could be made (each needs both its nodes).", MB_ICONWARNING);
+            return;
+        }
+        visible_ = true;
+        Changed(true);
+        SelectGroup(added);
+        LOG_INFO("roads: %zu roads imported from %S, moved by %.1f %.1f %.1f", added.size(), path.c_str(), delta.x,
+                 delta.y, delta.z);
+        app_.Status(Fmt(L"%zu roads imported and selected -- the gizmo moves and turns them all (Ctrl+Z takes them "
+                        L"out); J joins an end to a road already there", added.size()));
+    }
+
     void FillRoad(PropertiesPanel::View& view, const roads::Segment& road);
     void ApplyRoad(roads::RoadProfile& p, int only);
 
@@ -7742,6 +7955,10 @@ private:
         ::AppendMenuW(roadsMenu, MF_STRING, ID_ROAD_EXTEND, L"&Pull a Road out of the Selected Node\tCtrl+Shift+R");
         ::AppendMenuW(roadsMenu, MF_STRING, ID_ROAD_SPLIT, L"&Split the Selected Road Where Clicked");
         ::AppendMenuW(roadsMenu, MF_STRING, ID_ROAD_DELETE, L"&Delete Selected Node or Road");
+        ::AppendMenuW(roadsMenu, MF_SEPARATOR, 0, nullptr);
+        ::AppendMenuW(roadsMenu, MF_STRING, ID_ROAD_SELECT_JOINED, L"Select &All Roads Joined to the Selected One");
+        ::AppendMenuW(roadsMenu, MF_STRING, ID_ROAD_EXPORT, L"E&xport the Selected Roads to a File...");
+        ::AppendMenuW(roadsMenu, MF_STRING, ID_ROAD_IMPORT, L"&Import Roads from a File (another map, or the original editor's roads-*.txt)...");
         ::AppendMenuW(roadsMenu, MF_SEPARATOR, 0, nullptr);
         HMENU lanesMenu = ::CreatePopupMenu();
         ::AppendMenuW(lanesMenu, MF_STRING, ID_ROAD_LANE_ADD, L"Add a &Lane after the Selected Node");
