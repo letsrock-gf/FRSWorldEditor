@@ -153,45 +153,190 @@ Vec2 NearestOnOutline(const std::vector<Vec2>& poly, Vec2 p, size_t& edge, float
     return best;
 }
 
-// A corridor `half` wide along `path` (outside the outline), let into the
-// outline at the point of it nearest to the path's start: two points on that
-// edge either side of it, then one side of the corridor out and the other back.
-void AddCorridor(std::vector<Vec2>& poly, const std::vector<Vec2>& path, float half) {
-    if (path.empty() || poly.size() < 3) return;
-    size_t edge = 0;
-    float gap = 0.0f;
-    const Vec2 base = NearestOnOutline(poly, path.front(), edge, gap);
-    (void)gap;
-    const Vec2 a = poly[edge], b = poly[(edge + 1) % poly.size()];
-    const float el = std::max(1e-3f, std::hypot(b.x - a.x, b.y - a.y));
-    const Vec2 e{ (b.x - a.x) / el, (b.y - a.y) / el };
-    std::vector<Vec2> line{ base };
-    line.insert(line.end(), path.begin(), path.end());
-    // The base on the edge itself, so the corridor never laps over the zone
-    // (the even-odd test would make that a hole); then both sides outwards.
-    const Vec2 nearA{ base.x - e.x * half, base.y - e.y * half }, nearB{ base.x + e.x * half, base.y + e.y * half };
-    std::vector<Vec2> left, right;
-    for (size_t i = 1; i < line.size(); ++i) {
-        const Vec2 from = line[i - 1], to = line[std::min(i + 1, line.size() - 1)];
-        float tx = to.x - from.x, ty = to.y - from.y;
-        const float tl = std::max(1e-3f, std::hypot(tx, ty));
-        tx /= tl; ty /= tl;
-        left.push_back({ line[i].x - ty * half, line[i].y + tx * half });
-        right.push_back({ line[i].x + ty * half, line[i].y - tx * half });
+// A band `half` wide along a path (outside a zone), for WidenOutline.
+struct ZoneBand {
+    std::vector<Vec2> path;
+    float half = 0.0f;
+};
+
+// Whether two edges of an outline cross (touching ends aside).
+bool EdgesCross(Vec2 a, Vec2 b, Vec2 c, Vec2 d) {
+    const auto side = [](Vec2 p, Vec2 q, Vec2 r) { return (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x); };
+    return side(a, b, c) * side(a, b, d) < 0.0f && side(c, d, a) * side(c, d, b) < 0.0f;
+}
+
+bool OutlineCrosses(const std::vector<Vec2>& poly) {
+    const size_t n = poly.size();
+    for (size_t i = 0; i < n; ++i)
+        for (size_t j = i + 2; j < n; ++j)
+            if (!(i == 0 && j == n - 1) && EdgesCross(poly[i], poly[(i + 1) % n], poly[j], poly[(j + 1) % n]))
+                return true;
+    return false;
+}
+
+float OutlineArea(const std::vector<Vec2>& poly) {
+    double twice = 0.0;
+    for (size_t i = 0, j = poly.size() - 1; i < poly.size(); j = i++)
+        twice += (double)(poly[j].x - poly[0].x) * (poly[i].y - poly[0].y) - (double)(poly[i].x - poly[0].x) * (poly[j].y - poly[0].y);
+    return (float)(twice * 0.5);
+}
+
+// Douglas-Peucker between `from` and `to` of a closed loop (indices, `to` may wrap).
+void Simplify(const std::vector<Vec2>& loop, size_t from, size_t to, float tolerance, std::vector<size_t>& keep) {
+    const size_t n = loop.size();
+    const Vec2 a = loop[from % n], b = loop[to % n];
+    const float dx = b.x - a.x, dy = b.y - a.y, len = std::max(1e-6f, std::hypot(dx, dy));
+    float worst = -1.0f;
+    size_t at = 0;
+    for (size_t k = from + 1; k < to; ++k) {
+        const Vec2 p = loop[k % n];
+        const float d = std::fabs((p.x - a.x) * dy - (p.y - a.y) * dx) / len;
+        if (d > worst) { worst = d; at = k; }
     }
-    // Out along the side nearer `a`, back along the other: the outline stays one loop.
-    const auto along = [&](const Vec2& p) { return (p.x - a.x) * e.x + (p.y - a.y) * e.y; };
-    if (along(right.front()) < along(left.front())) std::swap(left, right);
-    // Side points inside the zone add nothing and would cross its edge (near
-    // the edge a side swings back in): left out.
-    const auto inside = [&](const Vec2& p) { return InOutline(poly, p.x, p.y); };
-    left.erase(std::remove_if(left.begin(), left.end(), inside), left.end());
-    right.erase(std::remove_if(right.begin(), right.end(), inside), right.end());
-    std::vector<Vec2> spur{ nearA };
-    spur.insert(spur.end(), left.begin(), left.end());
-    spur.insert(spur.end(), right.rbegin(), right.rend());
-    spur.push_back(nearB);
-    poly.insert(poly.begin() + (std::ptrdiff_t)(edge + 1), spur.begin(), spur.end());
+    if (worst <= tolerance) return;
+    Simplify(loop, from, at, tolerance, keep);
+    keep.push_back(at % n);
+    Simplify(loop, at, to, tolerance, keep);
+}
+
+// The union of zone outline `base` (even-odd, as the game tests it) and the
+// bands, as one outline that does not cross itself, of at most `maxPoints`.
+// Bands let into the outline one at a time lapped over each other where roads
+// join, and the game's even-odd test made a hole of every lap (zone 5115: 123
+// crossings, 27/11). Made on a grid and grown before it is simplified, so it
+// only grows: the zone and every band are inside it, the zone's own edges
+// moved out by a few metres at most. Empty when no such outline fits.
+std::vector<Vec2> WidenOutline(const std::vector<Vec2>& base, const std::vector<ZoneBand>& bands, size_t maxPoints) {
+    if (base.size() < 3) return {};
+    Vec2 lo{ 1e30f, 1e30f }, hi{ -1e30f, -1e30f };
+    const auto grow = [&](Vec2 p, float r) {
+        lo.x = std::min(lo.x, p.x - r); lo.y = std::min(lo.y, p.y - r);
+        hi.x = std::max(hi.x, p.x + r); hi.y = std::max(hi.y, p.y + r);
+    };
+    for (const Vec2& p : base) grow(p, 0.0f);
+    for (const ZoneBand& band : bands)
+        for (const Vec2& p : band.path) grow(p, band.half);
+    const float extent = std::max(hi.x - lo.x, hi.y - lo.y);
+    const bool clockwise = OutlineArea(base) < 0.0f;
+    for (float cell = std::max(2.0f, extent / 2000.0f); cell <= std::max(64.0f, extent / 50.0f); cell *= 1.5f) {
+        for (float tolerance = cell * 0.5f; tolerance <= cell * 32.0f; tolerance *= 1.6f) {
+            // Grown by a cell's diagonal and the tolerance: the simplified outline still holds all of it.
+            const float pad = cell * 0.75f + tolerance;
+            const Vec2 origin{ lo.x - pad - 2.0f * cell, lo.y - pad - 2.0f * cell };
+            const int w = (int)std::ceil((hi.x - lo.x + 2.0f * pad) / cell) + 4;
+            const int h = (int)std::ceil((hi.y - lo.y + 2.0f * pad) / cell) + 4;
+            std::vector<u8> in((size_t)w * h, 0);
+            const auto at = [&](int x, int y) -> u8& { return in[(size_t)y * w + x]; };
+            const auto centre = [&](int x, int y) { return Vec2{ origin.x + (x + 0.5f) * cell, origin.y + (y + 0.5f) * cell }; };
+            // The zone itself, row by row (even-odd, as InOutline).
+            for (int y = 0; y < h; ++y) {
+                const float cy = origin.y + (y + 0.5f) * cell;
+                std::vector<float> xs;
+                for (size_t i = 0, j = base.size() - 1; i < base.size(); j = i++)
+                    if ((base[i].y > cy) != (base[j].y > cy))
+                        xs.push_back((base[j].x - base[i].x) * (cy - base[i].y) / (base[j].y - base[i].y) + base[i].x);
+                std::sort(xs.begin(), xs.end());
+                for (size_t k = 0; k + 1 < xs.size(); k += 2)
+                    for (int x = std::max(0, (int)std::ceil((xs[k] - origin.x) / cell - 0.5f));
+                         x < w && origin.x + (x + 0.5f) * cell <= xs[k + 1]; ++x)
+                        at(x, y) = 1;
+            }
+            // Every cell whose centre is within `r` of segment a-b.
+            const auto stroke = [&](Vec2 a, Vec2 b, float r) {
+                const int x0 = std::max(0, (int)((std::min(a.x, b.x) - r - origin.x) / cell));
+                const int x1 = std::min(w - 1, (int)((std::max(a.x, b.x) + r - origin.x) / cell) + 1);
+                const int y0 = std::max(0, (int)((std::min(a.y, b.y) - r - origin.y) / cell));
+                const int y1 = std::min(h - 1, (int)((std::max(a.y, b.y) + r - origin.y) / cell) + 1);
+                const float dx = b.x - a.x, dy = b.y - a.y, l2 = dx * dx + dy * dy;
+                for (int y = y0; y <= y1; ++y)
+                    for (int x = x0; x <= x1; ++x) {
+                        const Vec2 c = centre(x, y);
+                        const float t = l2 > 0.0f ? std::clamp(((c.x - a.x) * dx + (c.y - a.y) * dy) / l2, 0.0f, 1.0f) : 0.0f;
+                        if (std::hypot(c.x - a.x - t * dx, c.y - a.y - t * dy) <= r) at(x, y) = 1;
+                    }
+            };
+            for (size_t i = 0, j = base.size() - 1; i < base.size(); j = i++) stroke(base[j], base[i], pad);
+            for (const ZoneBand& band : bands)
+                for (size_t k = 0; k < band.path.size(); ++k)
+                    stroke(band.path[k], band.path[std::min(k + 1, band.path.size() - 1)], band.half + pad);
+            // Holes filled: whatever the outside does not reach is in.
+            std::vector<u8> outside((size_t)w * h, 0);
+            std::vector<std::pair<int, int>> todo{ { 0, 0 } };
+            outside[0] = 1;
+            while (!todo.empty()) {
+                const auto [x, y] = todo.back();
+                todo.pop_back();
+                const int nx[4] = { x - 1, x + 1, x, x }, ny[4] = { y, y, y - 1, y + 1 };
+                for (int k = 0; k < 4; ++k)
+                    if (nx[k] >= 0 && ny[k] >= 0 && nx[k] < w && ny[k] < h && !at(nx[k], ny[k]) &&
+                        !outside[(size_t)ny[k] * w + nx[k]]) {
+                        outside[(size_t)ny[k] * w + nx[k]] = 1;
+                        todo.push_back({ nx[k], ny[k] });
+                    }
+            }
+            for (size_t k = 0; k < in.size(); ++k) in[k] = !outside[k];
+            // Cells touching only at a corner would give a corner two ways on: fill one.
+            for (bool changed = true; changed;) {
+                changed = false;
+                for (int y = 0; y + 1 < h; ++y)
+                    for (int x = 0; x + 1 < w; ++x) {
+                        const u8 a = at(x, y), b = at(x + 1, y), c = at(x, y + 1), d = at(x + 1, y + 1);
+                        if (a == d && b == c && a != b) { (a ? at(x + 1, y) : at(x, y)) = 1; changed = true; }
+                    }
+            }
+            // The boundary, the inside on the left: each grid corner then has one edge out.
+            std::unordered_map<u64, u64> next;
+            const auto key = [&](int x, int y) { return (u64)(u32)y * (u64)(w + 1) + (u64)(u32)x; };
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x) {
+                    if (!at(x, y)) continue;
+                    if (y == 0 || !at(x, y - 1)) next[key(x, y)] = key(x + 1, y);
+                    if (x == w - 1 || !at(x + 1, y)) next[key(x + 1, y)] = key(x + 1, y + 1);
+                    if (y == h - 1 || !at(x, y + 1)) next[key(x + 1, y + 1)] = key(x, y + 1);
+                    if (x == 0 || !at(x - 1, y)) next[key(x, y + 1)] = key(x, y);
+                }
+            std::vector<Vec2> best;
+            float bestArea = 0.0f;
+            std::unordered_set<u64> seen;
+            for (const auto& [start, unused] : next) {
+                (void)unused;
+                if (seen.count(start)) continue;
+                std::vector<Vec2> loop;
+                for (u64 k = start; seen.insert(k).second;) {
+                    loop.push_back({ origin.x + (float)(k % (u64)(w + 1)) * cell, origin.y + (float)(k / (u64)(w + 1)) * cell });
+                    const auto found = next.find(k);
+                    if (found == next.end()) break;
+                    k = found->second;
+                }
+                const float area = std::fabs(OutlineArea(loop));
+                if (area > bestArea) { bestArea = area; best = std::move(loop); }
+            }
+            if (best.size() < 3) continue;
+            // From the corner farthest from the first, both halves simplified.
+            size_t opposite = 0;
+            float farthest = -1.0f;
+            for (size_t k = 0; k < best.size(); ++k) {
+                const float d = std::hypot(best[k].x - best[0].x, best[k].y - best[0].y);
+                if (d > farthest) { farthest = d; opposite = k; }
+            }
+            std::vector<size_t> keep{ 0 };
+            Simplify(best, 0, opposite, tolerance, keep);
+            keep.push_back(opposite);
+            Simplify(best, opposite, best.size(), tolerance, keep);
+            if (keep.size() > maxPoints || keep.size() < 3) continue;
+            std::vector<Vec2> outline;
+            for (const size_t k : keep) outline.push_back(best[k]);
+            if (OutlineCrosses(outline)) continue;
+            bool holds = true;
+            for (const Vec2& p : base) holds = holds && InOutline(outline, p.x, p.y);
+            for (const ZoneBand& band : bands)
+                for (const Vec2& p : band.path) holds = holds && InOutline(outline, p.x, p.y);
+            if (!holds) continue;
+            if ((OutlineArea(outline) < 0.0f) != clockwise) std::reverse(outline.begin(), outline.end());
+            return outline;
+        }
+    }
+    return {};
 }
 
 constexpr int ID_ROADS_FIRST        = ID_EXTENSION_FIRST + 100;
@@ -6992,35 +7137,39 @@ private:
             }
         }
         if (stretches.empty()) return 0;
-        // The game reads at most 127 points an outline (a signed byte, 0x7471f0):
-        // the corridors are thinned until every widened outline fits in 124.
-        for (float spacing = 20.0f; spacing < 2000.0f; spacing *= 1.5f) {
-            std::map<u32, std::vector<Vec2>> made;
-            for (size_t s = 0; s < stretches.size(); ++s) {
-                const io::WorldZone& zone = zones[(size_t)stretches[s].first];
-                auto outline = made.find(zone.section);
-                if (outline == made.end()) {
-                    const auto manual = world->manualZoneOutlines.find(zone.section);
-                    outline = made.emplace(zone.section, manual != world->manualZoneOutlines.end() ? manual->second
-                                                                                                  : zone.points).first;
-                }
-                const std::vector<Vec2>& path = stretches[s].second;
-                std::vector<Vec2> thin{ path.front() };
-                for (size_t k = 1; k + 1 < path.size(); ++k)
-                    if (std::hypot(path[k].x - thin.back().x, path[k].y - thin.back().y) >= spacing) thin.push_back(path[k]);
-                if (path.size() > 1) thin.push_back(path.back());
-                AddCorridor(outline->second, thin, halves[s]);
+        // Each zone with the bands of the stretches that leave it, as one outline
+        // (WidenOutline); each band starts on the zone's edge, so it joins it.
+        std::map<u32, std::pair<std::vector<Vec2>, std::vector<ZoneBand>>> widen;
+        for (size_t s = 0; s < stretches.size(); ++s) {
+            const io::WorldZone& zone = zones[(size_t)stretches[s].first];
+            auto entry = widen.find(zone.section);
+            if (entry == widen.end()) {
+                const auto manual = world->manualZoneOutlines.find(zone.section);
+                entry = widen.emplace(zone.section, std::make_pair(manual != world->manualZoneOutlines.end() ? manual->second
+                                                                                                           : zone.points,
+                                                                   std::vector<ZoneBand>{})).first;
             }
-            bool fits = true;
-            for (const auto& [section, outline] : made) fits = fits && outline.size() <= 124;
-            if (!fits) continue;
-            for (auto& [section, outline] : made) world->zoneOutlines[section] = std::move(outline);
-            for (const auto& [section, outline] : world->zoneOutlines)
-                LOG_INFO("roads: streaming zone %u widened along the road: %zu points", section, outline.size());
-            return world->zoneOutlines.size();
+            ZoneBand band;
+            size_t edge = 0;
+            float gap = 0.0f;
+            band.path.push_back(NearestOnOutline(entry->second.first, stretches[s].second.front(), edge, gap));
+            band.path.insert(band.path.end(), stretches[s].second.begin(), stretches[s].second.end());
+            band.half = halves[s];
+            entry->second.second.push_back(std::move(band));
         }
-        LOG_WARN("roads: the streaming zones could not be widened along the road within 127 points");
-        return 0;
+        // The game reads at most 127 points an outline (a signed byte, 0x7471f0): 124 leaves room.
+        size_t failed = 0;
+        for (const auto& [section, job] : widen) {
+            std::vector<Vec2> outline = WidenOutline(job.first, job.second, 124);
+            if (outline.empty()) {
+                ++failed;
+                LOG_WARN("roads: streaming zone %u could not be widened along the road within 124 points", section);
+                continue;
+            }
+            LOG_INFO("roads: streaming zone %u widened along the road: %zu points", section, outline.size());
+            world->zoneOutlines[section] = std::move(outline);
+        }
+        return failed == widen.size() ? 0 : world->zoneOutlines.size();
     }
 
     bool WriteRoutes(std::wstring& summary) {

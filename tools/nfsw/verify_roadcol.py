@@ -86,7 +86,27 @@ def on(tri, face, tol=0.06):
     return min(l1, l2, l3) >= -0.01 and abs(l1 * a[2] + l2 * b[2] + l3 * cc[2] - cz) < tol
 
 
-ground, walls, missing_ground, missing_walls = [], 0, 0, 0
+def height_above(face, top):
+    """How far `top` (a triangle) lies above the plan centre of `face`; None when the centre is not under it."""
+    a, b, cc = top
+    cx, cy, cz = (sum(p[i] for p in face) / len(face) for i in range(3))
+    d = (b[1] - cc[1]) * (a[0] - cc[0]) + (cc[0] - b[0]) * (a[1] - cc[1])
+    if abs(d) < 1e-9: return None
+    l1 = ((b[1] - cc[1]) * (cx - cc[0]) + (cc[0] - b[0]) * (cy - cc[1])) / d
+    l2 = ((cc[1] - a[1]) * (cx - cc[0]) + (a[0] - cc[0]) * (cy - cc[1])) / d
+    l3 = 1 - l1 - l2
+    return l1 * a[2] + l2 * b[2] + l3 * cc[2] - cz if min(l1, l2, l3) >= -0.01 else None
+
+
+# Added ground 2 cm to 1 m over other ground (a raised median, a kerb top) cuts what is under it on purpose
+# (nfs::CutUnderRaised, src/nfs/WorldCollision.cpp): such a face is in no file and is not missing.
+raised = [cs[0:3] for b, q, cs in adds if not b and normal_z(cs[0:3]) > 0.6] + \
+         [[cs[0], cs[2], cs[3]] for b, q, cs in adds if not b and q and normal_z(cs[0:3]) > 0.6]
+def cut_under_raised(faces):
+    return all(any(h is not None and 0.02 <= h <= 1.0 for h in (height_above(f, t) for t in raised)) for f in faces)
+
+
+ground, walls, missing_ground, missing_walls, under_raised = [], 0, 0, 0, 0
 low = []
 for barrier, quad, corners in adds:
     faces = [corners[0:3]] + ([[corners[0], corners[2], corners[3]]] if quad else [])
@@ -98,7 +118,8 @@ for barrier, quad, corners in adds:
     if not barrier and normal_z(corners[0:3]) > 0.6:
         ground += faces
         if not any(on(t, f) for t in new for f in faces):
-            missing_ground += 1
+            if cut_under_raised(faces): under_raised += 1
+            else: missing_ground += 1
         continue
     pts = corners[:4] if quad else corners[:3]
     pair = max(((a, b) for i, a in enumerate(pts) for b in pts[i + 1:]),
@@ -108,7 +129,7 @@ for barrier, quad, corners in adds:
               for p0, p1 in new_bars)
     walls += 1
     missing_walls += not hit
-check(missing_ground == 0, f"added ground faces in the file: {sum(1 for b, q, cs in adds if not b and normal_z(cs[0:3]) > 0.6) - missing_ground} found, {missing_ground} missing")
+check(missing_ground == 0, f"added ground faces in the file: {sum(1 for b, q, cs in adds if not b and normal_z(cs[0:3]) > 0.6) - missing_ground - under_raised} found, {under_raised} cut under raised ground on purpose, {missing_ground} missing")
 check(missing_walls == 0, f"added walls and barriers as barrier records: {walls - missing_walls} found, {missing_walls} missing")
 stray = [t for t in new if not any(on(t, f) for f in ground)]
 print(f"   new triangles not on an added ground face: {len(stray)} (kerbs, and pieces of shipped ground cut round "
